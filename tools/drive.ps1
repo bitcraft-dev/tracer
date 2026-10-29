@@ -81,7 +81,10 @@ switch ($Do) {
   }
   "wheel" {
     MoveTo $X $Y
-    [W]::mouse_event(0x0800, 0, 0, [uint32]([int]$Text * 120 -band 0xFFFFFFFF), [IntPtr]::Zero)
+    # The delta is a signed int passed as a DWORD; 0xFFFFFFFF is -1 in
+    # PowerShell 5.1, so reinterpret the bytes rather than mask.
+    $delta = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Text * 120), 0)
+    [W]::mouse_event(0x0800, 0, 0, $delta, [IntPtr]::Zero)
     "wheel $Text at $X,$Y"
   }
   "keys" { [System.Windows.Forms.SendKeys]::SendWait($Text); "sent $Text" }

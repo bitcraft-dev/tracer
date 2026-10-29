@@ -2,7 +2,7 @@
 <template>
   <view class="page">
     <text class="h">1 · Ordered events from Rust</text>
-    <text class="p">Rust sets a rux::Signal once per event, numbered from 1, on another thread. The page counts the ones its effect saw. Tracer's live sync, WebSocket stream and benchmark samples all need every event, in order.</text>
+    <text class="p">Rust pushes onto a rux::Channel once per event, numbered from 1, on another thread. The page counts the ones its effect saw, and how many lists they came in. Tracer's live sync, WebSocket stream and benchmark samples all need every event, in order.</text>
     <view class="row">
       <view class="btn" @tap="run(1000, 0)"><text class="btn-label">1,000 · no gap</text></view>
       <view class="btn" @tap="run(1000, 1000)"><text class="btn-label">1,000 · 1 ms apart</text></view>
@@ -10,7 +10,8 @@
     </view>
     <view class="card">
       <text class="stat">received {{ received }} of {{ expected }}</text>
-      <text class="stat">skipped {{ skipped }} · out of order {{ backwards }} · last seq {{ last }}</text>
+      <text class="stat">skipped {{ skipped }} · repeated or out of order {{ backwards }} · last seq {{ last }}</text>
+      <text class="stat">in {{ batches }} lists</text>
       <text class="verdict" :class="{ bad: skipped > 0 }">{{ verdict }}</text>
     </view>
   </view>
@@ -38,6 +39,7 @@
   let received = signal(0);
   let skipped = signal(0);
   let backwards = signal(0);
+  let batches = signal(0);
   let last = signal(0);
 
   fn run(n: int, gap_us: int) {
@@ -45,30 +47,41 @@
     received = 0;
     skipped = 0;
     backwards = 0;
+    batches = 0;
     last = 0;
     run_id = events.burst(n, gap_us);
   }
 
+  // A channel reads as the ticks pushed since the last frame. Each should
+  // arrive exactly once, so a repeat counts against it rather than being
+  // filtered out.
   effect {
-    let t = events.tick;
-    if t != none && t.run == run_id && t.seq != last {
+    let mine = events.tick.filter(t => t.run == run_id);
+    if mine.length > 0 {
+      batches += 1;
+    }
+    for t in mine {
       received += 1;
-      if t.seq < last {
+      if t.seq <= last {
         backwards += 1;
       } else if t.seq > last + 1 {
         skipped += t.seq - last - 1;
       }
-      last = t.seq;
+      if t.seq > last {
+        last = t.seq;
+      }
     }
   }
 
   computed verdict = if expected == 0 {
     "press a burst"
-  } else if last < expected {
+  } else if received < expected && last < expected {
     "running…"
-  } else if received == expected {
+  } else if received == expected && backwards == 0 {
     "every event arrived, in order"
-  } else {
+  } else if received < expected {
     `${expected - received} of ${expected} events never reached the page`
+  } else {
+    `${backwards} events came again or out of order`
   };
 </script>

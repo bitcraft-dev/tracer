@@ -174,12 +174,12 @@
     active = id;
   }
 
-  fn dragSide(e) {
+  fn dragSide(e: DragEvent) {
     let w = sideW + e.moveX;
     sideW = if w < 180 { 180 } else if w > 520 { 520 } else { w.round() };
   }
 
-  fn dragReq(e) {
+  fn dragReq(e: DragEvent) {
     let h = reqH + e.moveY;
     reqH = if h < 120 { 120 } else if h > 520 { 520 } else { h.round() };
   }

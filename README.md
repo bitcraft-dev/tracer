@@ -9,6 +9,8 @@ Tracer exists to strain Rux. Where Rux is limited, Tracer reports it in
 [FINDINGS.md](FINDINGS.md) rather than working around it.
 
 - [docs/PLAN.md](docs/PLAN.md): what Tracer is, its architecture and phases
+- [docs/PROGRESS.md](docs/PROGRESS.md): where the work stands, what's next,
+  and gotchas already solved
 - [FINDINGS.md](FINDINGS.md): Rux limits found so far
 - [probes/](probes/): Phase 0, one page per capability; see
   [probes/PROBES.md](probes/PROBES.md)

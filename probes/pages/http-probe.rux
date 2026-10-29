@@ -87,7 +87,7 @@
     busy = false;
   }
 
-  fn onKey(e) {
+  fn onKey(e: KeyEvent) {
     if e.primary && e.key == "Enter" {
       send();
       return false;

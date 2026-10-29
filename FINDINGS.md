@@ -166,7 +166,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   `nowMs()` from Rust. Logged because every app that shows a duration will
   write the same five lines.
 - **Suggested fix:** a built-in monotonic `now()` (ms, float).
-- **Status:** open, low priority.
+- **Status:** fixed in Rux 5fc614c (local): `now()` gives milliseconds on a monotonic clock, in script, on desktop, Android and the web.
 
 ## AW-010 `rux run --route` is ignored for an app with a `native/` crate
 
@@ -209,7 +209,15 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   `rux::Channel<T>` (or `Signal::push`) whose values are delivered to a handler
   or `effect` one by one, in order, on the UI thread, batched per frame so a
   burst costs one rebuild.
-- **Status:** open.
+- **Status:** fixed in Rux ad33851 (local): `#[rux::export] pub static EVENTS: rux::Channel<T>`, `EVENTS.push(v)` from any thread. Script reads it as `T[]`, what was pushed since the last frame; an `effect` reading it runs once per non-empty list, so a burst of 1,000 arrives whole and in order as one update. **Verified 2026-10-29** with probe 1 moved to a `Channel`, driven in the window on the installed build:
+
+  | Burst | Reached the page | In lists |
+  |---|---|---|
+  | 1,000, no gap | **1,000** of 1,000 | 1 |
+  | 1,000, ~1 ms apart | **1,000** of 1,000 | 70 |
+  | 200, 20 ms apart | **200** of 200 | 179 |
+
+  None skipped, repeated or out of order.
 
 ## AW-012 A signal change inside a component rebuilds the whole document, and the cost grows faster than the rows
 
@@ -264,7 +272,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   contents (`Rc<[Value]>`, copy-on-write). Either removes the quadratic term.
   (2) Give instance state the patch path document state has, keyed
   `instance::name`, so a component's list reconciles instead of rebuilding.
-- **Status:** open.
+- **Status:** fixed in Rux a49cb20 (local): a list is shared rather than copied into every row, and converted once each way. 1,000 rows in a component: 3.15 s to 22 ms (about 140x faster), linear in rows. Not done: the patch path for component state (root cause 2), so a component's list still rebuilds, now at the screen's cost. **Re-driven by Tracer 2026-10-29** (installed build, debug, `RUX_PROFILE=1`), probe 2's own rows in its routed page: 1,002 lines no longer run away (Phase 0: 4.8 GB, not responding, ended from Task Manager). Loaded through the `await`ed export they draw for about 1.3 s of CPU and +50 MB, and the profile shows `rebuild` at 0 calls a frame. Loaded by the synchronous export inside the tap handler, the window is *not responding* for about 9 s and peaks at 1.15 GB; replacing those 1,002 lines with 100 does the same (about 1 GB, not responding). What remains is mostly layout, AW-018. The appearing-only-on-hover part is AW-017.
 
 ## AW-013 An `effect` on a Rust signal that keeps changing locks the window up for good
 
@@ -308,7 +316,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   node), and let the animator diff against the patched value; (3) coalesce
   signal-driven rebuilds to at most one per frame and let input and paint run
   between them.
-- **Status:** open.
+- **Status:** fixed in Rux cce6fd6 (local): what Rust sets is read once a frame rather than once a set, and parsed stylesheets are kept across whole builds. Driven: probe 4 with its `effect` paints at 30 and 500 Hz, and `stop` lands. Not done: `:d` still rebuilds rather than patching (root cause 2), about a core in a debug build at 30 Hz. **Re-driven by Tracer 2026-10-29** (installed build, debug): 30, 60 and 500 Hz all paint, the nav stays responsive, and **stop** lands (CPU goes flat). Each rate costs about one core. Frames are about 38 ms (≈26 fps): `rebuild` runs **2 times a frame at about 22 ms**, against layout's 9 ms and script's 3 ms. At 500 Hz, 3,707 samples woke the page 244 times, which is right for a chart. The two rebuilds a frame are the `:d` patch path still to come.
 
 ## AW-014 The running app reports problems `rux check` does not
 
@@ -325,7 +333,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Workaround:** n/a; the code was fixed, as it should have been.
 - **Suggested fix:** one checker for both; the runtime's none-safety pass
   should run under `rux check`.
-- **Status:** open.
+- **Status:** fixed in Rux f173be0 (local), with AW-005: `rux check` now runs the same checks over every page, and reports the `current` may be `none` errors.
 
 ## AW-015 The window opens larger than the screen
 
@@ -338,7 +346,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Workaround:** none.
 - **Suggested fix:** clamp the initial size to the monitor's work area and
   centre it.
-- **Status:** open.
+- **Status:** fixed in Rux 70ef191 (local): a window larger than nine tenths of the monitor opens to fit, centred. Driven: 1280 by 800 at 1.5x on 1080p opens inside the screen.
 
 ## AW-016 Each `print` reopens the dev overlay over the app and swallows the next tap
 
@@ -351,7 +359,70 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Workaround:** none.
 - **Suggested fix:** collect prints in a collapsed corner badge, or let taps
   outside the panel through.
+- **Status:** fixed in Rux 37783ba (local): prints alone wait in a one-line badge in the bottom right, which a tap opens; a print never brings back a dismissed panel. Driven: three taps on a printing button all reached it.
+
+## AW-017 An idle window does not draw what a key or an `await` changed, and keys typed in the meantime are lost
+
+- **Found:** 2026-10-29, re-running the probes on the build with AW-011 to
+  AW-016 fixed. Phase 0, on `de81f5c`, typed and sent with the same driver
+  without any of this.
+- **Severity:** **blocker**. Every field in Tracer is typing, and every request
+  is an `await`.
+- **Limit:** with nothing animating, a change made by a key or by an `await`
+  coming back stays off screen until the pointer moves over something with a
+  `:hover` style, which forces a frame. Typing then keeps only the last key:
+  - Probe 3: **Send** stays "Sending…" indefinitely. Moving the pointer over
+    empty space doesn't help. Hovering a nav link shows the 200 with all its
+    chips at once.
+  - Probe 2: the `await`ed 1k load measured itself at 65 ms (`now()` after the
+    `await`), yet "building…" stayed on screen until a hover 4 s later.
+  - Probe 6: "post" typed into the request filter, 300 ms per key, shows as
+    **`t`** after a hover. "send" then "bench" into the palette's field became
+    **`dh`**. Three backspaces sent before "bench" were lost too.
+  - Taps are fine, and so are `rux::Channel` values (probe 1) and a running
+    chart (probe 4): each of those draws without help.
+- **Reproduction:** `probes/`, probe 3: press **Send** and leave the pointer
+  still. Probe 6: click **Filter requests…** and type, without moving the
+  pointer.
+- **Workaround:** none.
+- **Lead, not a root cause:** cce6fd6 (AW-013) moved `refresh_native_signals`
+  from `RuxEvent::Answered` to `render`. `Answered` still calls
+  `settle_tasks()` and asks for a redraw, so the `await` continuation runs, but
+  what it set isn't drawn. Keys don't go through `Answered`, so the common
+  cause may be elsewhere, perhaps in what `render` relies on having been
+  applied before it runs. Not traced further.
+- **Suggested fix:** anything that changes document state (a key, an edit, a
+  settled task) should apply that change and request a frame. And an edit to
+  a field should start from the field's current text, not the text last
+  drawn, so keys between two frames are never lost.
 - **Status:** open.
+
+## AW-018 A long list costs its whole layout every frame, so 1,000 rows scroll at about 2 fps
+
+- **Found:** 2026-10-29, probe 2 re-run after AW-012's fix.
+- **Severity:** **blocker** for the response viewer, which has to show large
+  bodies. Probably friction once release builds are measured.
+- **Limit:** 1,002 rows of probe 2's viewer, in a debug build, with
+  `RUX_PROFILE=1`:
+
+  | phase | avg ms/frame | worst ms |
+  |---|---|---|
+  | layout | **414** | **1,706** |
+  | match | 17 (993 calls a frame) | 347 |
+  | gpu | 10 | 93 |
+  | script | 2.5 | 44 |
+  | rebuild | 0.1 (0 calls) | 9 |
+
+  Every row is laid out on every frame, including the ones scrolled out of
+  view. Wheel scrolling reaches line 1,002 and the window keeps responding,
+  but each wheel notch costs about 0.7 s of CPU (40 notches: 29 s).
+- **Reproduction:** probe 2, **1k lines**, then wheel down over the viewer with
+  `RUX_PROFILE=1`.
+- **Workaround:** none. Tracer won't page or truncate bodies to dodge it.
+- **Suggested fix:** keep the layout of rows that didn't change, and lay out
+  only what intersects the viewport of a scrolled container (or offer a
+  virtualised list). Selector matching has the same per-row shape.
+- **Status:** open. Not yet measured in a release build.
 
 ## Phase 0 results
 
@@ -360,12 +431,26 @@ drag, keys), dev and release builds:
 
 | Probe | Result |
 |---|---|
-| 1 Ordered events | **Fails**: AW-011 (blocker) |
+| 1 Ordered events | **Fails** on `Signal` (AW-011, blocker); **works** on `rux::Channel` since Rux ad33851: every event, in order |
 | 2 Large body | **Fails**: 100 and 300 coloured lines render well; 1,000 freezes the window (AW-012, blocker) |
 | 3 HTTP | **Works**: async Rust request off the UI thread, 200 in 815 ms, chips, headers, body; window stays responsive |
 | 4 Live chart | **Works without an effect**, at a whole core's cost; **locks up with one** (AW-013, blocker). AW-004 is check-only |
 | 5 Child process | **Works**: `@close` ran on a window close and stopped the child; no orphan |
 | 6 Shell | **Works**: both splitters drag and clamp, tabs open, the filter narrows, Ctrl+K from inside a field, `blur()` + `autofocus` hands focus to the palette, Esc and a pick close it |
+
+### Re-run on the fixed build (2026-10-29)
+
+The installed `rux` 0.9.0-dev at d7d92f9, with AW-001 to AW-016 fixed
+locally, in a debug build:
+
+| Probe | Result |
+|---|---|
+| 1 Ordered events | **Works** (`Channel`): 1000/1000, 1000/1000, 200/200, in order |
+| 2 Large body | **No longer runs away**; 1k awaited draws in ~1.3 s CPU, 1k sync is ~9 s not responding; layout 414 ms/frame (AW-018); result shows only after a hover (AW-017) |
+| 3 HTTP | **Works once a frame is forced**: 200 in 1,847 ms with chips, headers, body; until a hover it stays "Sending…" (AW-017) |
+| 4 Live chart | **Works with its effect** at 30/60/500 Hz, stop lands; ~1 core, 2 rebuilds a frame |
+| 5 Child process | **Works**: Alt+F4 ran `@close`, the child was stopped, no orphan |
+| 6 Shell | Splitters, tabs, Ctrl+K, Esc **work**; **typing loses keys** and isn't drawn until a hover (AW-017) |
 
 Ruled out on the way, as Tracer's own mistakes and not Rux's: a flex item
 growing to its longest unbreakable line (CSS does the same), an overlay not

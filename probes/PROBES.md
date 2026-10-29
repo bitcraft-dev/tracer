@@ -19,24 +19,29 @@ anything wrong into a `FINDINGS.md` entry.
 
 ## 1 · Ordered events (`/`)
 
-Press each burst. The card counts what the page's `effect` received.
+Press each burst. Rust pushes numbered ticks onto a `rux::Channel`; the card
+counts what the page's `effect` received, and in how many lists.
 
-- [ ] **1,000 · no gap**: received ___ of 1000, skipped ___
-- [ ] **1,000 · 1 ms apart**: received ___ of 1000, skipped ___
-- [ ] **200 · 20 ms apart**: received ___ of 200, skipped ___
+- [x] **1,000 · no gap**: 1000 of 1000 in 1 list
+- [x] **1,000 · 1 ms apart**: 1000 of 1000 in 70 lists
+- [x] **200 · 20 ms apart**: 200 of 200 in 179 lists
 
-Anything under the total means Rust events are coalesced. That breaks Tracer's
-live sync, which has to replay every agent action in order.
+Anything under the total, or any repeat, fails it: Tracer's live sync has to
+replay every agent action in order. Until Rux ad33851 this probe used a
+`rux::Signal`, which kept only the newest value (1, 89 and 199 arrived:
+AW-011).
 
 ## 2 · Large response body (`/json`)
 
-Press **1k**, **10k** and **50k** lines, and scroll each to the bottom with the
-wheel and by dragging the scrollbar. Run with `RUX_PROFILE=1`.
+Press **100**, **300** and **1k** lines (awaited Rust), then **1k · sync Rust**
+and **1k · script**, and scroll each to the bottom with the wheel. Run with
+`RUX_PROFILE=1`; the summary lands in `rux run`'s output.
 
-- [ ] Time from press to lines on screen (stopwatch is fine): 1k ___ 10k ___ 50k ___
-- [ ] Scrolling smooth? 1k ___ 10k ___ 50k ___
-- [ ] Profile line for a scroll frame at 10k (layout / scene / gpu): ___
-- [ ] Memory in Task Manager at 50k: ___
+- [ ] Time from press to lines on screen: 100 ___ 300 ___ 1k ___ (after an
+      `await`, a hover may be needed first: AW-017)
+- [ ] Scrolling smooth? 1k ___ (2026-10-29: about 0.7 s CPU a notch, AW-018)
+- [ ] Profile at 1k (layout / match / rebuild): ___
+- [ ] Memory in Task Manager at 1k: ___
 - [ ] Colours right (keys blue, strings orange, numbers green)?
 - [ ] Can you select and copy a line?
 

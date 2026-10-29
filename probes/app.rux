@@ -94,7 +94,7 @@
     { no: "6", path: "/shell", label: "Workbench shell" }
   ];
 
-  fn onKey(e) {
+  fn onKey(e: KeyEvent) {
     if e.primary && e.key == "k" {
       // Drop the caret first, so the palette's autofocus input takes it.
       blur();
