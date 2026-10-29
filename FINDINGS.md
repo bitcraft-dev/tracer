@@ -240,9 +240,30 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   `<screen>` itself. `RUX_PROFILE=each` shows `rebuild` against `patch`.
 - **Workaround:** none. (Putting every list in the `<screen>` is not one Tracer
   will take: pages are components by design.)
-- **Suggested fix:** route a component instance's signal changes through the
-  same fine-grained patch path the document's own signals take, and find what
-  in the rebuild path grows super-linearly with row count.
+- **Root cause** (read in the Rux source at `de81f5c`, not changed):
+  1. **Component state has no patch path.** `patch()` is chosen by which
+     *document* signals moved (`rux-runtime/src/lib.rs:5933`: "instance state
+     is not among them"). A component handler that moves its own state sets
+     `moved` and calls `self.rebuild()` (`lib.rs:5082`: "the rebuild is the
+     only thing that reads instance state again").
+  2. **A component's rows each deep-copy the component's whole state.** A
+     component is built with `locals = entry.state.clone()`
+     (`rux-style/src/lib.rs:9384`), so its `locals` hold the `rows` list
+     itself. Every row then starts from `locals.clone()` (`lib.rs:10619`),
+     `remember_row` keeps another (`10704`), and every text binding stores one
+     more (`TextBinding { locals: locals.clone() }`, `3219`). `Value::List` is
+     a plain `Vec<Value>` (`rux-reactive/src/lib.rs:155`), so each clone copies
+     every record. N rows × (2 + bindings per row) copies of an N-record list
+     is quadratic in time and memory: 1,000 rows of 2 bindings is ~4 million
+     records copied. In the document the same list lives in the engine's
+     global scope and `locals` hold only the loop variable, which is why the
+     `<screen>` version costs 33 MB.
+- **Suggested fix:** (1) keep instance state out of `locals`: give each
+  instance a scope in the engine, as the document's signals have, so a row's
+  locals are its loop variables only; or make `Value::List`/`Map` share their
+  contents (`Rc<[Value]>`, copy-on-write). Either removes the quadratic term.
+  (2) Give instance state the patch path document state has, keyed
+  `instance::name`, so a component's list reconciles instead of rebuilding.
 - **Status:** open.
 
 ## AW-013 An `effect` on a Rust signal that keeps changing locks the window up for good
@@ -263,9 +284,30 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   a turn.
 - **Reproduction:** `probes/` probe 4 with the `effect` above; press 30 Hz.
 - **Workaround:** none.
-- **Suggested fix:** patch, not rebuild, for a Rust signal's readers (AW-012);
-  never re-parse stylesheets on a signal change; give input and paint a turn
-  between rebuilds however busy the signals are.
+- **Root cause** (read in the Rux source at `de81f5c`, not changed):
+  1. **A bound `:d` always rebuilds the whole document.** Its dependencies go
+     into `reg.structural` (`rux-style/src/lib.rs:8498`), which makes
+     `patch()` refuse (`rux-runtime/src/lib.rs:5572`). The comment gives two
+     reasons: an unsized path takes its geometry's size, and the shape
+     animator compares against the previous build. So every sample is a full
+     rebuild, of every page's state, at the sample rate.
+  2. **A full rebuild re-parses every stylesheet.** `build_styled_tree_stateful`
+     parses the document's rules (`lib.rs:2899`) and **every** component's,
+     on screen or not (`2938`), on each call. The comment above it says
+     "merged here, once per load, rather than per build", but it runs per
+     build. The partial-rebuild path already caches parsed rules by print
+     (`lib.rs:11169`); the full path does not. The probe app's 7 stylesheets
+     × 2.4 rebuilds a frame is the measured 18.3 `css` calls a frame.
+  3. **The lock-up is the frame budget.** One full rebuild per sample already
+     costs a core; an `effect` that writes a bound signal adds a second
+     rebuild per sample (`apply_change_depth` runs effects, then applies their
+     writes), and the event loop never reaches input or paint again.
+- **Suggested fix:** (1) cache parsed rules across full builds, keyed as the
+  partial path keys them, and parse only components that are expanded;
+  (2) patch `:d` in place when the path has a CSS size (or relayout just that
+  node), and let the animator diff against the patched value; (3) coalesce
+  signal-driven rebuilds to at most one per frame and let input and paint run
+  between them.
 - **Status:** open.
 
 ## AW-014 The running app reports problems `rux check` does not
