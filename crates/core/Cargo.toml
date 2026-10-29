@@ -1,0 +1,11 @@
+[package]
+name = "tracer-core"
+description = "Tracer's core: the separate process every client (the Rux window, the CLI, AI agents) talks to."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracer-protocol = { path = "../protocol" }
+serde_json = "1.0.150"
+ureq = "3.5.0"

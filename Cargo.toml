@@ -4,7 +4,7 @@
 # all clients of it. See docs/PLAN.md.
 [workspace]
 resolver = "2"
-members = ["probes/native"]
+members = ["crates/protocol", "crates/core", "crates/cli", "probes/native"]
 
 [workspace.package]
 edition = "2021"

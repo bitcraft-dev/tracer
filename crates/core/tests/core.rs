@@ -1,0 +1,230 @@
+//! The core as its clients see it: over TCP, through the protocol's client.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+
+use tracer_protocol::client::Client;
+use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody};
+
+/// A fresh workspace under the temp directory, per test.
+fn workspace(name: &str) -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "tracer-test-{name}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// An HTTP server that answers every request with `200` and a small JSON body
+/// naming the path it was asked for. Gives its base URL.
+fn stub_server() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            thread::spawn(move || answer(stream));
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+fn answer(mut stream: TcpStream) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut first = String::new();
+    if reader.read_line(&mut first).is_err() {
+        return;
+    }
+    let mut length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0; length];
+    let _ = reader.read_exact(&mut body);
+    let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let reply = format!("{{\"path\":\"{path}\",\"got\":{length}}}");
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+        reply.len()
+    );
+}
+
+fn get(url: String) -> Command {
+    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None } }
+}
+
+#[test]
+fn a_request_is_answered_with_its_timing_and_seen_by_every_subscriber() {
+    let ws = workspace("answer");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    let Ok(ReplyBody::Accepted { request_id }) = agent.call(get(format!("{base}/albums?id=1"))).unwrap() else {
+        panic!("send was not accepted");
+    };
+
+    // The window sees the agent join, then the request start and finish,
+    // all attributed to the agent.
+    let mut seen = Vec::new();
+    while !matches!(seen.last(), Some(Event { kind: EventKind::RequestFinished { .. }, .. })) {
+        seen.push(window.next_event().unwrap());
+    }
+    let started = seen.iter().position(|e| matches!(e.kind, EventKind::RequestStarted { .. })).unwrap();
+    let finished = seen.len() - 1;
+    assert!(started < finished);
+    let EventKind::RequestFinished { request_id: id, response } = &seen[finished].kind else { unreachable!() };
+    assert_eq!(*id, request_id);
+    assert_eq!(seen[finished].actor.name, "claude-code");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, r#"{"path":"/albums?id=1","got":0}"#);
+    assert!(response.timing.ttfb_ms <= response.timing.total_ms);
+
+    core.stop();
+}
+
+/// The property Rux's signals lack (FINDINGS.md AW-011) and the window's live
+/// sync depends on: every event, numbered without a gap, in one order for
+/// everyone, and a late joiner's replay identical to what was seen live.
+#[test]
+fn a_burst_reaches_a_watcher_whole_and_in_order_and_replays_identically() {
+    const REQUESTS: usize = 200;
+    let ws = workspace("burst");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+
+    let mut watcher = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    let Ok(ReplyBody::Subscribed { next_seq: first_seq, .. }) =
+        watcher.call(Command::Subscribe { since: None }).unwrap()
+    else {
+        panic!("subscribe failed");
+    };
+
+    // Four agents at once, fifty requests each, as fast as they can send.
+    let agents: Vec<_> = (0..4)
+        .map(|n| {
+            let (ws, base) = (ws.clone(), base.clone());
+            thread::spawn(move || {
+                let mut agent = Client::connect(&ws, ClientKind::Agent, &format!("agent-{n}")).unwrap();
+                for i in 0..REQUESTS / 4 {
+                    agent.call(get(format!("{base}/r/{n}/{i}"))).unwrap().unwrap();
+                }
+                // Stay connected until the answers are in, so `client_left`
+                // does not interleave with what is being counted.
+                agent
+            })
+        })
+        .collect();
+
+    let mut live = Vec::new();
+    let mut finished = 0;
+    while finished < REQUESTS {
+        let event = watcher.next_event().unwrap();
+        if matches!(event.kind, EventKind::RequestFinished { .. }) {
+            finished += 1;
+        }
+        live.push(event);
+    }
+    let agents: Vec<Client> = agents.into_iter().map(|a| a.join().unwrap()).collect();
+
+    // Numbered 1, 2, 3, … from where the watcher came in, with no gap.
+    for (i, event) in live.iter().enumerate() {
+        assert_eq!(event.seq, first_seq + i as u64, "event {i} out of order or missing");
+    }
+    // Each request starts before it finishes, and every one finished.
+    let mut started_at = HashMap::new();
+    for (i, event) in live.iter().enumerate() {
+        match &event.kind {
+            EventKind::RequestStarted { request_id, .. } => {
+                started_at.insert(*request_id, i);
+            }
+            EventKind::RequestFinished { request_id, response } => {
+                assert!(started_at[request_id] < i, "request {request_id} finished before it started");
+                assert_eq!(response.status, 200);
+            }
+            EventKind::RequestFailed { request_id, error } => panic!("request {request_id} failed: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(started_at.len(), REQUESTS);
+
+    // A window opening now replays exactly what the first one saw live.
+    let mut late = Client::connect(&ws, ClientKind::Window, "late window").unwrap();
+    let Ok(ReplyBody::Subscribed { replayed, .. }) =
+        late.call(Command::Subscribe { since: Some(first_seq - 1) }).unwrap()
+    else {
+        panic!("late subscribe failed");
+    };
+    assert!(replayed as usize >= live.len());
+    for expected in &live {
+        assert_eq!(&late.next_event().unwrap(), expected);
+    }
+
+    drop(agents);
+    core.stop();
+}
+
+#[test]
+fn a_restarted_core_carries_on_the_journal_numbering() {
+    let ws = workspace("restart");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut a = Client::connect(&ws, ClientKind::Cli, "first").unwrap();
+    let Ok(ReplyBody::Status { next_seq: before, .. }) = a.call(Command::Status).unwrap() else { panic!() };
+    drop(a);
+    core.stop();
+
+    let core = tracer_core::start(&ws).unwrap();
+    let mut b = Client::connect(&ws, ClientKind::Cli, "second").unwrap();
+    let Ok(ReplyBody::Status { next_seq: after, .. }) = b.call(Command::Status).unwrap() else { panic!() };
+    // `first` joined (and left, unless the old core had stopped first), then
+    // `second` joined: numbering moved on and never restarted at 1.
+    assert!(after > before, "journal numbering restarted: {before} then {after}");
+
+    // And the whole journal replays from 1 without a gap.
+    b.call(Command::Subscribe { since: Some(0) }).unwrap().unwrap();
+    for seq in 1..after {
+        assert_eq!(b.next_event().unwrap().seq, seq);
+    }
+    core.stop();
+}
+
+#[test]
+fn a_client_without_the_token_is_refused() {
+    let ws = workspace("token");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut found = core.discovery();
+    found.token = "not-the-token".into();
+    let err = Client::connect_to(&found, ClientKind::Agent, "intruder").err().expect("connected without the token");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    core.stop();
+}
+
+#[test]
+fn nothing_is_accepted_before_hello() {
+    let ws = workspace("hello");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut raw = TcpStream::connect(("127.0.0.1", core.port)).unwrap();
+    writeln!(raw, r#"{{"id":1,"cmd":"status"}}"#).unwrap();
+    let mut line = String::new();
+    BufReader::new(raw.try_clone().unwrap()).read_line(&mut line).unwrap();
+    assert!(line.contains("say hello first"), "{line}");
+    core.stop();
+}

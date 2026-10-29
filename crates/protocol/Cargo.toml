@@ -1,0 +1,10 @@
+[package]
+name = "tracer-protocol"
+description = "What Tracer's clients and its core say to each other: commands, replies and the ordered event stream."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

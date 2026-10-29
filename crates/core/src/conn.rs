@@ -1,0 +1,112 @@
+//! One client's connection: a reader on this thread, a writer on its own.
+//!
+//! Replies and events for a client go through one channel to one writer, so
+//! what the client reads is in the order the core decided, whether it is a
+//! reply or an event.
+
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::net::TcpStream;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+
+use tracer_protocol::{
+    Actor, Command, EventKind, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+};
+
+use crate::http;
+use crate::hub::Hub;
+
+pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str) {
+    let Ok(write_half) = stream.try_clone() else { return };
+    let (out, rx) = mpsc::channel::<ServerMessage>();
+    let writer = thread::spawn(move || {
+        let mut w = BufWriter::new(write_half);
+        for msg in rx {
+            let Ok(line) = serde_json::to_string(&msg) else { continue };
+            if writeln!(w, "{line}").and_then(|_| w.flush()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut session: Option<(u64, Actor)> = None;
+    for line in BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Request = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                // No id to answer to; say so once with id 0 and carry on.
+                let _ = out.send(reply(0, Err(format!("not a request: {e}"))));
+                continue;
+            }
+        };
+        let id = request.id;
+        let outcome = match (&session, request.command) {
+            (None, Command::Hello { protocol, token: given, kind, name }) => {
+                if protocol != PROTOCOL_VERSION {
+                    Err(format!("protocol {protocol} is not this core's {PROTOCOL_VERSION}"))
+                } else if given != token {
+                    Err("wrong token".to_string())
+                } else {
+                    let actor = Actor { kind, name };
+                    let client = hub.join(actor.clone());
+                    session = Some((client, actor));
+                    Ok(ReplyBody::Welcome { client, protocol: PROTOCOL_VERSION })
+                }
+            }
+            (None, _) => Err("say hello first".to_string()),
+            (Some(_), Command::Hello { .. }) => Err("already said hello".to_string()),
+            (Some((client, _)), Command::Subscribe { since }) => {
+                // The reply goes out before the replay, under the hub's lock,
+                // so the client reads "subscribed" and then the events.
+                hub.subscribe(*client, since, out.clone(), |replayed, next_seq| {
+                    reply(id, Ok(ReplyBody::Subscribed { replayed, next_seq }))
+                });
+                continue;
+            }
+            (Some((_, actor)), Command::Send { request }) => {
+                // The id goes back before any event names it, so the sender
+                // knows which `request_started` is its own.
+                let request_id = hub.next_request_id();
+                let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
+                hub.publish(actor.clone(), EventKind::RequestStarted { request_id, request: request.clone() });
+                let (hub, actor) = (hub.clone(), actor.clone());
+                thread::spawn(move || {
+                    let kind = match http::execute(&request) {
+                        Ok(response) => EventKind::RequestFinished { request_id, response },
+                        Err(error) => EventKind::RequestFailed { request_id, error },
+                    };
+                    hub.publish(actor, kind);
+                });
+                continue;
+            }
+            (Some(_), Command::Status) => {
+                let (clients, next_seq) = hub.status();
+                Ok(ReplyBody::Status { clients, next_seq, workspace: hub.workspace().to_string() })
+            }
+        };
+        if out.send(reply(id, outcome)).is_err() {
+            break;
+        }
+    }
+
+    if let Some((client, _)) = session {
+        hub.leave(client);
+    }
+    drop(out);
+    let _ = writer.join();
+}
+
+fn reply(id: u64, outcome: Result<ReplyBody, String>) -> ServerMessage {
+    ServerMessage::Reply(Reply {
+        id,
+        outcome: match outcome {
+            Ok(body) => Outcome::Ok(body),
+            Err(e) => Outcome::Error(e),
+        },
+    })
+}

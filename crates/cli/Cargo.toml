@@ -1,0 +1,15 @@
+[package]
+name = "tracer-cli"
+description = "The `tracer` command: runs the core, and is a client of it like the window and agents are."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tracer"
+path = "src/main.rs"
+
+[dependencies]
+tracer-protocol = { path = "../protocol" }
+tracer-core = { path = "../core" }
+serde_json = "1.0.150"
