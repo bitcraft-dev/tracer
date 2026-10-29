@@ -272,7 +272,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   contents (`Rc<[Value]>`, copy-on-write). Either removes the quadratic term.
   (2) Give instance state the patch path document state has, keyed
   `instance::name`, so a component's list reconciles instead of rebuilding.
-- **Status:** fixed in Rux a49cb20 (local): a list is shared rather than copied into every row, and converted once each way. 1,000 rows in a component: 3.15 s to 22 ms (about 140x faster), linear in rows. Not done: the patch path for component state (root cause 2), so a component's list still rebuilds, now at the screen's cost. **Re-driven by Tracer 2026-10-29** (installed build, debug, `RUX_PROFILE=1`), probe 2's own rows in its routed page: 1,002 lines no longer run away (Phase 0: 4.8 GB, not responding, ended from Task Manager). Loaded through the `await`ed export they draw for about 1.3 s of CPU and +50 MB, and the profile shows `rebuild` at 0 calls a frame. Loaded by the synchronous export inside the tap handler, the window is *not responding* for about 9 s and peaks at 1.15 GB; replacing those 1,002 lines with 100 does the same (about 1 GB, not responding). What remains is mostly layout, AW-018. The appearing-only-on-hover part is AW-017.
+- **Status:** fixed in Rux a49cb20 (local): a list is shared rather than copied into every row, and converted once each way. 1,000 rows in a component: 3.15 s to 22 ms (about 140x faster), linear in rows. Not done: the patch path for component state (root cause 2), so a component's list still rebuilds, now at the screen's cost. **Re-driven by Tracer 2026-10-29** (installed build, debug, `RUX_PROFILE=1`), probe 2's own rows in its routed page: 1,002 lines no longer run away (Phase 0: 4.8 GB, not responding, ended from Task Manager). Loaded through the `await`ed export they draw for about 1.3 s of CPU and +50 MB, and the profile shows `rebuild` at 0 calls a frame. Loaded by the synchronous export inside the tap handler, the window is *not responding* for about 9 s and peaks at 1.15 GB; replacing those 1,002 lines with 100 does the same (about 1 GB, not responding). What remains is mostly layout, AW-018. The appearing-only-on-hover part is AW-017. **Root cause 2 fixed in Rux c4c46f7 (local, not pushed):** a component's own state is now patched in place (handlers, `r-model`, effects, computeds), falling back to a rebuild only where a prop carries it into a child. A counter beside 1,000 rows in a component: 21.6 ms to 0.98 ms a tap (about 22x faster). **Re-driven by Tracer on the pushed build (a27366f), 2026-10-29**, debug, pointer parked after each tap: **1k lines** (awaited) draws by itself in about 1.8 s of CPU; **1k · sync Rust** about 1.8 s of CPU and the window answers throughout (was ~9 s not responding); `rebuild` 0 calls a frame. Still heavy: a frame that loads or clears the 1,002 rows costs up to 2.06 s (`patch` 857 ms, `layout` 1,158 ms in that frame), and **clear** costs 2.6 s of CPU, more than loading them. Closed for Tracer; the load/clear frame is left to further optimisation. **Release build** (`rux build --release`, same probe): 1k awaited in 5 ms and drawn for **0.33 s** of CPU, **clear** 0.41 s.
 
 ## AW-013 An `effect` on a Rust signal that keeps changing locks the window up for good
 
@@ -316,7 +316,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   node), and let the animator diff against the patched value; (3) coalesce
   signal-driven rebuilds to at most one per frame and let input and paint run
   between them.
-- **Status:** fixed in Rux cce6fd6 (local): what Rust sets is read once a frame rather than once a set, and parsed stylesheets are kept across whole builds. Driven: probe 4 with its `effect` paints at 30 and 500 Hz, and `stop` lands. Not done: `:d` still rebuilds rather than patching (root cause 2), about a core in a debug build at 30 Hz. **Re-driven by Tracer 2026-10-29** (installed build, debug): 30, 60 and 500 Hz all paint, the nav stays responsive, and **stop** lands (CPU goes flat). Each rate costs about one core. Frames are about 38 ms (≈26 fps): `rebuild` runs **2 times a frame at about 22 ms**, against layout's 9 ms and script's 3 ms. At 500 Hz, 3,707 samples woke the page 244 times, which is right for a chart. The two rebuilds a frame are the `:d` patch path still to come.
+- **Status:** fixed in Rux cce6fd6 (local): what Rust sets is read once a frame rather than once a set, and parsed stylesheets are kept across whole builds. Driven: probe 4 with its `effect` paints at 30 and 500 Hz, and `stop` lands. Not done: `:d` still rebuilds rather than patching (root cause 2), about a core in a debug build at 30 Hz. **Re-driven by Tracer 2026-10-29** (installed build, debug): 30, 60 and 500 Hz all paint, the nav stays responsive, and **stop** lands (CPU goes flat). Each rate costs about one core. Frames are about 38 ms (≈26 fps): `rebuild` runs **2 times a frame at about 22 ms**, against layout's 9 ms and script's 3 ms. At 500 Hz, 3,707 samples woke the page 244 times, which is right for a chart. The two rebuilds a frame are the `:d` patch path still to come. **Root cause 2 fixed in Rux f3553b0 (local, not pushed):** a bound `:d` is patched in place unless the path declares `transition: d`. A chart sample: 3.7 ms to 0.61 ms (release). Driven: probe 4 with its `effect` at 30 Hz uses about half a core in a debug build, against about one before. **Re-driven by Tracer on the pushed build (a27366f), 2026-10-29**, debug: `rebuild` **0** a frame at every rate (was 2 at ~22 ms), `patch` 2 a frame at ~2 ms, frames 10–18 ms. CPU about **0.36 of a core at 30 Hz, 0.66 at 60 Hz, 0.73 at 500 Hz** (was ~1 at each). At 500 Hz, 3,204 samples woke the page 496 times; stop lands. Closed.
 
 ## AW-014 The running app reports problems `rux check` does not
 
@@ -395,7 +395,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   settled task) should apply that change and request a frame. And an edit to
   a field should start from the field's current text, not the text last
   drawn, so keys between two frames are never lost.
-- **Status:** open.
+- **Status:** not in any Rux commit; caused by the Rux checkout holding half-done work. `rux run` in a project with a `native/` crate builds the Rux crates from the checkout as it is at that moment, and this re-run came while the component patch path (AW-012) was half-written there: bindings did not yet record instance state (nothing drawn until a hover forced a restyle) and inputs kept stale state locals (each `r-model` write put old values back). Re-driven on the finished code (c4c46f7 + f3553b0) with `tools/drive.ps1` exactly (window moved to 1920 x 1040, one `SendKeys` call per key at 300 ms, pointer parked; also with `RUX_PROFILE=1`): "post" lands whole and filters to POST /albums, and probe 3's 200 draws with the pointer still. Also on d7d92f9 with another driver: typing works. Please re-run on the pushed build to close it. **Re-driven by Tracer on the pushed build (a27366f), 2026-10-29**, pointer parked: probe 3's 200 draws without a hover (785 ms); probe 2's awaited 1k draws by itself; "post" typed 300 ms a key lands whole and filters to POST /albums; "photos" in one fast burst lands whole; `{BS 30}` clears the field; the palette filters "bench" to Start benchmark. **Closed: not a Rux limit.** Correction to the entry above: the "three backspaces lost" were Tracer's driver splitting `{BS}` into the characters `{`, `B`, `S`, `}`, not Rux.
 
 ## AW-018 A long list costs its whole layout every frame, so 1,000 rows scroll at about 2 fps
 
@@ -422,7 +422,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** keep the layout of rows that didn't change, and lay out
   only what intersects the viewport of a scrolled container (or offer a
   virtualised list). Selector matching has the same per-row shape.
-- **Status:** open. Not yet measured in a release build.
+- **Status:** fixed in Rux 3c28c9d (pushed, installed `rux` is at a27366f). Two causes. A frame that only scrolled laid the whole tree out again; the layout now keeps the last frame's laid-out tree and, when the document's revision, the window size and the `content-visibility` answers are unchanged, only re-places it at the new offsets. And a debug build ran Rux's own proofs on every frame and every list change: each kept layout laid out again whole, each list built alone rebuilt with the whole document. Those were the 414 ms and the ~9 s sync freeze; they are now off in an app's window (`RUX_SELF_CHECK=1` turns them back on). Driven on probe 2 in its debug build: layout **13.4 ms** a scrolled frame (was 414), 40 notches **2.5 s** of CPU (was 29 s), loading 1k lines 2.0 s of CPU with `patch` 0.77 s (was 10.3 s), **1k · sync Rust** never stops responding. A 1,000-row copy in a release build: 16.8 ms to 4.2 ms of layout a frame. Still linear in rows: the walk that places boxes visits every row each frame, so 10,000 rows cost about ten times as much. Found on the way and fixed in 881e8b0: a row scrolled out of a list took taps and hover meant for whatever it lay under. **Re-driven by Tracer on the pushed build (a27366f), 2026-10-29**, debug: 40 one-notch wheel events over 1,002 rows cost **1.8 s** of CPU (about 45 ms each), and the step measured before, 10 events of 10 notches, cost **0.75 s (was 7.8 s, about 10x)**. The window answers throughout and reaches line 1,002. Closed for Tracer at this size; 10k rows, still linear, untested. **Release build:** the 10 x 10-notch step costs **0.34 s** of CPU.
 
 ## Phase 0 results
 
@@ -437,6 +437,23 @@ drag, keys), dev and release builds:
 | 4 Live chart | **Works without an effect**, at a whole core's cost; **locks up with one** (AW-013, blocker). AW-004 is check-only |
 | 5 Child process | **Works**: `@close` ran on a window close and stopped the child; no orphan |
 | 6 Shell | **Works**: both splitters drag and clamp, tabs open, the filter narrows, Ctrl+K from inside a field, `blur()` + `autofocus` hands focus to the palette, Esc and a pick close it |
+
+### Re-run on the pushed build (a27366f, 2026-10-29, evening)
+
+Installed `rux` at a27366f, Rux checkout clean, debug build, pointer parked
+after every action (nothing forced a frame):
+
+| Probe | Result |
+|---|---|
+| 1 Ordered events | **Works**: 1000/1000 in 1 list |
+| 2 Large body | **Works**: 1k awaited and 1k sync both draw in ~1.8 s CPU (release 0.33 s), window answers; scroll 10x cheaper (release 0.34 s for 100 notches); a load/clear frame still up to 2 s in debug, clear 2.6 s CPU (release 0.41 s) |
+| 3 HTTP | **Works**: 200 in 785 ms, drawn without a hover |
+| 4 Live chart | **Works**: 0 rebuilds, 0.36 / 0.66 / 0.73 of a core at 30 / 60 / 500 Hz |
+| 5 Child process | **Works**: Alt+F4 ran `@close`, child stopped |
+| 6 Shell | **Works**: slow and fast typing land whole, backspace, filter, palette |
+
+Every Phase 0 blocker (AW-011, AW-012, AW-013) is closed for Tracer, and the
+AW-017 and AW-018 seen in the earlier re-run are closed too.
 
 ### Re-run on the fixed build (2026-10-29)
 

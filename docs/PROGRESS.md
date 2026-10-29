@@ -5,7 +5,7 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-29)
+## Where it stands (2026-10-29, evening)
 
 Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
 
@@ -39,13 +39,20 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
   lost) and **AW-018** (layout of every row every frame: 414 ms a frame at
   1k rows, debug).
 
+- **Re-run on the pushed Rux build (a27366f)**: all six probes work with the
+  pointer parked. AW-011, AW-012, AW-013, AW-017 and AW-018 are closed for
+  Tracer. AW-017 turned out not to be a Rux bug at all: the earlier run built
+  against a Rux checkout with half-written work in it (see the gotchas).
+  Release build: 1k lines draw in 0.33 s of CPU, and 100 scroll notches cost
+  0.34 s.
+
 ### Next
 
-1. **Waiting on Rux**: AW-017 (blocks every field and request), AW-018, and
-   the component patch path and `:d` patching, which the Rux team is working
-   on (2026-10-29). When a fix lands, re-drive the probe it names and add the
-   numbers to that entry. Probe 2 should also be measured in a release build
-   (`rux run --release`).
+1. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
+   Open leads for them: a frame that loads or clears 1k rows still costs up to
+   2 s in debug, clear costs more than load, and a list's scroll cost is
+   linear in its rows (10k rows untested). Re-measure when they say something
+   landed.
 2. **The window shell as a client of the core** (the rest of Phase 1). Its
    native crate uses `tracer-protocol`'s blocking client, and core events
    reach the page through a `rux::Channel` (now possible: AW-011).
@@ -60,6 +67,12 @@ Things that cost a round trip once. Check here before debugging them again.
 
 ### Building and running
 
+- **`rux run` in an app with a `native/` crate compiles the Rux crates from
+  the checkout as it is right now**, including uncommitted, half-done work.
+  That is what produced the false AW-017 (2026-10-29). Before measuring a Rux
+  fix, run `git -C "C:/Users/USER/Mobile/UI Research" status --short`. If it
+  isn't clean, say so in the result, or wait. The log's `Compiling rux-…`
+  lines show it rebuilt them.
 - **`rux` on PATH can be older than the Rux checkout.** `~/.cargo/bin/rux.exe`
   was a day behind the Channel commit while the checkout's
   `target/release/rux.exe` had it. Compare dates (`ls -la` both) before
@@ -76,6 +89,10 @@ Things that cost a round trip once. Check here before debugging them again.
 - **Git Bash rewrites `/json` into `C:/Program Files/Git/json`**, so
   `rux run --route /json` silently opens on `/`. Prefix the command with
   `MSYS_NO_PATHCONV=1` (or run it from PowerShell).
+- A release build is `rux build --release`, which writes
+  `probes/dist/tracer-probes.exe`; `rux run` has no `--release`. On desktop the
+  profiler is read when the app starts, so launch it as
+  `RUX_PROFILE=1 ./dist/tracer-probes.exe` or it prints nothing.
 - `RUX_PROFILE=1` prints its summary every 60 painted frames into `rux run`'s
   own output, so redirect that to a file and read it there. An idle window
   paints nothing, so it prints nothing.
@@ -93,12 +110,13 @@ Things that cost a round trip once. Check here before debugging them again.
 - Probe 1's burst buttons sit at about (458, 207), (662, 207) and (881, 207)
   at 1280×800. Probe 2's buttons **move** when its note text changes width,
   so take a screenshot before each click there.
-- **While AW-017 is open, an idle window shows stale state.** After a key or an
-  `await`, hover a nav link (anything with `:hover`) and wait a second before
-  the screenshot, or you'll be reading the frame from before. Hovering empty
-  space doesn't force a frame.
-- Type with a gap between keys (a loop of single `SendKeys` calls) when
-  testing fields. Even so, while AW-017 is open only the last key lands.
+- **Park the pointer** (`-Do hover -X 1240 -Y 720`) after each click when
+  testing redraws. A hover over anything with `:hover` forces a frame, and
+  that can hide a missed redraw.
+- To type with gaps, send one key per `SendKeys` call, but treat `{BS}`,
+  `{ESC}` and the like as one token: splitting `{BS}` into characters types
+  the letters `BS` (that was the false "lost backspaces" of 2026-10-29).
+  `-Do keys -Text "{BS 30}"` clears a field.
 - `drive.ps1 -Do wheel` with a negative `-Text` (scroll down) failed before
   2026-10-29: in PowerShell 5.1 `0xFFFFFFFF` is the Int32 `-1`, so masking
   doesn't make it unsigned. It now reinterprets the bytes.
