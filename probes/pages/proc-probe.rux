@@ -1,0 +1,53 @@
+<!-- Probe 5: the window starts a child process (Tracer's core, later) and has
+     to get a chance to stop it when the window closes. -->
+<template>
+  <view class="page">
+    <text class="h">5 · Child process</text>
+    <text class="p">Start the stand-in, then close the window with its X button. The app's @close and unmounted both try to stop it and write to the log below, so the log says which of them ran. Then check whether the pid is still alive.</text>
+    <view class="row">
+      <view class="btn" @tap="startChild()"><text class="btn-label">start child</text></view>
+      <view class="btn ghost" @tap="check()"><text class="btn-label">is it alive?</text></view>
+      <view class="btn ghost" @tap="stop()"><text class="btn-label">stop it</text></view>
+    </view>
+    <view class="card">
+      <text class="stat">pid {{ pid }} · alive {{ alive }}</text>
+      <text class="stat">log {{ logPath }}</text>
+      <text class="stat">after closing: tasklist /FI "PID eq {{ pid }}"</text>
+    </view>
+  </view>
+</template>
+
+<style>
+  .page { display: flex; flex-direction: column; gap: 14px; padding: 28px; }
+  .h { color: #f0f0f0; font-size: 20px; font-weight: 700; }
+  .p { color: #9a9a9a; font-size: 13px; max-width: 720px; }
+  .row { display: flex; gap: 10px; }
+  .btn { padding: 8px 14px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+  .btn:hover { background: #8f81f5; }
+  .btn.ghost { background: #2a2a2a; }
+  .btn-label { color: #ffffff; font-size: 13px; font-weight: 700; }
+  .card { display: flex; flex-direction: column; gap: 6px; padding: 16px; background: #1e1e1e; border-radius: 8px; }
+  .stat { color: #d4d4d4; font-size: 14px; font-family: monospace; }
+</style>
+
+<script>
+  use native::proc;
+
+  let pid = signal(0);
+  let alive = signal(false);
+  let logPath = proc.logPath();
+
+  fn startChild() {
+    pid = proc.spawnChild();
+    alive = proc.childAlive();
+  }
+
+  fn check() {
+    alive = proc.childAlive();
+  }
+
+  fn stop() {
+    proc.stopChild("button");
+    alive = proc.childAlive();
+  }
+</script>

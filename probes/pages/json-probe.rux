@@ -1,0 +1,99 @@
+<!-- Probe 2: can a page show a response body of tens of thousands of lines,
+     coloured, and still scroll? -->
+<template>
+  <view class="page">
+    <text class="h">2 · Large response body</text>
+    <text class="p">Rust builds a pretty-printed JSON array, already split into coloured tokens, so what is measured is Rux rendering it. Ten lines per record. Run with RUX_PROFILE=1 to see each frame's cost.</text>
+    <view class="row">
+      <view class="btn" @tap="loadLines(10)"><text class="btn-label">100 lines</text></view>
+      <view class="btn" @tap="loadLines(30)"><text class="btn-label">300 lines</text></view>
+      <view class="btn" @tap="loadLines(100)"><text class="btn-label">1k lines</text></view>
+      <view class="btn alt" @tap="loadNow(100)"><text class="btn-label">1k · sync Rust</text></view>
+      <view class="btn alt" @tap="loadScript(100)"><text class="btn-label">1k · script</text></view>
+      <view class="btn ghost" @tap="clear()"><text class="btn-label">clear</text></view>
+      <text class="note">{{ note }}</text>
+    </view>
+    <view class="viewer">
+      <view class="ln" r-for="l in lines" r-key="l.no">
+        <text class="no">{{ l.no }}</text>
+        <text class="code" :style="`padding-left: ${l.indent * 18}px`"><text class="key">{{ l.key }}</text><text :class="l.kind">{{ l.value }}</text></text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<style>
+  .page { display: flex; flex-direction: column; gap: 14px; padding: 28px; height: 100%; }
+  .h { color: #f0f0f0; font-size: 20px; font-weight: 700; }
+  .p { color: #9a9a9a; font-size: 13px; max-width: 720px; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .btn { padding: 8px 14px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+  .btn:hover { background: #8f81f5; }
+  .btn.ghost { background: #2a2a2a; }
+  .btn.alt { background: #3a6f5a; }
+  .btn-label { color: #ffffff; font-size: 13px; font-weight: 700; }
+  .note { color: #9a9a9a; font-size: 13px; font-family: monospace; }
+
+  .viewer {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px 0;
+    background: #0e0e0e;
+    border: 1px solid #262626;
+    border-radius: 6px;
+  }
+
+  .ln { display: flex; gap: 14px; padding: 0 12px; }
+  .no { color: #555555; font-size: 13px; font-family: monospace; width: 48px; text-align: right; }
+  .code { color: #d4d4d4; font-size: 13px; font-family: monospace; }
+  .key { color: #9cdcfe; }
+  .string { color: #ce9178; }
+  .number { color: #b5cea8; }
+  .bool { color: #569cd6; }
+  .null { color: #c586c0; }
+  .punct { color: #d4d4d4; }
+</style>
+
+<script>
+  use native::json;
+  use native::clock;
+  use type native::json::JsonLine;
+
+  let lines: JsonLine[] = signal([]);
+  let note = signal("");
+
+  async fn loadLines(records: int) {
+    note = "building…";
+    let t0 = clock.nowMs();
+    let got = await json.sample(records);
+    let t1 = clock.nowMs();
+    lines = got;
+    note = `${got.length} lines · awaited ${(t1 - t0).round()} ms`;
+  }
+
+  // The same lines, from a synchronous export: no `await` involved.
+  fn loadNow(records: int) {
+    lines = json.sampleNow(records);
+    note = `${lines.length} lines · sync Rust`;
+  }
+
+  // The same shape of lines, built in script: no native value involved.
+  fn loadScript(records: int) {
+    let out: JsonLine[] = [];
+    let no = 0;
+    for i in 0..records {
+      for f in 0..10 {
+        no += 1;
+        out.push({ no: no, indent: if f == 0 || f == 9 { 1 } else { 2 }, key: "\"field\": ", value: `"record ${i} field ${f}",`, kind: "string" });
+      }
+    }
+    lines = out;
+    note = `${lines.length} lines · script`;
+  }
+
+  fn clear() {
+    lines = [];
+    note = "";
+  }
+</script>

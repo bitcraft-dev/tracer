@@ -1,0 +1,82 @@
+<!-- Probe 4: a latency chart fed from Rust many times a second, drawn as a
+     <path> whose geometry script builds. -->
+<template>
+  <view class="page">
+    <text class="h">4 · Live chart</text>
+    <text class="p">Rust publishes the last 240 fake latency samples at the chosen rate. The page builds the path's d string in script each time it is woken. Latest-value-wins is right for a chart: what matters is how often it repaints and whether the window stays responsive.</text>
+    <view class="row">
+      <view class="btn" @tap="go(30)"><text class="btn-label">30 Hz</text></view>
+      <view class="btn" @tap="go(60)"><text class="btn-label">60 Hz</text></view>
+      <view class="btn" @tap="go(500)"><text class="btn-label">500 Hz</text></view>
+      <view class="btn ghost" @tap="chart.stop()"><text class="btn-label">stop</text></view>
+    </view>
+    <view class="plot">
+      <path class="line" :d="pathOf(chart.series)" />
+    </view>
+    <view class="card">
+      <text class="stat">samples produced {{ chart.series?.seq ?? 0 }} · page woken {{ wakes }} times</text>
+      <text class="stat">avg {{ avg }} ms · max {{ max }} ms over the window</text>
+    </view>
+  </view>
+</template>
+
+<style>
+  .page { display: flex; flex-direction: column; gap: 14px; padding: 28px; }
+  .h { color: #f0f0f0; font-size: 20px; font-weight: 700; }
+  .p { color: #9a9a9a; font-size: 13px; max-width: 720px; }
+  .row { display: flex; gap: 10px; }
+  .btn { padding: 8px 14px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+  .btn:hover { background: #8f81f5; }
+  .btn.ghost { background: #2a2a2a; }
+  .btn-label { color: #ffffff; font-size: 13px; font-weight: 700; }
+  .plot { width: 740px; height: 260px; padding: 10px; background: #0e0e0e; border: 1px solid #262626; border-radius: 6px; }
+  .line { stroke: #7c6cf0; stroke-width: 2px; stroke-linejoin: round; fill: none; }
+  .card { display: flex; flex-direction: column; gap: 6px; padding: 16px; background: #1e1e1e; border-radius: 8px; }
+  .stat { color: #d4d4d4; font-size: 14px; font-family: monospace; }
+</style>
+
+<script>
+  use native::chart;
+  use type native::chart::Series;
+
+  let wakes = signal(0);
+  let avg = signal(0);
+  let max = signal(0);
+
+  fn go(hz: int) {
+    wakes = 0;
+    chart.start(hz);
+  }
+
+  // 240 samples across 720px; 240 ms of latency fills the height.
+  fn pathOf(s: Series?): string {
+    if s == none { return ""; }
+    let d = "";
+    let i = 0;
+    for p in s.points {
+      let y = 240 - (if p > 240 { 240 } else { p });
+      d += if i == 0 { `M 0 ${y}` } else { ` L ${i * 3} ${y}` };
+      i += 1;
+    }
+    d
+  }
+
+  effect {
+    let s = chart.series;
+    if s != none {
+      wakes += 1;
+      let total = 0.0;
+      let top = 0.0;
+      for p in s.points {
+        total += p;
+        if p > top { top = p; }
+      }
+      avg = (total / s.points.length).round();
+      max = top.round();
+    }
+  }
+
+  unmounted {
+    chart.stop();
+  }
+</script>

@@ -1,0 +1,11 @@
+[app]
+name = "Tracer Probes"
+id = "dev.ruxlang.tracer.probes"
+version = "0.1.0"
+
+# Desktop-sized, as Tracer itself will be.
+[window]
+width = 1280
+height = 800
+min-width = 900
+min-height = 600

@@ -1,0 +1,189 @@
+<!-- Probe 6: Tracer's layout with nothing behind it. Draggable splitters, tabs,
+     a collection tree with method badges, and the Ctrl+K palette, which the
+     <screen> opens through stores::ui. -->
+<template>
+  <view class="shell">
+    <view class="rail">
+      <view class="rail-item" r-for="r in rails" r-key="r" :class="{ on: rail == r }" @tap="rail = r">
+        <text class="rail-label">{{ r }}</text>
+      </view>
+    </view>
+
+    <view class="side" :style="`width: ${sideW}px`">
+      <view class="env"><text class="env-label">◉ local</text></view>
+      <view class="search"><input r-model="filter" placeholder="Filter requests…" /></view>
+      <text class="group">ALBUMS</text>
+      <view class="req" r-for="r in shown" r-key="r.id" :class="{ on: active == r.id }" @tap="open(r.id)">
+        <text class="badge" :class="r.method">{{ r.method }}</text>
+        <text class="path">{{ r.path }}</text>
+      </view>
+    </view>
+
+    <view class="vsplit" @drag="dragSide(event)"></view>
+
+    <view class="main">
+      <view class="tabs">
+        <view class="tab" r-for="t in tabs" r-key="t" :class="{ on: active == t }" @tap="active = t">
+          <text class="tab-label">{{ nameOf(t) }}</text>
+        </view>
+      </view>
+      <view class="reqpane" :style="`height: ${reqH}px`">
+        <view class="bar">
+          <text class="badge big" :class="current?.method ?? &quot;&quot;">{{ current?.method ?? "" }}</text>
+          <text class="url">{{ "{{baseUrl}}" }}{{ current?.path ?? "" }}</text>
+          <view class="send"><text class="send-label">Send</text></view>
+        </view>
+        <view class="subtabs">
+          <text class="subtab on">Params</text>
+          <text class="subtab">Body</text>
+          <text class="subtab">Headers</text>
+          <text class="subtab">Auth</text>
+          <text class="subtab">Asserts</text>
+        </view>
+      </view>
+      <view class="hsplit" @drag="dragReq(event)"></view>
+      <view class="respane">
+        <view class="chips">
+          <text class="chip ok">200 OK</text>
+          <text class="chip">TTFB 147 ms</text>
+          <text class="chip">10.4 KB</text>
+        </view>
+        <text class="stat">sidebar {{ sideW }}px · request pane {{ reqH }}px · last command: {{ ui.lastCommand }}</text>
+      </view>
+    </view>
+
+    <view class="scrim" r-if="ui.palette" @tap="ui.closePalette()">
+      <view class="palette" @tap="noop()">
+        <input r-model="query" placeholder="Type a command…" autofocus />
+        <view class="cmd" r-for="c in hits" r-key="c" @tap="ui.ran(c)">
+          <text class="cmd-label">{{ c }}</text>
+        </view>
+        <text class="empty" r-if="hits.length == 0">No command matches</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<style>
+  .shell { display: flex; height: 100%; background: #141414; }
+
+  .rail { display: flex; flex-direction: column; gap: 4px; width: 64px; padding: 10px 6px; background: #181818; border-right: 1px solid #262626; }
+  .rail-item { padding: 10px 0; border-radius: 6px; cursor: pointer; align-items: center; }
+  .rail-item:hover { background: #222222; }
+  .rail-item.on { background: #2b2540; }
+  .rail-label { color: #c8c8c8; font-size: 11px; text-align: center; }
+
+  .side { display: flex; flex-direction: column; gap: 2px; padding: 10px; background: #1b1b1b; }
+  .env { padding: 8px 10px; border: 1px solid #2c2c2c; border-radius: 6px; margin-bottom: 6px; }
+  .env-label { color: #4ec98f; font-size: 13px; }
+  .search { margin-bottom: 8px; }
+  .group { color: #7a7a7a; font-size: 11px; font-weight: 700; padding: 6px 4px; }
+  .req { display: flex; gap: 8px; align-items: center; padding: 6px; border-radius: 5px; cursor: pointer; }
+  .req:hover { background: #232323; }
+  .req.on { background: #262033; }
+  .path { color: #d4d4d4; font-size: 13px; font-family: monospace; }
+
+  .badge { width: 52px; padding: 2px 0; border-radius: 4px; font-size: 10px; font-weight: 700; text-align: center; color: #101010; }
+  .badge.big { width: 64px; padding: 6px 0; font-size: 12px; }
+  .GET { background: #4ec98f; }
+  .POST { background: #5b9cf0; }
+  .PUT { background: #f0b45b; }
+  .PATCH { background: #b38cf0; }
+  .DELETE { background: #f0716c; }
+
+  .vsplit { width: 5px; background: #222222; cursor: col-resize; }
+  .vsplit:hover { background: #7c6cf0; }
+  .hsplit { height: 5px; background: #222222; cursor: row-resize; }
+  .hsplit:hover { background: #7c6cf0; }
+
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs { display: flex; gap: 2px; padding: 6px 8px 0 8px; background: #181818; border-bottom: 1px solid #262626; }
+  .tab { padding: 8px 14px; border-radius: 6px 6px 0 0; cursor: pointer; }
+  .tab.on { background: #141414; }
+  .tab-label { color: #c8c8c8; font-size: 12px; }
+
+  .reqpane { display: flex; flex-direction: column; gap: 12px; padding: 14px; }
+  .bar { display: flex; gap: 8px; align-items: center; }
+  .url { flex: 1; padding: 8px 12px; background: #1c1c1c; border: 1px solid #2c2c2c; border-radius: 6px; color: #d4d4d4; font-size: 13px; font-family: monospace; }
+  .send { padding: 8px 20px; background: #7c6cf0; border-radius: 6px; }
+  .send-label { color: #ffffff; font-size: 13px; font-weight: 700; }
+  .subtabs { display: flex; gap: 18px; border-bottom: 1px solid #262626; padding-bottom: 8px; }
+  .subtab { color: #8a8a8a; font-size: 13px; }
+  .subtab.on { color: #f0f0f0; }
+
+  .respane { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 14px; }
+  .chips { display: flex; gap: 8px; }
+  .chip { padding: 4px 10px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
+  .chip.ok { color: #4ec98f; border-color: #2e6b4f; }
+  .stat { color: #8a8a8a; font-size: 12px; font-family: monospace; }
+
+  .scrim { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; align-items: center; padding-top: 90px; background: rgba(0, 0, 0, 0.5); }
+  .palette { display: flex; flex-direction: column; gap: 2px; width: 520px; padding: 10px; background: #1e1e1e; border: 1px solid #333333; border-radius: 10px; }
+  .cmd { padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+  .cmd:hover { background: #2b2540; }
+  .cmd-label { color: #d4d4d4; font-size: 13px; }
+  .empty { color: #6a6a6a; font-size: 13px; padding: 8px 10px; }
+</style>
+
+<script>
+  use stores::ui;
+
+  let rails = ["REST", "GraphQL", "Realtime", "Bench", "Mocks", "Agents"];
+  let rail = signal("REST");
+
+  let requests = [
+    { id: "1", method: "GET", path: "/albums" },
+    { id: "2", method: "POST", path: "/albums" },
+    { id: "3", method: "GET", path: "/albums/{id}" },
+    { id: "4", method: "PUT", path: "/albums/{id}" },
+    { id: "5", method: "PATCH", path: "/albums/{id}" },
+    { id: "6", method: "DELETE", path: "/albums/{id}" },
+    { id: "7", method: "GET", path: "/albums/{id}/photos" }
+  ];
+
+  let commands = [
+    "Send request",
+    "Save request",
+    "New request",
+    "Switch environment",
+    "Run collection",
+    "Start benchmark",
+    "Copy as cURL",
+    "Disconnect all agents"
+  ];
+
+  let filter = signal("");
+  let query = signal("");
+  let active = signal("1");
+  let tabs = signal(["1", "2"]);
+  let sideW = signal(280);
+  let reqH = signal(220);
+
+  computed shown = requests.filter(r => r.path.includes(filter) || r.method.includes(filter.toUpperCase()));
+  computed hits = commands.filter(c => c.toLowerCase().includes(query.toLowerCase()));
+  computed current = requests.find(r => r.id == active);
+
+  fn nameOf(id: string): string {
+    let r = requests.find(x => x.id == id);
+    if r == none { return id; }
+    `${r.method} ${r.path}`
+  }
+
+  fn open(id: string) {
+    if !tabs.includes(id) { tabs.push(id); }
+    active = id;
+  }
+
+  fn dragSide(e) {
+    let w = sideW + e.moveX;
+    sideW = if w < 180 { 180 } else if w > 520 { 520 } else { w.round() };
+  }
+
+  fn dragReq(e) {
+    let h = reqH + e.moveY;
+    reqH = if h < 120 { 120 } else if h > 520 { 520 } else { h.round() };
+  }
+
+  // The palette's own taps stop here instead of reaching the scrim's close.
+  fn noop() {}
+</script>

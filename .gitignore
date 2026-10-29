@@ -1,0 +1,12 @@
+# Build output
+target/
+dist/
+# What `rux run` and `rux build` generate
+.rux-build/
+
+# Editors and OS
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

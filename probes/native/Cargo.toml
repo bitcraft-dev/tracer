@@ -1,0 +1,11 @@
+[package]
+name = "tracer-probes-native"
+description = "Phase 0 probes: the Rust half of each capability Tracer needs from Rux."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Patched in the workspace manifest to the local Rux checkout.
+rux = { package = "rux-native", version = "0.9.0-dev" }
+ureq = "3.5.0"

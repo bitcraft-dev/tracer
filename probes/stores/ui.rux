@@ -1,0 +1,19 @@
+<!-- State the screen and the pages share: the command palette is opened by a
+     key the <screen> hears and drawn by the shell probe's page. -->
+<script>
+  export let palette = signal(false);
+  export let lastCommand = signal("");
+
+  export fn togglePalette() {
+    palette = !palette;
+  }
+
+  export fn closePalette() {
+    palette = false;
+  }
+
+  export fn ran(name: string) {
+    lastCommand = name;
+    palette = false;
+  }
+</script>

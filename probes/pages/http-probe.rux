@@ -1,0 +1,96 @@
+<!-- Probe 3: a real request, sent from Rust and awaited by the page, with the
+     request bar Tracer will have. Ctrl+Enter sends from inside the fields. -->
+<template>
+  <view class="page" @key="onKey(event)">
+    <text class="h">3 · Real HTTP request</text>
+    <text class="p">The request runs in Rust off the UI thread. A 4xx or 5xx is an answer; only a transport failure is thrown, and arrives in catch.</text>
+    <view class="bar">
+      <view class="method">
+        <input type="select" r-model="method" :options="methods" />
+      </view>
+      <view class="url">
+        <input r-model="url" placeholder="https://…" />
+      </view>
+      <view class="send" :class="{ busy: busy }" @tap="send()">
+        <text class="send-label">{{ if busy { "Sending…" } else { "Send" } }}</text>
+      </view>
+    </view>
+    <view class="body" r-if="method != &quot;GET&quot; && method != &quot;HEAD&quot;">
+      <input type="textarea" r-model="body" placeholder="request body" />
+    </view>
+    <view class="chips" r-if="res != none">
+      <text class="chip" :class="{ ok: res.status < 400, bad: res.status >= 400 }">Status {{ res.status }}</text>
+      <text class="chip">Time {{ res.ms.round() }} ms</text>
+      <text class="chip">Size {{ res.bytes }} B</text>
+      <text class="chip">Headers {{ res.headers.length }}</text>
+    </view>
+    <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
+    <view class="split" r-if="res != none">
+      <view class="pane">
+        <text class="pane-h">Body (first 4 KiB)</text>
+        <text class="mono">{{ res.preview }}</text>
+      </view>
+      <view class="pane narrow">
+        <text class="pane-h">Headers</text>
+        <text class="mono" r-for="h in res.headers">{{ h }}</text>
+      </view>
+    </view>
+  </view>
+</template>
+
+<style>
+  .page { display: flex; flex-direction: column; gap: 14px; padding: 28px; }
+  .h { color: #f0f0f0; font-size: 20px; font-weight: 700; }
+  .p { color: #9a9a9a; font-size: 13px; max-width: 720px; }
+  .bar { display: flex; gap: 8px; align-items: center; }
+  .method { width: 120px; }
+  .url { flex: 1; }
+  .send { padding: 9px 22px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+  .send:hover { background: #8f81f5; }
+  .send.busy { background: #4a4380; }
+  .send-label { color: #ffffff; font-size: 14px; font-weight: 700; }
+  .body { height: 140px; }
+  .chips { display: flex; gap: 8px; }
+  .chip { padding: 4px 10px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
+  .chip.ok { color: #4ec98f; border-color: #2e6b4f; }
+  .chip.bad { color: #f0716c; border-color: #7a3533; }
+  .error { color: #f0716c; font-size: 13px; font-family: monospace; }
+  .split { display: flex; gap: 12px; }
+  .pane { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 12px; background: #0e0e0e; border: 1px solid #262626; border-radius: 6px; }
+  .pane.narrow { flex: 0 0 340px; }
+  .pane-h { color: #9a9a9a; font-size: 12px; font-weight: 700; padding-bottom: 6px; }
+  .mono { color: #d4d4d4; font-size: 12px; font-family: monospace; }
+</style>
+
+<script>
+  use native::http;
+  use type native::http::HttpResult;
+
+  let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
+  let method = signal("GET");
+  let url = signal("https://jsonplaceholder.typicode.com/photos?albumId=1");
+  let body = signal("{\n  \"title\": \"tracer\"\n}");
+  let res: HttpResult? = signal(none);
+  let error = signal("");
+  let busy = signal(false);
+
+  async fn send() {
+    if busy { return; }
+    busy = true;
+    error = "";
+    try {
+      res = await http.send(method, url, body);
+    } catch e {
+      res = none;
+      error = `${e.kind}: ${e.message}`;
+    }
+    busy = false;
+  }
+
+  fn onKey(e) {
+    if e.primary && e.key == "Enter" {
+      send();
+      return false;
+    }
+  }
+</script>

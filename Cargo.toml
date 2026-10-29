@@ -1,0 +1,21 @@
+# Tracer: an API workbench whose window is written in Rux.
+#
+# The core runs as its own process; the Rux window, the CLI and AI agents are
+# all clients of it. See docs/PLAN.md.
+[workspace]
+resolver = "2"
+members = ["probes/native"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+publish = false
+
+# The native crates name `rux-native` as a crates.io dependency, as every Rux
+# app does, and it is patched here to the local Rux checkout. A path or git
+# dependency in the native crate itself would give the app a second copy of
+# `rux-native` beside the one `rux run` supplies, and a second copy is a second
+# export registry (the same reasoning Mava Studio 2 follows).
+[patch.crates-io]
+rux-native = { path = "C:/Users/USER/Mobile/UI Research/crates/rux-native" }
+rux-native-macros = { path = "C:/Users/USER/Mobile/UI Research/crates/rux-native-macros" }

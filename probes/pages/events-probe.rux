@@ -1,0 +1,74 @@
+<!-- Probe 1: does every event Rust sends reach the page, in order? -->
+<template>
+  <view class="page">
+    <text class="h">1 · Ordered events from Rust</text>
+    <text class="p">Rust sets a rux::Signal once per event, numbered from 1, on another thread. The page counts the ones its effect saw. Tracer's live sync, WebSocket stream and benchmark samples all need every event, in order.</text>
+    <view class="row">
+      <view class="btn" @tap="run(1000, 0)"><text class="btn-label">1,000 · no gap</text></view>
+      <view class="btn" @tap="run(1000, 1000)"><text class="btn-label">1,000 · 1 ms apart</text></view>
+      <view class="btn" @tap="run(200, 20000)"><text class="btn-label">200 · 20 ms apart</text></view>
+    </view>
+    <view class="card">
+      <text class="stat">received {{ received }} of {{ expected }}</text>
+      <text class="stat">skipped {{ skipped }} · out of order {{ backwards }} · last seq {{ last }}</text>
+      <text class="verdict" :class="{ bad: skipped > 0 }">{{ verdict }}</text>
+    </view>
+  </view>
+</template>
+
+<style>
+  .page { display: flex; flex-direction: column; gap: 14px; padding: 28px; }
+  .h { color: #f0f0f0; font-size: 20px; font-weight: 700; }
+  .p { color: #9a9a9a; font-size: 13px; max-width: 720px; }
+  .row { display: flex; gap: 10px; }
+  .btn { padding: 8px 14px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+  .btn:hover { background: #8f81f5; }
+  .btn-label { color: #ffffff; font-size: 13px; font-weight: 700; }
+  .card { display: flex; flex-direction: column; gap: 6px; padding: 16px; background: #1e1e1e; border-radius: 8px; }
+  .stat { color: #d4d4d4; font-size: 15px; font-family: monospace; }
+  .verdict { color: #4ec98f; font-size: 14px; font-weight: 700; }
+  .verdict.bad { color: #f0716c; }
+</style>
+
+<script>
+  use native::events;
+
+  let run_id = signal(0);
+  let expected = signal(0);
+  let received = signal(0);
+  let skipped = signal(0);
+  let backwards = signal(0);
+  let last = signal(0);
+
+  fn run(n: int, gap_us: int) {
+    expected = n;
+    received = 0;
+    skipped = 0;
+    backwards = 0;
+    last = 0;
+    run_id = events.burst(n, gap_us);
+  }
+
+  effect {
+    let t = events.tick;
+    if t != none && t.run == run_id && t.seq != last {
+      received += 1;
+      if t.seq < last {
+        backwards += 1;
+      } else if t.seq > last + 1 {
+        skipped += t.seq - last - 1;
+      }
+      last = t.seq;
+    }
+  }
+
+  computed verdict = if expected == 0 {
+    "press a burst"
+  } else if last < expected {
+    "running…"
+  } else if received == expected {
+    "every event arrived, in order"
+  } else {
+    `${expected - received} of ${expected} events never reached the page`
+  };
+</script>
