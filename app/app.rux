@@ -10,7 +10,7 @@
         <view class="rail-item on"><text class="rail-label">REST</text></view>
       </view>
 
-      <view class="side">
+      <view class="side" :style="`width: ${sideWidth}px`">
         <view class="side-h">
           <text class="side-title">History</text>
           <text class="count">{{ requests.length }}</text>
@@ -35,6 +35,8 @@
         </view>
       </view>
 
+      <view class="split-v" @drag="resizeSide(event)"><view class="grip-v"></view></view>
+
       <view class="work">
         <view class="bar">
           <view class="method">
@@ -57,11 +59,12 @@
             <text class="badge" r-if="sentHeaders().length > 0">{{ sentHeaders().length }}</text>
           </view>
         </view>
-        <view class="editor">
+        <view class="editor" :style="`height: ${reqHeight}px`">
           <input r-if="reqTab == &quot;body&quot;" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
           <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
         </view>
         <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
+        <view class="split-h" @drag="resizeReq(event)"><view class="grip-h"></view></view>
 
         <view class="res">
           <text class="empty" r-if="sel == none">Pick a request in History, or send one.</text>
@@ -141,10 +144,17 @@
   .side {
     display: flex;
     flex-direction: column;
-    width: 300px;
+    flex-shrink: 0;
     background: #1b1b1b;
-    border-right: 1px solid #262626;
   }
+
+  /* Drag handles: a wide target with a thin line, lit while hovered. */
+  .split-v { display: flex; justify-content: center; width: 7px; flex-shrink: 0; cursor: col-resize; }
+  .grip-v { width: 1px; background: #262626; }
+  .split-v:hover .grip-v { width: 3px; background: #7c6cf0; }
+  .split-h { display: flex; flex-direction: column; justify-content: center; height: 9px; flex-shrink: 0; cursor: row-resize; }
+  .grip-h { height: 1px; background: #262626; }
+  .split-h:hover .grip-h { height: 3px; background: #7c6cf0; }
   .side-h { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px 14px; }
   .side-title { color: #f0f0f0; font-size: 13px; font-weight: 700; }
   .count { color: #8a8a8a; font-size: 11px; padding: 1px 6px; background: #262626; border-radius: 8px; }
@@ -187,10 +197,10 @@
   .tab.on .tab-label { color: #f0f0f0; }
   .badge { color: #9a9a9a; font-size: 10px; padding: 0 5px; background: #262626; border-radius: 6px; }
 
-  .editor { height: 110px; display: flex; flex-direction: column; padding: 8px 10px; background: #1b1b1b; border: 1px solid #2e2e2e; border-radius: 6px; }
+  .editor { flex-shrink: 0; display: flex; flex-direction: column; padding: 8px 10px; background: #1b1b1b; border: 1px solid #2e2e2e; border-radius: 6px; }
   .error { color: #f0716c; font-size: 12px; font-family: monospace; }
 
-  .res { flex: 1; display: flex; flex-direction: column; min-height: 0; border-top: 1px solid #262626; padding-top: 10px; }
+  .res { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   .res-in { flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
   .res-h { display: flex; gap: 8px; align-items: center; }
   .res-url { color: #c8c8c8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -261,6 +271,11 @@
   let reqTab = signal("body");
   let resTab = signal("body");
   let error = signal("");
+
+  // The layout, kept in the app's settings so it outlives the window.
+  let sideWidth: float = signal(settings.get("sideWidth") ?? 300.0);
+  let reqHeight: float = signal(settings.get("reqHeight") ?? 110.0);
+  let dragFrom: float = signal(0.0);
 
   let requests: Row[] = signal([]);
   let clients: Client[] = signal([]);
@@ -432,6 +447,23 @@
   fn linkColor(): string {
     let s = tracer.link?.state ?? "";
     if s == "connected" { "#4ec98f" } else if s == "connecting" || s == "" { "#e8a54b" } else { "#f0716c" }
+  }
+
+  fn resizeSide(e: DragEvent) {
+    if e.phase == "start" { dragFrom = sideWidth; }
+    sideWidth = clamp(dragFrom + e.totalX, 200.0, 560.0);
+    if e.phase == "end" { settings.set("sideWidth", sideWidth); }
+  }
+
+  fn resizeReq(e: DragEvent) {
+    if e.phase == "start" { dragFrom = reqHeight; }
+    reqHeight = clamp(dragFrom + e.totalY, 60.0, 420.0);
+    if e.phase == "end" { settings.set("reqHeight", reqHeight); }
+  }
+
+  // `Math.min`/`Math.max` don't exist yet (FINDINGS.md AW-020).
+  fn clamp(v: float, lo: float, hi: float): float {
+    if v < lo { lo } else if v > hi { hi } else { v }
   }
 
   fn onKey(e: KeyEvent) {

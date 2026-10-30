@@ -577,6 +577,23 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   move toward; and say the per-window GPU cost in the docs.
 - **Status:** open.
 
+## AW-023 The docs' `@drag` example uses `event.dx`, which doesn't exist
+
+- **Found:** 2026-10-30, adding Tracer's resizable panes.
+- **Severity:** papercut (docs).
+- **Limit:** `docs/07-script.md` line 267 shows `@drag="offset = event.dx"`.
+  `rux check` refuses it: "`DragEvent` has no field `dx`; did you mean `x`?".
+  The real fields (`crates/rux-script/src/native.rs`, `POINTER_FIELDS` and
+  `TRAVEL_FIELDS`) are `totalX/Y`, `moveX/Y`, `phase`, and the pointer's
+  `x`, `y`, `pageX`, `pageY`, `width`, `height`, `touches`. The docs' field
+  table lists only the travel fields and `phase`, so the checker's suggestion
+  (`x`, the pointer position) points somewhere the docs never mention, and
+  isn't what the example meant either (`totalX`).
+- **Suggested fix:** `@drag="offset = event.totalX"` in the example; list the
+  pointer fields in the table; when a missing field is close to a travel field
+  (`dx` → `totalX`/`moveX`), suggest those.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,

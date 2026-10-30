@@ -64,13 +64,21 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
     `reverse`/`replace` silently mutate and return nothing), **AW-021**
     (`&quot;` not decoded inside `{{ }}`).
 
+- **Committed** (6dd0497, af47b0b). Then, the same day:
+  - **History survives a core restart**, checked: a fresh core replays the
+    old journal and the window shows the old requests with their full
+    responses; numbering carries on. No change needed.
+  - **Resizable panes**: the sidebar's width and the request editor's height
+    drag (`@drag`, `totalX/Y`), and are kept with the built-in `settings`
+    store (`%APPDATA%\dev.ruxlang.tracer\settings.json`), restored at launch.
+    Driven: dragged, closed, reopened, same layout. Filed **AW-023** (the
+    docs' `@drag` example uses a field that doesn't exist).
+
 ### Next
 
-1. Commit `app/` and the core changes once the user has looked.
-2. Window, next steps in Phase 1/2: method colours on the select, a
-   draggable split between request and response, Ctrl+K palette, and
-   history surviving a core restart (check whether a new core replays the old
-   journal to the window).
+1. Ctrl+K command palette (key handling, focus).
+2. Cancel a request in flight: needs a `Cancel` command in the core, and a
+   cancellable `async` on the Rux side (no probe has covered it yet).
 3. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
    Open leads for them: a frame that loads or clears 1k rows still costs up to
    2 s in debug, clear costs more than load, and a list's scroll cost is
@@ -125,6 +133,12 @@ Things that cost a round trip once. Check here before debugging them again.
   `TRACER_STARTED_BY_WINDOW`, which refuses to start another. When launching
   the window, set `TRACER_BIN` to `target/debug/tracer.exe` and run a
   watchdog that kills `tracer` past 3 processes.
+- **`target/` was emptied around 09:03 on 2026-10-30** (not by a session
+  command), which removed `target/debug/tracer.exe`; the window then said
+  "could not start …tracer.exe". `cargo build -p tracer-cli` before
+  launching.
+- The display is scaled 150%: screenshot pixels are 1.5x layout pixels, so a
+  300px sidebar ends at x = 96 + 450 in a screenshot.
 - A `rux run` started with `( … &)` inside a Bash call dies when the call
   ends. Use the tool's background mode.
 - An app with no `native/` crate runs inside `rux.exe`, so its process is
