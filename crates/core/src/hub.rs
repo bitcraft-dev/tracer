@@ -9,17 +9,20 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracer_protocol::{Actor, Event, EventKind, HttpRequest, ServerMessage, JOURNAL_PATH};
+use tracer_protocol::{Actor, Event, EventKind, HttpRequest, SavedRequest, ServerMessage, JOURNAL_PATH};
+
+use crate::files;
 
 pub struct Hub {
     inner: Mutex<Inner>,
     workspace: String,
+    root: PathBuf,
 }
 
 struct Inner {
@@ -79,6 +82,7 @@ impl Hub {
                 running: HashMap::new(),
             }),
             workspace: workspace.display().to_string(),
+            root: workspace.to_path_buf(),
         })
     }
 
@@ -158,6 +162,35 @@ impl Hub {
 
     pub fn publish(&self, actor: Actor, kind: EventKind) -> u64 {
         publish_locked(&mut self.inner.lock().unwrap(), actor, kind)
+    }
+
+    /// Every saved request, the event number that's true at, and the files
+    /// that didn't parse. Read under the lock that saves and deletes take, so
+    /// no change falls between the list and its number.
+    pub fn list_requests(&self) -> (Vec<SavedRequest>, u64, Vec<String>) {
+        let inner = self.inner.lock().unwrap();
+        let (requests, skipped) = files::list(&self.root);
+        (requests, inner.next_seq, skipped)
+    }
+
+    /// Write `request` at `path` and publish it. Gives the path as written.
+    pub fn save_request(&self, actor: Actor, path: &str, request: HttpRequest) -> Result<String, String> {
+        let path = files::normalize(path)?;
+        let mut inner = self.inner.lock().unwrap();
+        files::write(&self.root, &path, &request).map_err(|e| format!("could not save `{path}`: {e}"))?;
+        publish_locked(&mut inner, actor, EventKind::RequestSaved { path: path.clone(), request });
+        Ok(path)
+    }
+
+    pub fn delete_request(&self, actor: Actor, path: &str) -> Result<(), String> {
+        let path = files::normalize(path)?;
+        let mut inner = self.inner.lock().unwrap();
+        files::remove(&self.root, &path).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => format!("there is no saved request `{path}`"),
+            _ => format!("could not delete `{path}`: {e}"),
+        })?;
+        publish_locked(&mut inner, actor, EventKind::RequestDeleted { path });
+        Ok(())
     }
 
     pub fn status(&self) -> (Vec<Actor>, u64) {

@@ -91,6 +91,16 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
                     Err(format!("request #{request_id} is not running"))
                 }
             }
+            (Some(_), Command::ListRequests) => {
+                let (requests, as_of, skipped) = hub.list_requests();
+                Ok(ReplyBody::Requests { requests, as_of, skipped })
+            }
+            (Some((_, actor)), Command::SaveRequest { path, request }) => {
+                hub.save_request(actor.clone(), &path, request).map(|path| ReplyBody::Saved { path })
+            }
+            (Some((_, actor)), Command::DeleteRequest { path }) => {
+                hub.delete_request(actor.clone(), &path).map(|_| ReplyBody::Deleted)
+            }
             (Some(_), Command::Status) => {
                 let (clients, next_seq) = hub.status();
                 Ok(ReplyBody::Status { clients, next_seq, workspace: hub.workspace().to_string() })

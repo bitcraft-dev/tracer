@@ -439,3 +439,58 @@ fn a_core_with_a_cancelled_request_still_stops() {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn saved_requests_are_plain_files_and_every_client_sees_them_change() {
+    let ws = workspace("saved");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    let request = HttpRequest {
+        method: "POST".into(),
+        url: "https://x.test/albums".into(),
+        headers: vec![("Accept".into(), "application/json".into())],
+        body: Some("{\"title\": \"t\"}".into()),
+    };
+    let saved = agent.call(Command::SaveRequest { path: r"requests\albums\new album.http".into(), request: request.clone() });
+    assert_eq!(saved.unwrap(), Ok(ReplyBody::Saved { path: "albums/new album".into() }));
+
+    // A plain file anyone can read, diff or write.
+    let text = std::fs::read_to_string(ws.join("requests/albums/new album.http")).unwrap();
+    assert_eq!(text, "POST https://x.test/albums\nAccept: application/json\n\n{\"title\": \"t\"}\n");
+
+    // The window sees who saved what.
+    let event = loop {
+        let e = window.next_event().unwrap();
+        if matches!(e.kind, EventKind::RequestSaved { .. }) {
+            break e;
+        }
+    };
+    assert_eq!(event.actor.name, "claude-code");
+    assert_eq!(event.kind, EventKind::RequestSaved { path: "albums/new album".into(), request: request.clone() });
+
+    // A file written by hand is listed; one that doesn't parse is named.
+    std::fs::write(ws.join("requests/health.http"), "# ping\nGET http://localhost:8080/health\n").unwrap();
+    std::fs::write(ws.join("requests/albums/broken.http"), "not a request line\n").unwrap();
+    let Ok(ReplyBody::Requests { requests, as_of, skipped }) = window.call(Command::ListRequests).unwrap() else {
+        panic!("no list");
+    };
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["albums/new album", "health"]);
+    assert_eq!(requests[1].request.url, "http://localhost:8080/health");
+    assert!(as_of > event.seq);
+    assert_eq!(skipped.len(), 1);
+    assert!(skipped[0].starts_with("albums/broken"), "{skipped:?}");
+
+    // Deleting removes the file and says so; a second delete, or a path
+    // outside requests/, is refused.
+    std::fs::remove_file(ws.join("requests/albums/broken.http")).unwrap();
+    assert_eq!(agent.call(Command::DeleteRequest { path: "albums/new album".into() }).unwrap(), Ok(ReplyBody::Deleted));
+    assert!(!ws.join("requests/albums").exists(), "the emptied folder was left");
+    assert!(agent.call(Command::DeleteRequest { path: "albums/new album".into() }).unwrap().is_err());
+    assert!(agent.call(Command::SaveRequest { path: "../escape".into(), request }).unwrap().is_err());
+    assert!(!ws.join("escape.http").exists());
+    core.stop();
+}

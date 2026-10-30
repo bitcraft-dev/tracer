@@ -27,6 +27,10 @@ pub const DISCOVERY_PATH: &str = ".tracer/core.json";
 /// The file, relative to the workspace, that holds every event, one per line.
 pub const JOURNAL_PATH: &str = ".tracer/journal.ndjson";
 
+/// The folder, relative to the workspace, that holds saved requests: one
+/// `.http` file each, folders being collections.
+pub const REQUESTS_DIR: &str = "requests";
+
 /// Where the core is listening and what it wants to hear first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
@@ -86,6 +90,15 @@ pub enum Command {
     /// `request_cancelled` and nothing else follows for that request; a
     /// request that has already finished or failed is refused.
     Cancel { request_id: u64 },
+    /// Every saved request, and the event number the list is true at:
+    /// `request_saved` and `request_deleted` events numbered from `as_of` on
+    /// came after it.
+    ListRequests,
+    /// Save a request at `path` (such as `albums/get album`), over any
+    /// request already there. Published as `request_saved`.
+    SaveRequest { path: String, request: HttpRequest },
+    /// Delete the saved request at `path`. Published as `request_deleted`.
+    DeleteRequest { path: String },
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -102,6 +115,14 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub body: Option<String>,
+}
+
+/// A request saved in the workspace, by its path: relative to
+/// [`REQUESTS_DIR`], `/` between folders, no extension.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRequest {
+    pub path: String,
+    pub request: HttpRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,6 +169,11 @@ pub enum ReplyBody {
     Accepted { request_id: u64 },
     Status { clients: Vec<Actor>, next_seq: u64, workspace: String },
     Cancelled,
+    /// `skipped` names files under `requests/` that don't parse, and why.
+    Requests { requests: Vec<SavedRequest>, as_of: u64, skipped: Vec<String> },
+    /// The path as the core wrote it, which may be tidier than the one sent.
+    Saved { path: String },
+    Deleted,
     Stopping,
 }
 
@@ -174,6 +200,8 @@ pub enum EventKind {
     /// Cancelled by this event's actor. A request ends with exactly one of
     /// `request_finished`, `request_failed` or this.
     RequestCancelled { request_id: u64 },
+    RequestSaved { path: String, request: HttpRequest },
+    RequestDeleted { path: String },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
     CoreStopping,

@@ -4,6 +4,10 @@
 //! tracer core                       run the core for this workspace
 //! tracer status                     who is connected, how far the journal goes
 //! tracer send GET https://…         send a request and print its answer
+//! tracer ls                         list the saved requests
+//! tracer save <PATH> GET https://…  save a request as requests/<PATH>.http
+//! tracer run <PATH>                 send a saved request
+//! tracer rm <PATH>                  delete a saved request
 //! tracer watch [--all | --since N]  print events as they happen
 //! tracer cancel <ID>                 cancel a running request, whoever sent it
 //! tracer stop                       stop the workspace's core
@@ -16,7 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tracer_protocol::client::Client;
-use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody};
+use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
 
 const USAGE: &str = "\
 usage:
@@ -24,6 +28,11 @@ usage:
   tracer status                       who is connected, how far the journal goes
   tracer send <METHOD> <URL> [-H 'Name: value']... [-d <body>]
                                       send a request and print its answer
+  tracer ls                           list the saved requests
+  tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>]
+                                      save a request as requests/<PATH>.http
+  tracer run <PATH>                   send a saved request and print its answer
+  tracer rm <PATH>                    delete a saved request
   tracer watch [--all | --since <N>]  print events as they happen
   tracer cancel <ID>                  cancel a running request, whoever sent it
   tracer stop                         stop the workspace's core
@@ -41,6 +50,10 @@ fn main() -> ExitCode {
         Some("core") => core(workspace),
         Some("status") => status(workspace),
         Some("send") => send(workspace, args[1..].to_vec()),
+        Some("ls") => ls(workspace),
+        Some("save") => save(workspace, args[1..].to_vec()),
+        Some("run") => run(workspace, args[1..].to_vec()),
+        Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
         Some("cancel") => cancel(workspace, args[1..].to_vec()),
         Some("stop") => stop(workspace),
@@ -113,7 +126,13 @@ fn cancel(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     }
 }
 
-fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+fn send(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let request = request_from(args)?;
+    send_and_wait(&workspace, request, "tracer send")
+}
+
+/// `<METHOD> <URL> [-H 'Name: value']... [-d <body>]`.
+fn request_from(mut args: Vec<String>) -> io::Result<HttpRequest> {
     let mut headers = Vec::new();
     while let Some(h) = take_value(&mut args, "-H") {
         let Some((name, value)) = h.split_once(':') else {
@@ -123,9 +142,78 @@ fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     }
     let body = take_value(&mut args, "-d");
     let [method, url] = <[String; 2]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
-    let request = HttpRequest { method: method.to_uppercase(), url, headers, body };
+    Ok(HttpRequest { method: method.to_uppercase(), url, headers, body })
+}
 
-    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer send")?;
+fn ls(workspace: PathBuf) -> io::Result<ExitCode> {
+    let (requests, skipped) = saved(&workspace, "tracer ls")?;
+    for r in &requests {
+        println!("{:<7} {:<32} {}", r.request.method, r.path, r.request.url);
+    }
+    for why in &skipped {
+        eprintln!("tracer: skipped {why}");
+    }
+    if requests.is_empty() && skipped.is_empty() {
+        eprintln!("tracer: no saved requests; `tracer save <PATH> GET <URL>` makes one");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn save(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    if args.is_empty() {
+        return Err(io::Error::other(USAGE));
+    }
+    let path = args.remove(0);
+    let request = request_from(args)?;
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer save")?;
+    match client.call(Command::SaveRequest { path, request })? {
+        Ok(ReplyBody::Saved { path }) => {
+            println!("tracer: saved requests/{path}.http");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+fn run(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    // Matched as the core names paths, so `requests/a/b.http` finds `a/b`.
+    let wanted = path.trim().replace('\\', "/");
+    let wanted = wanted.strip_prefix("requests/").unwrap_or(&wanted);
+    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted);
+    let (requests, _) = saved(&workspace, "tracer run")?;
+    let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
+        return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
+    };
+    send_and_wait(&workspace, found.request, "tracer run")
+}
+
+fn rm(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer rm")?;
+    match client.call(Command::DeleteRequest { path: path.clone() })? {
+        Ok(ReplyBody::Deleted) => {
+            println!("tracer: deleted {path}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+fn saved(workspace: &PathBuf, name: &str) -> io::Result<(Vec<SavedRequest>, Vec<String>)> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, name)?;
+    match client.call(Command::ListRequests)? {
+        Ok(ReplyBody::Requests { requests, skipped, .. }) => Ok((requests, skipped)),
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// Send `request` and print its answer when it comes.
+fn send_and_wait(workspace: &PathBuf, request: HttpRequest, name: &str) -> io::Result<ExitCode> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, name)?;
     // Subscribed before sending, so the answer cannot go past unseen.
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
     let request_id = match client.call(Command::Send { request })? {
@@ -190,6 +278,8 @@ fn describe(event: &Event) -> String {
         ),
         EventKind::RequestFailed { request_id, error } => format!("#{request_id} failed: {error}"),
         EventKind::RequestCancelled { request_id } => format!("#{request_id} cancelled"),
+        EventKind::RequestSaved { path, request } => format!("saved {path} ({} {})", request.method, request.url),
+        EventKind::RequestDeleted { path } => format!("deleted {path}"),
         EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)
