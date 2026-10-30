@@ -540,7 +540,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   `"` works in text, so it is only the inconsistency.
 - **Suggested fix:** decode entities in text interpolations as in attributes,
   or have the error say "write `\"` here; `&quot;` is only for attributes".
-- **Status:** open.
+- **Status:** fixed in Rux 73ff9a7 (pushed): an entity in text (`&quot;`, `&amp;`, `&#39;`) is decoded inside `{{ }}` as it is in an attribute.
 
 ## AW-022 Every window holds about 490 MB of GPU memory, whatever it draws
 
@@ -575,7 +575,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   `RUX_PROFILE` printing GPU allocations); size vello's buffers from the
   scene, starting small and growing on overflow, as newer vello versions
   move toward; and say the per-window GPU cost in the docs.
-- **Status:** open.
+- **Status:** fixed in Rux a53b9fb + 92a5e03 (pushed). vello (now vendored) sizes its scratch buffers to the scene rather than to a fixed ~150 MB a frame in flight, and its device asks wgpu for small memory blocks. The 1,000-row window: GPU memory 475 MB to 61 MB, private 586 MB to 193 MB, frame time as before. `RUX_GPU_REPORT=1` prints what a window's GPU memory holds after its 30th frame. The web keeps vello's fixed path.
 
 ## AW-023 The docs' `@drag` example uses `event.dx`, which doesn't exist
 
@@ -592,7 +592,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** `@drag="offset = event.totalX"` in the example; list the
   pointer fields in the table; when a missing field is close to a travel field
   (`dx` → `totalX`/`moveX`), suggest those.
-- **Status:** open.
+- **Status:** fixed in Rux b0b362b (pushed): the `@drag` example uses `event.totalX`, the distance section names the pointer fields, and `dx`, `deltaX`, `movementX` or `distanceX` on an event with travel fields is answered with "write `totalX` (from where the press landed) or `moveX` (since the last move)".
 
 ## AW-024 An `effect` runs again with its signal unchanged, right after a key handler, and undoes it
 
@@ -652,7 +652,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** compare before notifying in signal writes (or in the
   field's model write); and a test with an `effect` on a field's model plus a
   key handler on that field, keys sent within the undo-group window.
-- **Status:** open.
+- **Status:** fixed in Rux ff24a56 (pushed): an `effect` listens only to what it read for its value. `pick = 0` in the effect left it subscribed to `pick` whenever the assignment changed nothing, so the key's `pick += 1` woke it and was reset; a signal the effect only writes no longer wakes it.
 
 ## AW-025 Script can't write to the clipboard
 
@@ -667,7 +667,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** a built-in like `settings`: `clipboard.writeText(s)` and
   `clipboard.readText(): string?`, under the browser's names, desktop and web
   (`navigator.clipboard`), Android through its clipboard manager.
-- **Status:** open.
+- **Status:** fixed in Rux e0405b8 (pushed): `clipboard.writeText(text)` (a plain call, so a `@tap` can make it) and `await clipboard.readText()` (`""` for no text), Rux's own like `settings`, on every target. Driven in a desktop window: paste from another program, copy to another program, an empty clipboard. The web and Android built, not driven.
 
 ## AW-026 Script can't cancel, or put a time limit on, a native call it awaits
 
@@ -692,7 +692,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   being dropped); and drop the future when its owner goes, saying so in the
   docs. A timeout falls out of the same handle once script has a clock
   (AW-009).
-- **Status:** open.
+- **Status:** fixed in Rux 4906409 + 5be1b1e (pushed). An awaited native call's Rust future is now dropped where it waits when its run is cancelled or the component that started it goes, so a request goes no further (a call that blocks its thread inside a poll still finishes first). A call to an `async fn` without `await` gives a handle, as `setInterval` does, and `cancel(handle)` stops the run; a timeout is a `setInterval` that cancels. A file's own `fn cancel(x)` keeps the name. Under test (a guard held in a future that never finishes is dropped); not driven in a window.
 
 ## AW-027 An `effect` that empties a signal it reads is never woken by that signal again
 
@@ -745,7 +745,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** keep a signal the effect read among its subscriptions
   even if it also wrote it, and swallow only the wake caused by its own
   write; a test with the page above.
-- **Status:** open.
+- **Status:** fixed in Rux f7876a4 (pushed): an `effect` that empties a signal it reads is woken by that signal again.
 
 ## AW-028 A page that loads again re-reads the channel's last list
 
@@ -764,7 +764,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   unnumbered values has nothing to go on.
 - **Suggested fix:** a page that loads starts with an empty channel list; or
   document that a reload replays the last list.
-- **Status:** open.
+- **Status:** not reproduced at Rux 1773c46 (pushed). Rust's take empties the queue, a page that loads starts each channel at `[]` (since AW-019), and a reload carries no script state; a test now holds that. Driven in Tracer's window on a scratch workspace: 2 requests, then 2 hot reloads with the `e.seq <= lastSeq` line commented out, and history stayed at 2 rows. Most likely seen on a build before 800250d. The seq check can stay as ordinary care for a numbered stream.
 
 ## AW-029 An `async fn` an effect starts, when a channel woke it, never comes back from its `await`
 
@@ -800,7 +800,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** a test with an effect that, on a channel value, starts an
   `async fn` awaiting a native `async fn`, the push made from another thread
   while the window is idle.
-- **Status:** open.
+- **Status:** fixed in Rux 59923cf (pushed): an `async fn` an effect starts on a push from Rust comes back from its `await`.
 
 ## AW-030 Symbols outside the UI font draw as boxes: no fallback to Segoe UI Symbol
 
@@ -817,7 +817,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   to the fallback chain on Windows, and the platform equivalents elsewhere
   (Apple Symbols; DejaVu Sans / Noto Sans Symbols 2); fontique's fallback by
   script doesn't cover symbols, which are script "Common".
-- **Status:** open.
+- **Status:** fixed in Rux cf9e563 (pushed): every font-family list ends with the symbol and emoji fonts that are installed (Segoe UI Emoji and Segoe UI Symbol on Windows, Apple's and Noto's elsewhere), found once at start, as a browser falls back, so ✕ ▾ ▸ ⧉ ⌫ draw.
 
 ## AW-031 Keyboard focus is kept by position: when a focusable element appears before it, focus moves to the newcomer
 
@@ -860,7 +860,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   key, as text fields are by `r-model`, row and instance) and find its new
   index after each layout, dropping focus only if it is gone; and have a
   text field taking focus (tap or `autofocus`) set `focus_index` to itself.
-- **Status:** open.
+- **Status:** fixed in Rux e48f594 (pushed): keyboard focus is found again after each layout by what it is (a field by model, row and instance; a box by its handler, which carries a row's values; a select or file input by model), and dropped only when it is gone. A field taking the caret, by a tap, `autofocus` or a script, takes keyboard focus too. Driven on the reproduction above: the old build rings "clear" as soon as the field has text, the new one does not, and one Tab reaches "after". The palette and arriving-row cases are under test, not driven.
 
 ## AW-032 A select's dropdown runs off the bottom of the window, and what's below can't be reached
 
@@ -879,7 +879,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** place the panel with the room there is (flip up, or
   cap its height to the window and scroll it, as browsers do), and let the
   arrows and Enter pick within an open dropdown.
-- **Status:** open.
+- **Status:** fixed in Rux 105131c (pushed): the drawn dropdown opens below when every option fits there, else above when they fit there, else on the side with more room, capped to the window and scrolled. The wheel scrolls an open list; the arrows, Home and End move an outlined pick; Enter or Space takes it; Escape or Tab closes it. Driven at 150%: ten options flip above a select near the bottom, Down three times and Enter choose "four", thirty options scroll with End and the wheel.
 
 ## AW-033 Script has no wall clock or `Date`: an app can't say when something happened
 
@@ -898,7 +898,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   local-time getters and `toLocaleTimeString` / `toLocaleDateString`, or
   `Intl.RelativeTimeFormat` for "3 min ago"; JavaScript's names, as AW-020
   went.
-- **Status:** open.
+- **Status:** fixed in Rux 4deca46 (pushed), in the shape the owner chose: functions on milliseconds, no `Date` value and no `new`. `Date.now()` is milliseconds since 1970 (`int`); `Date.time(ms)` gives `"14:02"` and `Date.date(ms)` `"30 Oct 2026"` in the local time zone; `Date.hours`, `minutes`, `seconds`, `day`, `month` (1 to 12), `year` and `weekday` (0 is Sunday) give `int`s. "3 min ago" is `intDiv(Date.now() - atMs, 60000)`. Driven against the system clock.
 
 ## Phase 0 results
 
