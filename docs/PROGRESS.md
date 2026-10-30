@@ -221,11 +221,17 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     row at a narrow window (a flex row shrunk below its text's width keeps
     one line's height); minimal pages didn't reproduce it.
 
+  - **Rux b4fe20a (local, not pushed):** AW-035 fixed and re-driven
+    (probe 2 at 978, 820 and 1360 px wide with scrolling; Tracer's Headers
+    tab with a 105-character header). New: **AW-036**, an `overflow:
+    hidden` flex item keeps its content width as its minimum, so a long
+    history URL squeezes the method column and overflows the row
+    (pre-existing: the installed 08c314f does it).
+
 ### Next
 
-1. When AW-035 is fixed: re-drive probe 2 at about 1000×1040. Tracer's
-   response body is one text, but its Headers tab is flex rows (`.hdr`), so
-   a long header value in a narrow pane may hit it: check that too.
+1. When b4fe20a is pushed, mark AW-035 closed. When AW-036 is fixed:
+   re-drive Tracer's history with a long URL in a narrow sidebar.
 2. Phase 3 remainder: try `tracer mcp` from a real client (`claude mcp add`,
    README); the local HTTP/WS API for anything that isn't MCP; per-agent
    permissions (read-only / local env only / anywhere) and rate and size
@@ -234,7 +240,10 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
    remembered env the open workspace doesn't have (seen: "typicode" in a
-   fresh workspace), and Send would use it.
+   fresh workspace), and Send would use it; the remembered sidebar width
+   isn't capped by the window, so at 1000 px wide a 400 px sidebar
+   collapses the URL field; the response header name column is a fixed
+   220 px, which squeezes values in a narrow pane.
 
 ## Gotchas and how they were solved
 

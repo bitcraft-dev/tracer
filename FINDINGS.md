@@ -974,6 +974,40 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   it was measured at, measure its height again at the final width, as CSS
   does (the second pass of flex layout); a test with a row whose basis
   is its one-line width inside a narrower container.
+- **Status:** fixed in Rux b4fe20a (local, not pushed when re-driven), by the Rux team: taffy hands a known width over as the border box, and Rux wrapped the text at that, so the `padding-left` counted as room and one line fit; text now wraps at the content width. **Re-driven by Tracer on b4fe20a (checkout clean; `rux run` builds from it), 2026-10-30:** probe 2 with 1k lines at 978×984 (the failing size): lines 6, 16, 26 are two lines tall with the next row below them; at 820 px wide, after scrolling 40 notches, lines 65/66/75/76 each wrap with nothing overlapped; at 1360 px nothing wraps. In Tracer's window (also built from it), the response Headers tab in a narrow pane: a 105-character `X-Long-Header` and the CORS headers wrap, each row as tall as its longest cell. **Closed** once b4fe20a is pushed.
+
+## AW-036 A flex item with `overflow: hidden` keeps its content's width as its minimum, so it squeezes its siblings and overflows its container
+
+- **Found:** 2026-10-30, Tracer's history rows at a narrow window, while
+  re-driving AW-035.
+- **Severity:** bug; every list row with an ellipsised title next to a
+  fixed-width column meets it (Tracer's history and collections).
+- **Limit:** in a `display: flex` row, a `<text>` with `flex: 1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis` beside a
+  `width: 64px` sibling. When the text is longer than the row, Rux keeps
+  the text box at its one-line width and shrinks the sibling to its own
+  content ("GET"), and the text box runs past its container's padding. In
+  CSS, an item whose `overflow` isn't `visible` has an automatic minimum
+  width of 0, and `flex: 1` makes its basis 0: the sibling keeps its 64 px
+  and the text ellipsises inside the row.
+- **Reproduction:** (installed `rux` 08c314f, no native crate)
+  ```html
+  <view class="side">
+    <view class="row"><text class="m">GET</text><text class="u">https://httpbin.org/response-headers?X-Long-Header=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</text></view>
+    <view class="row"><text class="m">GET</text><text class="u">https://short.test/x</text></view>
+  </view>
+  ```
+  with `.side { width: 300px; padding: 8px }`, `.row { display: flex; gap:
+  8px }`, `.m { width: 64px }` and `.u` as above, backgrounds on `.m` and
+  `.u` to see their boxes: the first row's `.m` is as wide as "GET" and
+  its `.u` ends past the side's padding; the second row's `.m` is 64 px.
+  Seen in Tracer too, where the history list then grows a horizontal
+  scrollbar. Not a regression from b4fe20a: the installed 08c314f does it.
+- **Workaround:** none taken (`min-width: 0` on the text, or
+  `flex-shrink: 0` on the column, would likely sidestep it; untried).
+- **Suggested fix:** resolve `min-width: auto` to 0 for a flex item whose
+  `overflow` is not `visible` (CSS Flexbox, "automatic minimum size"),
+  and check `flex: 1` sets a 0 basis.
 - **Status:** open.
 
 ## Phase 0 results
