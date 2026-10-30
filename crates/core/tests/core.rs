@@ -494,3 +494,35 @@ fn saved_requests_are_plain_files_and_every_client_sees_them_change() {
     assert!(!ws.join("escape.http").exists());
     core.stop();
 }
+
+#[test]
+fn a_request_a_dead_core_left_running_is_closed_when_the_next_one_opens() {
+    let ws = workspace("unfinished");
+    std::fs::create_dir_all(ws.join(".tracer")).unwrap();
+    // What a core killed mid-request leaves: a start with no end.
+    let started = r#"{"seq":1,"at_ms":1,"actor":{"kind":"agent","name":"claude-code"},"event":"request_started","request_id":7,"request":{"method":"GET","url":"http://x.test/"}}"#;
+    std::fs::write(ws.join(".tracer/journal.ndjson"), format!("{started}\n")).unwrap();
+
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: Some(0) }).unwrap().unwrap();
+    let mut ended = None;
+    for _ in 0..3 {
+        let e = window.next_event().unwrap();
+        if let EventKind::RequestFailed { request_id: 7, error } = &e.kind {
+            ended = Some((e.seq, e.actor.name.clone(), error.clone()));
+            break;
+        }
+    }
+    let (seq, actor, error) = ended.expect("the unfinished request was not closed");
+    assert_eq!((seq, actor.as_str()), (2, "claude-code"));
+    assert!(error.contains("stopped"), "{error}");
+    core.stop();
+
+    // Only once: the next core finds it closed.
+    let core = tracer_core::start(&ws).unwrap();
+    core.stop();
+    let journal = std::fs::read_to_string(ws.join(".tracer/journal.ndjson")).unwrap();
+    let failures = journal.lines().filter(|l| l.contains("\"request_failed\"") && l.contains("\"request_id\":7")).count();
+    assert_eq!(failures, 1, "{journal}");
+}

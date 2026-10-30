@@ -68,9 +68,21 @@ impl Hub {
             })
             .max()
             .map_or(1, |id| id + 1);
+        // Requests a previous core started and never ended: it stopped, or
+        // was killed, with them in flight.
+        let mut unfinished: Vec<(u64, Actor)> = Vec::new();
+        for e in &events {
+            match &e.kind {
+                EventKind::RequestStarted { request_id, .. } => unfinished.push((*request_id, e.actor.clone())),
+                EventKind::RequestFinished { request_id, .. }
+                | EventKind::RequestFailed { request_id, .. }
+                | EventKind::RequestCancelled { request_id } => unfinished.retain(|(id, _)| id != request_id),
+                _ => {}
+            }
+        }
         fs::create_dir_all(path.parent().expect("the journal is inside .tracer/"))?;
         let journal = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Hub {
+        let hub = Hub {
             inner: Mutex::new(Inner {
                 next_seq,
                 next_client: 1,
@@ -83,7 +95,17 @@ impl Hub {
             }),
             workspace: workspace.display().to_string(),
             root: workspace.to_path_buf(),
-        })
+        };
+        // Each is closed in its sender's name, as any failure is, so every
+        // client stops showing it as running.
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            for (request_id, actor) in unfinished {
+                let error = "the core stopped before it finished".to_string();
+                publish_locked(&mut inner, actor, EventKind::RequestFailed { request_id, error });
+            }
+        }
+        Ok(hub)
     }
 
     pub fn workspace(&self) -> &str {
