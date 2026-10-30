@@ -223,8 +223,9 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 
 ### Next
 
-1. When AW-035 is fixed: re-drive probe 2 at about 1000×1040. Until then,
-   Tracer's response pane is one text, not rows, so it isn't affected.
+1. When AW-035 is fixed: re-drive probe 2 at about 1000×1040. Tracer's
+   response body is one text, but its Headers tab is flex rows (`.hdr`), so
+   a long header value in a narrow pane may hit it: check that too.
 2. Phase 3 remainder: try `tracer mcp` from a real client (`claude mcp add`,
    README); the local HTTP/WS API for anything that isn't MCP; per-agent
    permissions (read-only / local env only / anywhere) and rate and size
