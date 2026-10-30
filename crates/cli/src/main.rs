@@ -5,6 +5,7 @@
 //! tracer status                     who is connected, how far the journal goes
 //! tracer send GET https://…         send a request and print its answer
 //! tracer watch [--all | --since N]  print events as they happen
+//! tracer cancel <ID>                 cancel a running request, whoever sent it
 //! tracer stop                       stop the workspace's core
 //! ```
 //!
@@ -24,6 +25,7 @@ usage:
   tracer send <METHOD> <URL> [-H 'Name: value']... [-d <body>]
                                       send a request and print its answer
   tracer watch [--all | --since <N>]  print events as they happen
+  tracer cancel <ID>                  cancel a running request, whoever sent it
   tracer stop                         stop the workspace's core
 
 options:
@@ -40,6 +42,7 @@ fn main() -> ExitCode {
         Some("status") => status(workspace),
         Some("send") => send(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
+        Some("cancel") => cancel(workspace, args[1..].to_vec()),
         Some("stop") => stop(workspace),
         _ => {
             eprintln!("{USAGE}");
@@ -96,6 +99,20 @@ fn stop(workspace: PathBuf) -> io::Result<ExitCode> {
     }
 }
 
+fn cancel(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let [id] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let request_id = id.trim_start_matches('#').parse().map_err(|_| io::Error::other(format!("`{id}` is not a request id")))?;
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer cancel")?;
+    match client.call(Command::Cancel { request_id })? {
+        Ok(ReplyBody::Cancelled) => {
+            println!("tracer: cancelled #{request_id}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
 fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let mut headers = Vec::new();
     while let Some(h) = take_value(&mut args, "-H") {
@@ -116,8 +133,17 @@ fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),
     };
+    eprintln!("#{request_id} sent; `tracer cancel {request_id}` stops it");
     loop {
-        match client.next_event()?.kind {
+        let event = client.next_event()?;
+        if let EventKind::RequestCancelled { request_id: id } = event.kind {
+            if id == request_id {
+                return Err(io::Error::other(format!("cancelled by {}", event.actor.name)));
+            }
+            continue;
+        }
+
+        match event.kind {
             EventKind::RequestFinished { request_id: id, response } if id == request_id => {
                 eprintln!(
                     "{} · TTFB {:.0} ms · total {:.0} ms · {} B",
@@ -163,6 +189,7 @@ fn describe(event: &Event) -> String {
             response.status, response.timing.total_ms, response.size
         ),
         EventKind::RequestFailed { request_id, error } => format!("#{request_id} failed: {error}"),
+        EventKind::RequestCancelled { request_id } => format!("#{request_id} cancelled"),
         EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)

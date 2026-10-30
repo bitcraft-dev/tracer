@@ -53,7 +53,7 @@ pub struct CoreEvent {
     pub actor_kind: String,
     pub actor: String,
     /// `client_joined`, `client_left`, `request_started`, `request_finished`,
-    /// `request_failed` or `core_stopping`.
+    /// `request_failed`, `request_cancelled` or `core_stopping`.
     pub kind: String,
     pub client: u64,
     pub request_id: u64,
@@ -187,10 +187,28 @@ pub fn send(method: String, url: String, headers: Vec<Header>, body: String) -> 
     }
 }
 
+/// Cancel a running request, whoever sent it. Its `request_cancelled`
+/// arrives on `events` like everything else.
+#[rux::export]
+pub fn cancel(request_id: u64) -> Result<(), CoreError> {
+    let shared = match SESSION.lock().unwrap().as_ref() {
+        Some(session) => session.shared.clone(),
+        None => return Err(CoreError("not connected to a core".into())),
+    };
+    match shared.call(Command::Cancel { request_id }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// Leave the core: stop it if this window started it, otherwise hang up.
 /// `why` becomes the link's detail.
 #[rux::export]
 pub fn close(why: String) {
+    // A `connect` still under way finishes first, so a core it is starting
+    // is stopped here rather than left running with no window.
+    let _after_connect = CONNECTING.lock().unwrap();
     let Some(mut session) = SESSION.lock().unwrap().take() else { return };
     if let Some(link) = LINK.get() {
         set_link("closed", &why, &link.workspace, link.started_core);
@@ -356,6 +374,10 @@ fn to_page(event: Event) -> CoreEvent {
             out.kind = "request_failed".into();
             out.request_id = request_id;
             out.error = error;
+        }
+        EventKind::RequestCancelled { request_id } => {
+            out.kind = "request_cancelled".into();
+            out.request_id = request_id;
         }
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }

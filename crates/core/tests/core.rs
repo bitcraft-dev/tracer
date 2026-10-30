@@ -322,3 +322,120 @@ fn shutdown_answers_the_asker_tells_every_watcher_and_stops_the_core() {
     assert!(!ws.join(DISCOVERY_PATH).exists(), "the discovery file was left behind");
     assert!(Client::connect(&ws, ClientKind::Cli, "late").is_err());
 }
+
+/// A server that sends its headers at once, then a body of `chunks` pieces
+/// with `gap` between them. Gives its base URL.
+fn trickle_server(chunks: usize, gap: Duration) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\n");
+                for _ in 0..chunks {
+                    thread::sleep(gap);
+                    if stream.write_all(b"x").and_then(|_| stream.flush()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_cancelled_request_ends_once_for_everyone_and_says_who_cancelled_it() {
+    let ws = workspace("cancel");
+    let slow = trickle_server(40, Duration::from_millis(100));
+    let fast = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+
+    let mut watcher = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    watcher.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let (tx, events) = mpsc::channel();
+    let _watcher = watcher.into_shared(move |incoming| {
+        let _ = tx.send(incoming);
+    }).unwrap();
+
+    // The CLI sends; an agent cancels it while the body is still arriving.
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer send").unwrap();
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("{slow}/big"))).unwrap() else {
+        panic!("send was not accepted");
+    };
+    thread::sleep(Duration::from_millis(300));
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    assert_eq!(agent.call(Command::Cancel { request_id }).unwrap(), Ok(ReplyBody::Cancelled));
+    // A second cancel is refused: it has already ended.
+    assert!(agent.call(Command::Cancel { request_id }).unwrap().is_err());
+
+    // The watcher sees it cancelled by the agent, and nothing after that for
+    // this request, though the server would have finished in about 4 s.
+    let mut cancelled = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Ok(Incoming::Event(event)) = events.recv_timeout(Duration::from_millis(200)) else { continue };
+        match event.kind {
+            EventKind::RequestCancelled { request_id: id } if id == request_id => {
+                assert_eq!(event.actor.name, "claude-code");
+                cancelled += 1;
+            }
+            EventKind::RequestFinished { request_id: id, .. } | EventKind::RequestFailed { request_id: id, .. }
+                if id == request_id =>
+            {
+                panic!("a cancelled request also ended: {:?}", event.kind);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(cancelled, 1);
+
+    // A request that has finished can't be cancelled.
+    let Ok(ReplyBody::Accepted { request_id: done }) = cli.call(get(format!("{fast}/a"))).unwrap() else {
+        panic!("send was not accepted");
+    };
+    loop {
+        if let Ok(Incoming::Event(Event { kind: EventKind::RequestFinished { request_id: id, .. }, .. })) =
+            events.recv_timeout(Duration::from_secs(5))
+        {
+            if id == done {
+                break;
+            }
+        }
+    }
+    let refused = agent.call(Command::Cancel { request_id: done }).unwrap();
+    assert_eq!(refused, Err(format!("request #{done} is not running")));
+    core.stop();
+}
+
+#[test]
+fn a_core_with_a_cancelled_request_still_stops() {
+    let ws = workspace("cancel-stop");
+    let slow = trickle_server(100, Duration::from_millis(100));
+    let core = tracer_core::start(&ws).unwrap();
+    let waiting = thread::spawn(move || core.wait());
+
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: Some(0) }).unwrap().unwrap();
+    let window = window.into_shared(|_| {}).unwrap();
+    let Ok(Ok(ReplyBody::Accepted { request_id })) = window.call(get(format!("{slow}/big"))) else {
+        panic!("send was not accepted");
+    };
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(window.call(Command::Cancel { request_id }).unwrap(), Ok(ReplyBody::Cancelled));
+    assert_eq!(window.call(Command::Shutdown).unwrap(), Ok(ReplyBody::Stopping));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !waiting.is_finished() {
+        assert!(std::time::Instant::now() < deadline, "the core did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+}

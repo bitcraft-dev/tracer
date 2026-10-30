@@ -3,7 +3,13 @@
 //! Phase 1 times what `ureq` can tell apart: the status line and headers
 //! (TTFB) and the whole body. DNS, connect and TLS need a lower-level client
 //! and come with the timing waterfall.
+//!
+//! A cancelled request stops between reads of its body. The wait for the
+//! status line can't be interrupted with `ureq`: that thread runs on until the
+//! server answers, and its answer is dropped.
 
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tracer_protocol::{HttpRequest, HttpResponse, Timing};
@@ -11,7 +17,7 @@ use ureq::Agent;
 
 /// An error status is an answer, not a failure: only a request that got no
 /// answer at all is an `Err`.
-pub fn execute(req: &HttpRequest) -> Result<HttpResponse, String> {
+pub fn execute(req: &HttpRequest, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
     let agent: Agent = Agent::config_builder().http_status_as_error(false).build().into();
     let mut builder = ureq::http::Request::builder().method(req.method.as_str()).uri(req.url.as_str());
     for (name, value) in &req.headers {
@@ -23,7 +29,18 @@ pub fn execute(req: &HttpRequest) -> Result<HttpResponse, String> {
     let started = Instant::now();
     let mut res = agent.run(request).map_err(|e| e.to_string())?;
     let ttfb = started.elapsed();
-    let bytes = res.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    let mut reader = res.body_mut().as_reader();
+    let mut chunk = vec![0; 64 * 1024];
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        match reader.read(&mut chunk).map_err(|e| e.to_string())? {
+            0 => break,
+            n => bytes.extend_from_slice(&chunk[..n]),
+        }
+    }
     let total = started.elapsed();
 
     Ok(HttpResponse {

@@ -82,6 +82,10 @@ pub enum Command {
     /// Send an HTTP request. The reply gives its id at once; what happens to
     /// it arrives as events, which every client sees.
     Send { request: HttpRequest },
+    /// Cancel a request still running, whoever sent it. The core publishes
+    /// `request_cancelled` and nothing else follows for that request; a
+    /// request that has already finished or failed is refused.
+    Cancel { request_id: u64 },
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -143,6 +147,7 @@ pub enum ReplyBody {
     Subscribed { replayed: u64, next_seq: u64 },
     Accepted { request_id: u64 },
     Status { clients: Vec<Actor>, next_seq: u64, workspace: String },
+    Cancelled,
     Stopping,
 }
 
@@ -166,6 +171,9 @@ pub enum EventKind {
     RequestStarted { request_id: u64, request: HttpRequest },
     RequestFinished { request_id: u64, response: HttpResponse },
     RequestFailed { request_id: u64, error: String },
+    /// Cancelled by this event's actor. A request ends with exactly one of
+    /// `request_finished`, `request_failed` or this.
+    RequestCancelled { request_id: u64 },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
     CoreStopping,

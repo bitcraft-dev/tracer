@@ -71,20 +71,25 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
                 continue;
             }
             (Some((_, actor)), Command::Send { request }) => {
-                // The id goes back before any event names it, so the sender
-                // knows which `request_started` is its own.
-                let request_id = hub.next_request_id();
+                let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone());
                 let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
-                hub.publish(actor.clone(), EventKind::RequestStarted { request_id, request: request.clone() });
                 let (hub, actor) = (hub.clone(), actor.clone());
                 thread::spawn(move || {
-                    let kind = match http::execute(&request) {
+                    let kind = match http::execute(&request, &cancelled) {
                         Ok(response) => EventKind::RequestFinished { request_id, response },
                         Err(error) => EventKind::RequestFailed { request_id, error },
                     };
-                    hub.publish(actor, kind);
+                    // Dropped if the request was cancelled meanwhile.
+                    hub.end_request(actor, request_id, kind);
                 });
                 continue;
+            }
+            (Some((_, actor)), Command::Cancel { request_id }) => {
+                if hub.cancel_request(actor.clone(), request_id) {
+                    Ok(ReplyBody::Cancelled)
+                } else {
+                    Err(format!("request #{request_id} is not running"))
+                }
             }
             (Some(_), Command::Status) => {
                 let (clients, next_seq) = hub.status();

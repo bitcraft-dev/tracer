@@ -6,15 +6,16 @@
 //! critical section, so no event falls between its replay and its first live
 //! one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracer_protocol::{Actor, Event, EventKind, ServerMessage, JOURNAL_PATH};
+use tracer_protocol::{Actor, Event, EventKind, HttpRequest, ServerMessage, JOURNAL_PATH};
 
 pub struct Hub {
     inner: Mutex<Inner>,
@@ -31,6 +32,10 @@ struct Inner {
     events: Vec<Event>,
     clients: BTreeMap<u64, Actor>,
     subscribers: Vec<(u64, Sender<ServerMessage>)>,
+    /// Requests still running, each with the flag its worker checks to stop
+    /// early. Whoever takes a request out of here publishes how it ended, so
+    /// it ends exactly once.
+    running: HashMap<u64, Arc<AtomicBool>>,
 }
 
 impl Hub {
@@ -71,6 +76,7 @@ impl Hub {
                 events,
                 clients: BTreeMap::new(),
                 subscribers: Vec::new(),
+                running: HashMap::new(),
             }),
             workspace: workspace.display().to_string(),
         })
@@ -120,11 +126,34 @@ impl Hub {
         inner.subscribers.push((client, out));
     }
 
-    pub fn next_request_id(&self) -> u64 {
+    /// Number a new request and publish that it started. Gives its id and
+    /// the flag that says it was cancelled.
+    pub fn start_request(&self, actor: Actor, request: HttpRequest) -> (u64, Arc<AtomicBool>) {
         let mut inner = self.inner.lock().unwrap();
-        let id = inner.next_request;
+        let request_id = inner.next_request;
         inner.next_request += 1;
-        id
+        let cancelled = Arc::new(AtomicBool::new(false));
+        inner.running.insert(request_id, cancelled.clone());
+        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request });
+        (request_id, cancelled)
+    }
+
+    /// Publish how a request ended, unless it was cancelled first.
+    pub fn end_request(&self, actor: Actor, request_id: u64, kind: EventKind) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.running.remove(&request_id).is_some() {
+            publish_locked(&mut inner, actor, kind);
+        }
+    }
+
+    /// Cancel a running request on `actor`'s behalf. False when it is not
+    /// running: never sent, or already ended.
+    pub fn cancel_request(&self, actor: Actor, request_id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(cancelled) = inner.running.remove(&request_id) else { return false };
+        cancelled.store(true, Ordering::SeqCst);
+        publish_locked(&mut inner, actor, EventKind::RequestCancelled { request_id });
+        true
     }
 
     pub fn publish(&self, actor: Actor, kind: EventKind) -> u64 {

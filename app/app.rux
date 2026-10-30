@@ -45,8 +45,11 @@
           <view class="url">
             <input r-model="url" placeholder="https://…" />
           </view>
-          <view class="send" :class="{ off: !connected() }" @tap="send()">
+          <view class="send" r-if="!running()" :class="{ off: !connected() }" @tap="send()">
             <text class="send-label">Send</text>
+          </view>
+          <view class="send stop" r-if="running()" @tap="cancel()">
+            <text class="send-label">Cancel</text>
           </view>
         </view>
 
@@ -92,6 +95,7 @@
             <view class="pane">
               <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
               <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
+              <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
               <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
               <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
                 <text class="hdr-n">{{ h.name }}</text>
@@ -185,9 +189,9 @@
   .row.on { background: #2b2540; }
   .row-top { display: flex; gap: 8px; }
   .row-bottom { display: flex; gap: 8px; }
-  .m { font-size: 11px; font-weight: 700; font-family: monospace; width: 52px; }
+  .m { font-size: 11px; font-weight: 700; font-family: monospace; width: 64px; }
   .row-url { flex: 1; color: #d4d4d4; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .st { font-size: 11px; font-family: monospace; width: 52px; }
+  .st { font-size: 11px; font-family: monospace; width: 64px; }
   .who { color: #7a7a7a; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   .work { flex: 1; display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; min-width: 0; }
@@ -207,6 +211,8 @@
   .send { padding: 9px 26px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
   .send:hover { background: #8f81f5; }
   .send.off { background: #3a3550; }
+  .send.stop { background: #8a3a38; }
+  .send.stop:hover { background: #a04542; }
   .send-label { color: #ffffff; font-size: 14px; font-weight: 700; }
 
   .tabs { display: flex; gap: 18px; border-bottom: 1px solid #262626; }
@@ -307,7 +313,8 @@
     size: int,
     body: string,
     resHeaders: Header[],
-    error: string
+    error: string,
+    cancelledBy: string
   };
 
   type Client = { client: int, actor: string, actorKind: string };
@@ -330,6 +337,7 @@
 
   let commands: Cmd[] = [
     { id: "send", label: "Send the request", hint: "Ctrl+Enter" },
+    { id: "cancel", label: "Cancel the request on show", hint: "" },
     { id: "newest", label: "Open the newest request", hint: "" },
     { id: "req:body", label: "Edit the request body", hint: "" },
     { id: "req:headers", label: "Edit the request headers", hint: "" },
@@ -390,9 +398,10 @@
           size: 0,
           body: "",
           resHeaders: [],
-          error: ""
+          error: "",
+          cancelledBy: ""
         });
-      } else if e.kind == "request_finished" || e.kind == "request_failed" {
+      } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {
         requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
       } else if e.kind == "client_joined" {
         clients.push({ client: e.client, actor: e.actor, actorKind: e.actorKind });
@@ -409,6 +418,9 @@
     if e.kind == "request_failed" {
       out.state = "failed";
       out.error = e.error;
+    } else if e.kind == "request_cancelled" {
+      out.state = "cancelled";
+      out.cancelledBy = `${e.actorKind} · ${e.actor}`;
     } else {
       out.state = "done";
       out.status = e.status;
@@ -430,6 +442,20 @@
     try {
       selected = tracer.send(method, url, sentHeaders(), body);
       resTab = "body";
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  // Whether the request on show is still running, whoever sent it.
+  fn running(): bool {
+    sel != none && sel.state == "running"
+  }
+
+  fn cancel() {
+    if sel == none { return; }
+    try {
+      tracer.cancel(sel.id);
     } catch e {
       error = e.message;
     }
@@ -458,11 +484,17 @@
   }
 
   fn statusText(r: Row): string {
-    if r.state == "running" { "…" } else if r.state == "failed" { "failed" } else { `${r.status}` }
+    if r.state == "running" {
+      "…"
+    } else if r.state == "failed" || r.state == "cancelled" {
+      r.state
+    } else {
+      `${r.status}`
+    }
   }
 
   fn statusColor(r: Row): string {
-    if r.state == "running" {
+    if r.state == "running" || r.state == "cancelled" {
       "#8a8a8a"
     } else if r.state == "failed" || r.status >= 500 {
       "#f0716c"
@@ -576,6 +608,8 @@
     closePalette();
     if id == "send" {
       send();
+    } else if id == "cancel" {
+      cancel();
     } else if id == "newest" {
       if history.length > 0 { selected = history[0].id; }
     } else if id.startsWith("req:") {
@@ -610,12 +644,11 @@
   }
 
   // The window owns the core when it started it: stop it on the way out.
+  // Only here, not in `unmounted`, which a dev build's hot reload also runs:
+  // the Rust side and its connection outlive a reload, and `connect` in the
+  // next `mounted` finds them.
   fn onClose() {
     tracer.close("window closed");
     true
-  }
-
-  unmounted {
-    tracer.close("window closed");
   }
 </script>

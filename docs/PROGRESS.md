@@ -74,11 +74,35 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
     Driven: dragged, closed, reopened, same layout. Filed **AW-023** (the
     docs' `@drag` example uses a field that doesn't exist).
 
+  - **Ctrl+K palette** (59983ca): arrows and Enter on the palette's own
+    field (its `@key` runs before the field's editing). Filed **AW-024** (an
+    effect re-runs with its signal unchanged right after a key handler,
+    eating the first ArrowDown after typing; minimal repro) and **AW-025** (no
+    clipboard for script, so no Copy as cURL).
+  - **Cancel**: `Command::Cancel`, `request_cancelled`, `tracer cancel <id>`
+    (and `tracer send` prints its id), a Cancel button in place of Send while
+    the request on show runs, and a palette command. Anyone can cancel
+    anyone's request; the event names who did. The core keeps a table of
+    running requests: cancel and finish race to take the entry under the
+    hub's lock, so a request ends exactly once. Bodies stop between 64 KiB
+    reads; the wait for the status line can't be interrupted with `ureq`.
+    Two tests. Driven: window cancels its own drip; window cancels the CLI's,
+    and the CLI prints "cancelled by USER". Filed **AW-026** (script can't
+    cancel or time out an awaited native call).
+  - **Fixed, found while driving cancel:** every hot reload stopped and
+    restarted the core (`unmounted` called `close`), and closing the window
+    while `connect` was starting a core orphaned that core. `close` now waits
+    for `connect`, and only `@close` stops the core. Driven: reload keeps the
+    core's PID; 8 closes at 0 to 1000 ms after the window appears leave no
+    core.
+
 ### Next
 
-1. Ctrl+K command palette (key handling, focus).
-2. Cancel a request in flight: needs a `Cancel` command in the core, and a
-   cancellable `async` on the Rux side (no probe has covered it yet).
+1. Phase 2: requests and collections saved as plain files in the workspace,
+   then environments with `{{var}}` substitution and an environment picker.
+2. A journal that ends with `request_started` and no outcome (a core killed
+   mid-request) leaves that row "running" forever in the window. The core
+   should close such requests when it opens the journal.
 3. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
    Open leads for them: a frame that loads or clears 1k rows still costs up to
    2 s in debug, clear costs more than load, and a list's scroll cost is
@@ -139,8 +163,22 @@ Things that cost a round trip once. Check here before debugging them again.
   launching.
 - The display is scaled 150%: screenshot pixels are 1.5x layout pixels, so a
   300px sidebar ends at x = 96 + 450 in a screenshot.
-- A `rux run` started with `( … &)` inside a Bash call dies when the call
-  ends. Use the tool's background mode.
+- A `rux run` started with `( … &)` inside a Bash call does **not** die with
+  the call: its window lives on, unseen, holding ~565 MB (one from 08:05 was
+  found at 09:40 on 2026-10-30). Use the tool's background mode, and check
+  `Get-Process rux` when done.
+- `rux run` sometimes exits with code 127 and no message while its window
+  keeps running; hot reload still works (the window watches the files).
+- **A dev build's hot reload runs `unmounted` and then `mounted`.** Rust
+  statics survive it. Don't put "the window is closing" work in `unmounted`;
+  use `@close`.
+- **Closing a window from a script: refresh the handle first.** For its first
+  few hundred milliseconds a Rux window's `MainWindowHandle` is a temporary
+  window, and a `CloseMainWindow` sent to it is lost. `early3.ps1` in the
+  2026-10-30 scratchpad waits for the handle to change.
+- Force-killing the window (`Stop-Process`) skips `@close`, so its core
+  lives on. Clean up with `tracer stop -w <ws>`, or kill the
+  `target\debug\tracer.exe` processes.
 - An app with no `native/` crate runs inside `rux.exe`, so its process is
   named `rux`, not after the app.
 

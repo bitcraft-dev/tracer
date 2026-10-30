@@ -669,6 +669,31 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   (`navigator.clipboard`), Android through its clipboard manager.
 - **Status:** open.
 
+## AW-026 Script can't cancel, or put a time limit on, a native call it awaits
+
+- **Found:** 2026-10-30, adding Cancel to Tracer.
+- **Severity:** friction for Tracer, which doesn't await its sends (they go
+  through the core, and cancel is a command like any other). A **gap** for
+  most apps: the page that does `res = await http.send(…)`, as probe 3 does,
+  has no Cancel button to offer and no timeout.
+- **Limit:** `docs/07-script.md`, "Async": "There is no `Future`, `Promise`
+  or task value on the Rux side", and no `delay` built in. The only way an
+  awaited call stops is that the component that started it goes away, and
+  then the docs say only that "the answer that comes later writes nothing".
+  Nothing says the Rust future is dropped or told, so the request, file read
+  or query goes on to the end. There's no `AbortController`, no handle to
+  cancel, and no `Promise.race` with a timer to time out.
+- **Workaround:** none in script. An app can export its own `cancel(id)` from
+  Rust and keep its own table of running work, as Tracer's core does; every
+  app would write that again.
+- **Suggested fix:** a cancel handle a page can hold, in the browser's shape:
+  `let job = abortable();` then `await http.send(url, job)` and `job.abort()`,
+  surfacing in Rust as a token the native function can check (or the future
+  being dropped); and drop the future when its owner goes, saying so in the
+  docs. A timeout falls out of the same handle once script has a clock
+  (AW-009).
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,
