@@ -2,9 +2,10 @@
 //!
 //! Replies and events for a client go through one channel to one writer, so
 //! what the client reads is in the order the core decided, whether it is a
-//! reply or an event.
+//! reply or an event. A connection is lines of JSON in and out, whatever
+//! carries them: TCP here, or a WebSocket or one HTTP call ([`crate::api`]).
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -18,14 +19,28 @@ use crate::{envs, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
-pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
+/// A client on the core's TCP protocol: a line of JSON each way.
+pub fn serve_tcp(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
     let Ok(write_half) = stream.try_clone() else { return };
+    let mut w = BufWriter::new(write_half);
+    let write_line = move |line: &str| writeln!(w, "{line}").and_then(|_| w.flush());
+    serve(BufReader::new(stream).lines(), write_line, hub, token, stop);
+}
+
+/// A client whose messages arrive as `lines`, and whose replies and events
+/// go to `write_line`, one message each, until either side stops.
+pub fn serve(
+    lines: impl IntoIterator<Item = io::Result<String>>,
+    mut write_line: impl FnMut(&str) -> io::Result<()> + Send + 'static,
+    hub: Arc<Hub>,
+    token: &str,
+    stop: &Stop,
+) {
     let (out, rx) = mpsc::channel::<ServerMessage>();
     let writer = thread::spawn(move || {
-        let mut w = BufWriter::new(write_half);
         for msg in rx {
             let Ok(line) = serde_json::to_string(&msg) else { continue };
-            if writeln!(w, "{line}").and_then(|_| w.flush()).is_err() {
+            if write_line(&line).is_err() {
                 break;
             }
         }
@@ -33,7 +48,7 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
 
     let mut session: Option<(u64, Actor)> = None;
     let mut shutting_down = false;
-    for line in BufReader::new(stream).lines() {
+    for line in lines {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;

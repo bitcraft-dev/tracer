@@ -14,9 +14,9 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   core or probes). The scratch workspace and drivers used to test lived in
   that session's scratchpad and are gone with it; see the gotchas for how
   to set them up again.
-- Phases 0 to 2 are done. Phase 3's MCP server, guardrails and
-  `agents.policy` are done and tried from Claude Code (see Done), but not
-  committed yet. What's left is under Next.
+- Phases 0 to 3 are done: the MCP server (tried from Claude Code),
+  guardrails, `agents.policy` and the local HTTP/WS API (see Done). Next
+  is Phase 4, after the DNS fix under Next.
 - **Open Rux findings: AW-036 only**, which is new and not yet answered.
   AW-035 was closed on 2026-10-30 after a re-drive on the pushed and
   installed Rux b4fe20a. Everything from AW-001 to AW-035 is closed.
@@ -271,13 +271,35 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     the window showed it, and the red notice for a broken file, gone once
     fixed.
 
+- **Phase 3 finished: the local API (2026-10-30, night).** Policy work
+  committed first (7717163). `crates/core/src/api.rs`: the core's port
+  tells its protocol (`{`) from HTTP (a method) by peeking. `POST
+  /v1/command` (Bearer token; `X-Tracer-Kind`, default `agent`;
+  `X-Tracer-Name`, default `http`) runs one command through the same
+  `conn::serve`, now transport-free (lines in, a line writer out).
+  `GET /v1/ws` is the protocol over a WebSocket, hand-written (RFC 6455
+  framing, SHA-1 and base64 for the handshake, no new crates). Host and
+  Origin must be this machine. `tracer status` prints the addresses. 42
+  tests, three runs clean. Driven: curl (policy, an agent's POST waiting,
+  a foreign Origin refused 403) and Node 24's built-in `WebSocket` (hello
+  as a person, subscribe with replay, allowed curl's request).
+
 ### Next
 
-1. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
+1. **Happy eyeballs in the HTTP engine.** On this machine IPv4 (A)
+   lookups are slow or fail (`curl -4`: 11 s, then "couldn't resolve")
+   while IPv6 works; curl races the two, `ureq`'s resolver waits for both,
+   so Tracer's sends take 0.7 to 29 s, or fail "No such host is known",
+   where curl takes about 1 s. A resolver that races A and AAAA, and
+   connects to whichever answers, would fix it. It also feeds Phase 4's
+   timing waterfall (DNS, connect, TLS), which needs a lower-level client
+   anyway.
+2. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
-2. Commit the policy work (asked the user on 2026-10-30; not committed).
-3. Phase 3 remainder: the local HTTP/WS API for anything that isn't MCP.
-   Bench-size caps belong in the policy once benchmarking exists (Phase 4).
+3. Phase 4: response tools, then assertions and flows, then benchmarking
+   (with bench-size caps in the policy), then realtime and GraphQL.
+4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
+   wants it.
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
    remembered env the open workspace doesn't have (seen: "typicode" in a
@@ -369,9 +391,10 @@ Things that cost a round trip once. Check here before debugging them again.
   --strict-mcp-config --mcp-config <json> --allowedTools mcp__tracer
   --output-format stream-json --verbose`, and `< /dev/null` (it waits 3 s
   for stdin otherwise). Stop the core it starts with `tracer stop`.
-- The network here was erratic on 2026-10-30 night: one DNS failure and
-  sends of 9 s and 23 s, while `curl` itself took 7 s to connect at times.
-  Compare with `curl` before blaming Tracer's HTTP engine.
+- **Slow or failing sends here are IPv4 DNS** (2026-10-30 night): `curl
+  -4` takes 11 s and fails, plain `curl` races IPv6 and is fine, Tracer
+  waits for both (Next, 1). Compare `curl` and `curl -4` before blaming
+  anything else.
 
 ### Driving the window
 

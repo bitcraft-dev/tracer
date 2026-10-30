@@ -10,6 +10,7 @@
 //!
 //! [`Command::Hello`]: tracer_protocol::Command::Hello
 
+mod api;
 mod conn;
 mod envs;
 mod files;
@@ -140,7 +141,7 @@ pub fn start(workspace: &Path) -> io::Result<Running> {
             let (hub, token, stop) = (hub.clone(), token.clone(), stop.clone());
             let _ = thread::Builder::new()
                 .name("tracer-client".into())
-                .spawn(move || conn::serve(stream, hub, &token, &stop));
+                .spawn(move || api::serve(stream, hub, &token, &stop));
         }
     })?;
     Ok(Running { accept: Some(accept), ..running })

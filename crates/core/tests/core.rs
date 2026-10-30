@@ -1021,3 +1021,140 @@ fn the_workspace_policy_holds_each_agent_to_its_rules_and_is_followed_as_it_chan
     assert!(error.starts_with("agents.policy: line 2"), "{error}");
     core.stop();
 }
+
+/// One raw HTTP call to the core; gives the status and the body.
+fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n", body.len());
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    s.write_all(req.as_bytes()).unwrap();
+    let mut answer = String::new();
+    s.read_to_string(&mut answer).unwrap();
+    let status = answer.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, answer.split_once("\r\n\r\n").unwrap().1.to_string())
+}
+
+fn ws_send(s: &mut TcpStream, text: &str) {
+    let mask = [7u8, 1, 200, 33];
+    let mut frame = vec![0x81];
+    match text.len() {
+        n if n < 126 => frame.push(0x80 | n as u8),
+        n => {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(text.bytes().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    s.write_all(&frame).unwrap();
+}
+
+fn ws_read(s: &mut TcpStream) -> (u8, String) {
+    let mut two = [0u8; 2];
+    s.read_exact(&mut two).unwrap();
+    let len = match two[1] & 0x7F {
+        126 => {
+            let mut b = [0u8; 2];
+            s.read_exact(&mut b).unwrap();
+            u16::from_be_bytes(b) as usize
+        }
+        127 => {
+            let mut b = [0u8; 8];
+            s.read_exact(&mut b).unwrap();
+            u64::from_be_bytes(b) as usize
+        }
+        n => n as usize,
+    };
+    let mut payload = vec![0; len];
+    s.read_exact(&mut payload).unwrap();
+    (two[0] & 0x0F, String::from_utf8(payload).unwrap())
+}
+
+#[test]
+fn the_local_api_runs_a_command_over_http_and_the_protocol_over_a_websocket() {
+    let ws = workspace("api");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let (port, token) = (core.port, core.token.clone());
+    let bearer = format!("Bearer {token}");
+    let host = ("Host", "127.0.0.1");
+
+    // One command, as an agent unless told otherwise.
+    let (status, body) = http(port, "POST", "/v1/command", &[host, ("Authorization", &bearer)], r#"{"cmd":"status"}"#);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""reply":"status""#) && body.contains(r#""kind":"agent","name":"http""#), "{body}");
+    let as_ci = [host, ("Authorization", &bearer), ("X-Tracer-Kind", "cli"), ("X-Tracer-Name", "ci")];
+    let send = format!(r#"{{"cmd":"send","request":{{"method":"POST","url":"{base}/x","body":"hi"}}}}"#);
+    let (status, body) = http(port, "POST", "/v1/command", &as_ci, &send);
+    assert_eq!((status, body.as_str()), (200, r#"{"reply":"accepted","request_id":1}"#));
+    // An agent's is held to the guardrails, and refusals are 4xx.
+    let (status, body) =
+        http(port, "POST", "/v1/command", &[host, ("Authorization", &bearer)], r#"{"cmd":"set_agents","allowed":false}"#);
+    assert_eq!(status, 400);
+    assert!(body.contains("for a person"), "{body}");
+
+    // Kept out: no token, a wrong one, another host, another site's page.
+    let status_of = |headers: &[(&str, &str)]| http(port, "POST", "/v1/command", headers, r#"{"cmd":"status"}"#).0;
+    assert_eq!(status_of(&[host]), 401);
+    assert_eq!(status_of(&[host, ("Authorization", "Bearer nope")]), 401);
+    assert_eq!(status_of(&[("Host", "evil.example:80"), ("Authorization", &bearer)]), 403);
+    assert_eq!(status_of(&[host, ("Origin", "https://evil.example"), ("Authorization", &bearer)]), 403);
+    assert_eq!(status_of(&[host, ("Origin", "http://localhost:3000"), ("Authorization", &bearer)]), 200);
+    assert_eq!(http(port, "GET", "/", &[host], "").0, 404);
+
+    // The WebSocket: the protocol as it is, a message a frame.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let upgrade = "GET /v1/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    s.write_all(upgrade.as_bytes()).unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b).unwrap();
+        head.push(b[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    assert!(head.starts_with("HTTP/1.1 101") && head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{head}");
+    ws_send(&mut s, &format!(r#"{{"id":1,"cmd":"hello","protocol":1,"token":"{token}","kind":"window","name":"web"}}"#));
+    assert!(ws_read(&mut s).1.contains(r#""reply":"welcome""#));
+    ws_send(&mut s, r#"{"id":2,"cmd":"subscribe","since":0}"#);
+    assert!(ws_read(&mut s).1.contains(r#""reply":"subscribed""#));
+    // The replay, including the HTTP caller's send and how it ended.
+    let mut seen = Vec::new();
+    while !seen.iter().any(|e: &String| e.contains(r#""event":"request_finished""#)) {
+        let (opcode, text) = ws_read(&mut s);
+        assert_eq!(opcode, 1);
+        seen.push(text);
+    }
+    assert!(seen.iter().any(|e| e.contains(r#""name":"ci""#) && e.contains("request_started")));
+    // A ping is answered, and a long message arrives whole.
+    s.write_all(&[0x89, 0x80, 0, 0, 0, 0]).unwrap();
+    loop {
+        let (opcode, _) = ws_read(&mut s);
+        if opcode == 0xA {
+            break;
+        }
+    }
+    let long = format!(r#"{{"id":3,"cmd":"send","request":{{"method":"GET","url":"{base}/{}"}}}}"#, "y".repeat(300));
+    ws_send(&mut s, &long);
+    loop {
+        let (_, text) = ws_read(&mut s);
+        if text.contains(r#""reply":"accepted""#) {
+            assert!(text.contains(r#""id":3"#));
+            break;
+        }
+    }
+    // Closed, it's answered and the client leaves.
+    s.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
+    loop {
+        let (opcode, _) = ws_read(&mut s);
+        if opcode == 0x8 {
+            break;
+        }
+    }
+    core.stop();
+}

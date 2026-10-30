@@ -33,7 +33,7 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, ClientKind, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    SavedRequest, StatusClass,
+    Discovery, SavedRequest, StatusClass, DISCOVERY_PATH,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -139,6 +139,11 @@ fn status(workspace: PathBuf) -> io::Result<ExitCode> {
             println!("workspace  {workspace}");
             println!("events     {}", next_seq - 1);
             println!("agents     {}", if agents_allowed { "on" } else { "off (tracer agents on)" });
+            // The local API is on the core's own port, behind the same token.
+            let found = std::fs::read_to_string(std::path::Path::new(&workspace).join(DISCOVERY_PATH)).ok();
+            if let Some(d) = found.and_then(|text| serde_json::from_str::<Discovery>(&text).ok()) {
+                println!("api        POST http://127.0.0.1:{}/v1/command, ws://127.0.0.1:{}/v1/ws", d.port, d.port);
+            }
             println!("clients    {}", clients.len());
             for actor in clients {
                 println!("  {:?} {}", actor.kind, actor.name);

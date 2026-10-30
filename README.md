@@ -33,6 +33,27 @@ tracer status -w <dir>               # who is connected
 - `crates/core`: the core (`cargo test -p tracer-core`)
 - `crates/cli`: the `tracer` command
 
+## The local API
+
+Anything else (a script, a web page on this machine, another tool) talks
+to the core on its own port, which `tracer status` prints, with the token
+from `.tracer/core.json`:
+
+```bash
+curl -X POST http://127.0.0.1:<port>/v1/command   -H "Authorization: Bearer <token>" -H "X-Tracer-Name: my-script"   -d '{"cmd":"send","request":{"method":"GET","url":"http://localhost:8080/health"}}'
+# {"reply":"accepted","request_id":12}
+```
+
+- `POST /v1/command` runs one command of the core's protocol
+  (`crates/protocol`): the reply's body comes back, or `{"error": …}` with
+  a 4xx. A caller is an agent, held to the guardrails and the policy,
+  unless `X-Tracer-Kind: cli` says it is a person's script.
+- `ws://127.0.0.1:<port>/v1/ws` is a WebSocket carrying the protocol as it
+  is, one JSON message per frame: `hello` with the token first, then
+  `subscribe` for the live event stream and any other command.
+- Only requests addressed to this machine, and pages served from it, are
+  answered.
+
 ## Letting an AI agent drive it
 
 `tracer mcp` is an MCP server on stdio. Point any MCP client at it with the
