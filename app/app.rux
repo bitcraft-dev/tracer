@@ -92,6 +92,10 @@
             <text class="send-label">Cancel</text>
           </view>
         </view>
+        <view class="preview" r-if="url.includes(&quot;{{&quot;)">
+          <text class="preview-t">{{ preview }}</text>
+          <text class="preview-warn" r-if="preview.includes(&quot;{{&quot;)">{{ previewWarning() }}</text>
+        </view>
 
         <view class="tabs">
           <view class="tab" :class="{ on: reqTab == &quot;body&quot; }" @tap="reqTab = &quot;body&quot;">
@@ -375,6 +379,9 @@
   .send.stop:hover { background: #a04542; }
   .send-label { color: #ffffff; font-size: 14px; font-weight: 700; }
 
+  .preview { display: flex; gap: 10px; align-items: center; margin-top: -4px; padding: 0 2px; }
+  .preview-t { flex: 1; min-width: 0; color: #8a8a8a; font-size: 12px; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .preview-warn { color: #e8a54b; font-size: 11px; white-space: nowrap; }
   .tabs { display: flex; gap: 18px; border-bottom: 1px solid #262626; }
   .tab { display: flex; gap: 6px; align-items: center; padding: 6px 0; cursor: pointer; border-bottom: 2px solid #141414; }
   .tab.on { border-bottom: 2px solid #7c6cf0; }
@@ -570,6 +577,10 @@
   computed dirty = if openPath == "" { false } else if current == none { true } else { !sameAs(current) };
   computed envOptions = [NO_ENV] + envs.map(e => e.name);
   computed editSecrets = envs.find(e => e.name == editEnv)?.secrets ?? [];
+  // The URL as it will go out with the chosen environment. Only a preview:
+  // the core fills it in when sending. Secrets show as dots; the window
+  // never has their values.
+  computed preview = fillVars(url.trim());
   computed hits = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
 
   // A new filter starts at its first match.
@@ -715,6 +726,23 @@
     url = s.url;
     body = s.body;
     headerText = headerLines(s.headers);
+  }
+
+  fn fillVars(text: string): string {
+    let env = envs.find(e => e.name == envPick);
+    if env == none { return text; }
+    let out = text;
+    for v in env.vars {
+      out = out.split(`{{${v.name}}}`).join(v.value).split(`{{ ${v.name} }}`).join(v.value);
+    }
+    for name in env.secrets {
+      out = out.split(`{{${name}}}`).join("••••").split(`{{ ${name} }}`).join("••••");
+    }
+    out
+  }
+
+  fn previewWarning(): string {
+    if envPick == NO_ENV { "no environment chosen" } else { `not all defined in ${envPick}` }
   }
 
   fn headerLines(list: Header[]): string {
