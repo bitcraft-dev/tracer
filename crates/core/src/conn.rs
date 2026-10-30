@@ -77,11 +77,20 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
                 thread::spawn(move || {
                     // Resolved here, not before it started, so a missing
                     // variable is a failed request every client sees.
-                    let env = env.as_deref().map(|name| hub.environment(name)).transpose();
+                    let env = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
+                    let (env, secrets) = match env {
+                        Ok(Some((env, secrets))) => (Ok(Some(env)), secrets),
+                        Ok(None) => (Ok(None), Vec::new()),
+                        Err(e) => (Err(e), Vec::new()),
+                    };
                     let resolved = env.and_then(|env| envs::resolve(&request, env.as_ref()));
+                    // Secret values that come back are replaced by their
+                    // names before anything is published or journalled.
                     let kind = match resolved.and_then(|request| http::execute(&request, &cancelled)) {
-                        Ok(response) => EventKind::RequestFinished { request_id, response },
-                        Err(error) => EventKind::RequestFailed { request_id, error },
+                        Ok(response) => {
+                            EventKind::RequestFinished { request_id, response: envs::redact_response(response, &secrets) }
+                        }
+                        Err(error) => EventKind::RequestFailed { request_id, error: envs::redact(&error, &secrets) },
                     };
                     // Dropped if the request was cancelled meanwhile.
                     hub.end_request(actor, request_id, kind);
@@ -114,6 +123,9 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
             }
             (Some((_, actor)), Command::DeleteEnvironment { name }) => {
                 hub.delete_environment(actor.clone(), &name).map(|_| ReplyBody::EnvironmentDeleted)
+            }
+            (Some((_, actor)), Command::SetSecret { env, name, value }) => {
+                hub.set_secret(actor.clone(), &env, &name, value).map(|_| ReplyBody::SecretSet)
             }
             (Some(_), Command::Status) => {
                 let (clients, next_seq) = hub.status();

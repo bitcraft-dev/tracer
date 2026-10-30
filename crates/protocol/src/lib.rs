@@ -35,6 +35,11 @@ pub const REQUESTS_DIR: &str = "requests";
 /// `<name>.env` file each, `KEY=value` a line.
 pub const ENVIRONMENTS_DIR: &str = "environments";
 
+/// The folder, relative to the workspace, that holds secret values: one
+/// `<env>.env` file each, beside the journal under `.tracer/`, which the core
+/// keeps out of git. Their values never leave the core.
+pub const SECRETS_DIR: &str = ".tracer/secrets";
+
 /// Where the core is listening and what it wants to hear first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
@@ -116,8 +121,16 @@ pub enum Command {
     /// Save an environment, over any of that name. Published as
     /// `environment_saved`.
     SaveEnvironment { env: Environment },
-    /// Published as `environment_deleted`.
+    /// Published as `environment_deleted`. Its secrets go with it.
     DeleteEnvironment { name: String },
+    /// Set the secret `name` of environment `env`, or remove it with no
+    /// `value`. Published as `secret_set`, without the value.
+    SetSecret {
+        env: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -142,6 +155,12 @@ pub struct Environment {
     /// One word, such as `local`: the file is `environments/<name>.env`.
     pub name: String,
     pub vars: Vec<(String, String)>,
+    /// The names of its secrets, never their values. A secret fills
+    /// `{{name}}` like a variable, wins over a variable of the same name, and
+    /// is replaced by `{{name}}` wherever its value comes back in a response.
+    /// Ignored in `SaveEnvironment`: secrets are set with `SetSecret`.
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 /// A request saved in the workspace, by its path: relative to
@@ -204,6 +223,7 @@ pub enum ReplyBody {
     Environments { environments: Vec<Environment>, as_of: u64, skipped: Vec<String> },
     EnvironmentSaved { name: String },
     EnvironmentDeleted,
+    SecretSet,
     Stopping,
 }
 
@@ -241,6 +261,8 @@ pub enum EventKind {
     RequestDeleted { path: String },
     EnvironmentSaved { env: Environment },
     EnvironmentDeleted { name: String },
+    /// A secret was set (`present`) or removed. Never carries the value.
+    SecretSet { env: String, name: String, present: bool },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
     CoreStopping,

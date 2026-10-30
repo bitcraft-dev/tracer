@@ -536,7 +536,7 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
     window.call(Command::Subscribe { since: None }).unwrap().unwrap();
     let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
 
-    let env = tracer_protocol::Environment { name: "local".into(), vars: vec![("baseUrl".into(), base.clone()), ("id".into(), "7".into())] };
+    let env = tracer_protocol::Environment { name: "local".into(), vars: vec![("baseUrl".into(), base.clone()), ("id".into(), "7".into())], secrets: vec![] };
     assert_eq!(agent.call(Command::SaveEnvironment { env }).unwrap(), Ok(ReplyBody::EnvironmentSaved { name: "local".into() }));
     let text = std::fs::read_to_string(ws.join("environments/local.env")).unwrap();
     assert_eq!(text, format!("baseUrl={base}\nid=7\n"));
@@ -617,5 +617,57 @@ fn files_changed_behind_the_core_are_published_once_and_its_own_saves_are_not_ec
     assert!(got.iter().any(|e| matches!(&e.kind, EventKind::RequestDeleted { path } if path == "a")), "{kinds:?}");
     assert!(got.iter().any(|e| matches!(&e.kind, EventKind::EnvironmentSaved { env } if env.name == "local")), "{kinds:?}");
     assert_eq!(got.len(), 3, "{kinds:?}");
+    core.stop();
+}
+
+#[test]
+fn a_secret_fills_in_but_its_value_never_reaches_a_client_or_the_journal() {
+    let ws = workspace("secrets");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    const VALUE: &str = "tok-9f8e7d6c5b4a";
+
+    let env = tracer_protocol::Environment { name: "prod".into(), vars: vec![("baseUrl".into(), base)], secrets: vec![] };
+    agent.call(Command::SaveEnvironment { env }).unwrap().unwrap();
+    let set = Command::SetSecret { env: "prod".into(), name: "token".into(), value: Some(VALUE.into()) };
+    assert_eq!(window.call(set).unwrap(), Ok(ReplyBody::SecretSet));
+
+    // Listed by name only.
+    let listed = agent.call(Command::ListEnvironments).unwrap();
+    let Ok(ReplyBody::Environments { environments, .. }) = &listed else { panic!() };
+    assert_eq!(environments[0].secrets, ["token"]);
+    assert!(!format!("{listed:?}").contains(VALUE));
+
+    // Sent with it: the stub echoes the path, so the value comes back in the
+    // body, and is replaced by its name before anyone sees it.
+    let send = Command::Send {
+        request: HttpRequest { method: "GET".into(), url: "{{baseUrl}}/me?key={{token}}".into(), headers: vec![], body: None },
+        env: Some("prod".into()),
+    };
+    let Ok(ReplyBody::Accepted { request_id }) = agent.call(send).unwrap() else { panic!() };
+    let body = loop {
+        if let EventKind::RequestFinished { request_id: id, response } = window.next_event().unwrap().kind {
+            if id == request_id {
+                break response.body;
+            }
+        }
+    };
+    assert_eq!(body, r#"{"path":"/me?key={{token}}","got":0}"#);
+
+    let journal = std::fs::read_to_string(ws.join(".tracer/journal.ndjson")).unwrap();
+    assert!(journal.contains("secret_set"));
+    assert!(!journal.contains(VALUE), "the journal holds the secret");
+    assert!(std::fs::read_to_string(ws.join(".tracer/secrets/prod.env")).unwrap().contains(VALUE));
+    assert!(std::fs::read_to_string(ws.join(".tracer/.gitignore")).unwrap().lines().any(|l| l == "*"));
+    assert!(!std::fs::read_to_string(ws.join("environments/prod.env")).unwrap().contains(VALUE));
+
+    // Removing it, then a removal of what isn't there, which is refused.
+    let rm = || Command::SetSecret { env: "prod".into(), name: "token".into(), value: None };
+    assert_eq!(window.call(rm()).unwrap(), Ok(ReplyBody::SecretSet));
+    assert!(window.call(rm()).unwrap().is_err());
+    assert!(!ws.join(".tracer/secrets/prod.env").exists());
     core.stop();
 }

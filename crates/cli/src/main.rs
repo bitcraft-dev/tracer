@@ -8,6 +8,8 @@
 //! tracer save <PATH> GET https://…  save a request as requests/<PATH>.http
 //! tracer run <PATH>                 send a saved request
 //! tracer env                        list the environments
+//! tracer secret set <ENV> <NAME>    set a secret, its value read from stdin
+//! tracer secret rm <ENV> <NAME>     remove a secret
 //! tracer rm <PATH>                  delete a saved request
 //! tracer watch [--all | --since N]  print events as they happen
 //! tracer cancel <ID>                 cancel a running request, whoever sent it
@@ -38,6 +40,9 @@ usage:
                                       save a request as requests/<PATH>.http
   tracer run <PATH> [--env <NAME>]    send a saved request and print its answer
   tracer env                          list the environments and their variables
+  tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
+                                      so it stays out of shell history
+  tracer secret rm <ENV> <NAME>       remove a secret
   tracer rm <PATH>                    delete a saved request
   tracer watch [--all | --since <N>]  print events as they happen
   tracer cancel <ID>                  cancel a running request, whoever sent it
@@ -61,6 +66,7 @@ fn main() -> ExitCode {
         Some("run") => run(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
+        Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
         Some("cancel") => cancel(workspace, args[1..].to_vec()),
         Some("stop") => stop(workspace),
@@ -206,9 +212,15 @@ fn env_list(workspace: PathBuf) -> io::Result<ExitCode> {
     for env in &environments {
         println!("{}", env.name);
         for (key, value) in &env.vars {
+            if env.secrets.contains(key) {
+                continue;
+            }
             let shown: String = value.chars().take(VALUE_SHOWN).collect();
             let more = if shown.len() < value.len() { "…" } else { "" };
             println!("  {key:<20} {shown}{more}");
+        }
+        for key in &env.secrets {
+            println!("  {key:<20} •••• (secret)");
         }
     }
     for why in &skipped {
@@ -217,6 +229,32 @@ fn env_list(workspace: PathBuf) -> io::Result<ExitCode> {
     if environments.is_empty() && skipped.is_empty() {
         eprintln!("tracer: no environments; write environments/<name>.env with KEY=value lines");
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn secret(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let (action, env, name) = match args.as_slice() {
+        [a, e, n] if a == "set" || a == "rm" => (a.as_str(), e.clone(), n.clone()),
+        _ => return Err(io::Error::other(USAGE)),
+    };
+    let value = if action == "set" {
+        let mut line = String::new();
+        if std::io::IsTerminal::is_terminal(&io::stdin()) {
+            eprint!("value for {name} (not echoed to history; Enter to finish): ");
+        }
+        io::stdin().read_line(&mut line)?;
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return Err(io::Error::other("an empty secret; `tracer secret rm` removes one"));
+        }
+        Some(line)
+    } else {
+        None
+    };
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer secret")?;
+    client.call(Command::SetSecret { env: env.clone(), name: name.clone(), value })?.map_err(io::Error::other)?;
+    let done = if action == "set" { "set" } else { "removed" };
+    println!("tracer: {done} secret {name} of {env}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -314,6 +352,9 @@ fn describe(event: &Event) -> String {
         EventKind::RequestDeleted { path } => format!("deleted {path}"),
         EventKind::EnvironmentSaved { env } => format!("saved environment {} ({} variables)", env.name, env.vars.len()),
         EventKind::EnvironmentDeleted { name } => format!("deleted environment {name}"),
+        EventKind::SecretSet { env, name, present } => {
+            format!("{} secret {name} of {env}", if *present { "set" } else { "removed" })
+        }
         EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)

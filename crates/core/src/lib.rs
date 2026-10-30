@@ -97,6 +97,12 @@ const DISK_SCAN: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub fn start(workspace: &Path) -> io::Result<Running> {
     fs::create_dir_all(workspace.join(".tracer"))?;
+    // The journal, the discovery file's token and the secrets stay out of
+    // git, without touching the workspace's own .gitignore.
+    let ignore = workspace.join(".tracer").join(".gitignore");
+    if !ignore.exists() {
+        fs::write(&ignore, "# Written by Tracer: nothing in here belongs in git.\n*\n")?;
+    }
     let hub = Arc::new(Hub::open(workspace)?);
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();

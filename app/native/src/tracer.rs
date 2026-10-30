@@ -519,7 +519,9 @@ fn to_page(event: Event) -> CoreEvent {
             out.path = path;
         }
         // The window lists them again: they're few and small.
-        EventKind::EnvironmentSaved { .. } | EventKind::EnvironmentDeleted { .. } => out.kind = "environment_changed".into(),
+        EventKind::EnvironmentSaved { .. } | EventKind::EnvironmentDeleted { .. } | EventKind::SecretSet { .. } => {
+            out.kind = "environment_changed".into()
+        }
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }
     out

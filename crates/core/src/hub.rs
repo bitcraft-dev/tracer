@@ -245,9 +245,28 @@ impl Hub {
         (environments, inner.next_seq, skipped)
     }
 
-    pub fn environment(&self, name: &str) -> Result<Environment, String> {
+    /// The environment `name` with its secrets filled in, for sending, and
+    /// the secrets alone, for redacting what comes back. Never for a client.
+    pub fn environment_for_sending(&self, name: &str) -> Result<(Environment, Vec<(String, String)>), String> {
         let _inner = self.inner.lock().unwrap();
-        envs::read(&self.root, name)
+        let env = envs::read(&self.root, name)?;
+        let secrets = envs::secret_values(&self.root, &env.name);
+        Ok((envs::with_secrets(env, &secrets), secrets))
+    }
+
+    pub fn set_secret(&self, actor: Actor, env: &str, name: &str, value: Option<String>) -> Result<(), String> {
+        let env = envs::normalize(env)?;
+        let mut inner = self.inner.lock().unwrap();
+        if !envs::file_of(&self.root, &env).exists() {
+            return Err(format!("there is no environment `{env}`"));
+        }
+        let present = value.is_some();
+        let had = envs::set_secret(&self.root, &env, name, value.as_deref())?;
+        if !present && !had {
+            return Err(format!("`{env}` has no secret `{name}`"));
+        }
+        publish_locked(&mut inner, actor, EventKind::SecretSet { env, name: name.to_string(), present });
+        Ok(())
     }
 
     pub fn save_environment(&self, actor: Actor, mut env: Environment) -> Result<String, String> {
@@ -270,6 +289,7 @@ impl Hub {
             _ => format!("could not delete environment `{name}`: {e}"),
         })?;
         inner.disk.environments.remove(&name);
+        envs::remove_secrets(&self.root, &name);
         publish_locked(&mut inner, actor, EventKind::EnvironmentDeleted { name });
         Ok(())
     }
@@ -295,7 +315,8 @@ impl Hub {
         }
         for (name, vars) in &now.environments {
             if inner.disk.environments.get(name) != Some(vars) {
-                changes.push(EventKind::EnvironmentSaved { env: Environment { name: name.clone(), vars: vars.clone() } });
+                let secrets = envs::read(&self.root, name).map(|e| e.secrets).unwrap_or_default();
+                changes.push(EventKind::EnvironmentSaved { env: Environment { name: name.clone(), vars: vars.clone(), secrets } });
             }
         }
         for name in inner.disk.environments.keys() {
