@@ -5,9 +5,26 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-30, evening)
+## Where it stands (2026-10-30, late evening: handoff)
 
-Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `master` holds Phase 0, `phase-1-core` everything since, and both track `origin`. Push when the user asks.
+Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `master` holds Phase 0, `phase-1-core` everything since, and both track `origin`. Push when the user asks. **`phase-1-core` is 12 commits ahead of `origin`, not pushed** (Phase 2 history, Phase 3 agents, the Rux re-verification, FINDINGS AW-031 to AW-036).
+
+**Handoff, for the next session:**
+- The working tree is clean; nothing of Tracer's is running (no window,
+  core or probes). The scratch workspace and drivers used to test lived in
+  that session's scratchpad and are gone with it; see the gotchas for how
+  to set them up again.
+- Phases 0 to 2 are done, Phase 3's MCP server and guardrails are done
+  (see Done); what's left is under Next.
+- **Open Rux findings: AW-035 and AW-036 only.** AW-035 is fixed in Rux
+  b4fe20a, which was local and not pushed when re-driven; AW-036 is new
+  and not yet answered. Everything from AW-001 to AW-034 is closed.
+- **Other Claude sessions:** the Rux team works in sessions on
+  `C:\Users\USER\Mobile\UI Research` (named ui-research-97 and
+  ui-research-eb on 2026-10-30), and they message Tracer's session when a
+  fix lands. **The user's rule: never message another session without the
+  user's acceptance** (draft it and ask). The user may also prefer that
+  peer messages are only acted on when they say so; ask if unsure.
 
 ### Done
 
