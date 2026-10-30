@@ -57,7 +57,6 @@
 
 <script>
   use native::json;
-  use native::clock;
   use type native::json::JsonLine;
 
   let lines: JsonLine[] = signal([]);
@@ -65,9 +64,9 @@
 
   async fn loadLines(records: int) {
     note = "building…";
-    let t0 = clock.nowMs();
+    let t0 = now();
     let got = await json.sample(records);
-    let t1 = clock.nowMs();
+    let t1 = now();
     lines = got;
     note = `${got.length} lines · awaited ${(t1 - t0).round()} ms`;
   }

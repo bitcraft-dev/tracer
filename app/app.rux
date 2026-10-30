@@ -76,6 +76,7 @@
               <text class="who">{{ r.actorKind }} · {{ r.actor }}</text>
               <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
               <text class="again" r-if="r.rerunOf > 0">↻ #{{ r.rerunOf }}</text>
+              <text class="when">{{ when(r.atMs) }}</text>
             </view>
           </view>
         </view>
@@ -111,7 +112,7 @@
           <view class="url">
             <input r-model="url" placeholder="https://…" />
           </view>
-          <view class="send" r-if="!running()" :class="{ off: !connected() }" @tap="send()">
+          <view class="send" r-if="!running()" :class="{ off: !connected }" @tap="send()">
             <text class="send-label">Send</text>
           </view>
           <view class="send stop" r-if="running()" @tap="cancel()">
@@ -146,6 +147,7 @@
               <text class="res-id">#{{ sel.id }}</text>
               <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
               <text class="res-url">{{ sel.url }}</text>
+              <view class="link" @tap="copySelCurl()"><text class="link-t">cURL</text></view>
               <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
               <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
             </view>
@@ -159,6 +161,7 @@
               <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
               <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
+              <text class="chip">sent {{ when(sel.atMs) }}</text>
             </view>
             <view class="tabs">
               <view class="tab" :class="{ on: resTab == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
@@ -234,7 +237,7 @@
             <view class="var" r-for="v in draftVars" r-key="v.id">
               <view class="vf name"><input r-model="v.name" placeholder="name" /></view>
               <view class="vf grow"><input r-model="v.value" placeholder="value" /></view>
-              <view class="x" @tap="removeVar(v.id)"><text class="x-t">×</text></view>
+              <view class="x" @tap="removeVar(v.id)"><text class="x-t">✕</text></view>
             </view>
             <view class="envbody-h">
               <view class="link" @tap="addVar()"><text class="link-t">+ variable</text></view>
@@ -244,7 +247,7 @@
             <view class="var" r-for="name in editSecrets" r-key="name">
               <text class="secret-n">{{ name }}</text>
               <text class="secret-v">••••••</text>
-              <view class="x" @tap="removeSecret(name)"><text class="x-t">×</text></view>
+              <view class="x" @tap="removeSecret(name)"><text class="x-t">✕</text></view>
             </view>
             <view class="var">
               <view class="vf name"><input r-model="secretName" placeholder="name" /></view>
@@ -451,6 +454,7 @@
   .hpick { flex: 1; min-width: 0; }
   .clear-t { color: #9d8ff5; font-size: 11px; }
   .again { color: #7a7a7a; font-size: 10px; font-family: monospace; }
+  .when { margin-left: auto; color: #6a6a6a; font-size: 10px; font-family: monospace; white-space: nowrap; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip { padding: 3px 9px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
 
@@ -516,6 +520,8 @@
     flex-direction: column;
     gap: 2px;
     width: 540px;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
     padding: 10px;
     background: #1e1e1e;
     border: 1px solid #333333;
@@ -564,7 +570,9 @@
     // The request this one sent again, or 0.
     rerunOf: int,
     // Why it waits for a person, while `state` is "approval".
-    reason: string
+    reason: string,
+    // When it was sent, in milliseconds since 1970.
+    atMs: int
   };
 
   type Client = { client: int, actor: string, actorKind: string };
@@ -600,6 +608,8 @@
     { id: "newest", label: "Open the newest request", hint: "" },
     { id: "rerun", label: "Re-run the request on show, as it was sent", hint: "" },
     { id: "edit-past", label: "Edit the request on show", hint: "" },
+    { id: "curl-sel", label: "Copy the request on show as cURL", hint: "" },
+    { id: "curl-editor", label: "Copy the request being edited as cURL", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
     { id: "refuse", label: "Refuse the agent's request on show", hint: "" },
@@ -666,6 +676,7 @@
   let hActor = signal(ANYONE);
   let hStatus = signal(ANY_STATUS);
 
+  computed connected = (tracer.link?.state ?? "") == "connected";
   computed history = requests.sort((a, b) => b.id - a.id);
   // Agents' requests waiting for this person, oldest first.
   computed waiting = requests.filter(r => r.state == "approval");
@@ -758,6 +769,7 @@
           reqHeaders: e.headers,
           reqBody: e.body,
           rerunOf: e.rerunOf,
+          atMs: e.atMs,
           reason: ""
         });
       } else if e.kind == "approval_asked" {
@@ -842,16 +854,64 @@
   }
 
   fn fillVars(text: string): string {
-    let env = envs.find(e => e.name == envPick);
+    fillIn(text, envPick, "••••")
+  }
+
+  // `text` with environment `envName`'s variables filled in, and each secret
+  // as `secret` (the window never has their values), or left as written
+  // when `secret` is "".
+  fn fillIn(text: string, envName: string, secret: string): string {
+    let env = envs.find(e => e.name == envName);
     if env == none { return text; }
     let out = text;
     for v in env.vars {
-      out = out.split(`{{${v.name}}}`).join(v.value).split(`{{ ${v.name} }}`).join(v.value);
+      if env.secrets.includes(v.name) { continue; }
+      out = out.replaceAll(`{{${v.name}}}`, v.value).replaceAll(`{{ ${v.name} }}`, v.value);
     }
-    for name in env.secrets {
-      out = out.split(`{{${name}}}`).join("••••").split(`{{ ${name} }}`).join("••••");
+    if secret != "" {
+      for name in env.secrets {
+        out = out.replaceAll(`{{${name}}}`, secret).replaceAll(`{{ ${name} }}`, secret);
+      }
     }
     out
+  }
+
+  // A shell command that sends the request, its variables filled in from
+  // `envName`; secrets stay `{{name}}` for whoever runs it to fill.
+  fn curlOf(m: string, u: string, headers: Header[], b: string, envName: string): string {
+    let parts = ["curl"];
+    if m != "GET" { parts.push(`-X ${m}`); }
+    parts.push(shellQuote(fillIn(u.trim(), envName, "")));
+    for h in headers {
+      parts.push(`-H ${shellQuote(fillIn(`${h.name}: ${h.value}`, envName, ""))}`);
+    }
+    if b != "" { parts.push(`--data-raw ${shellQuote(fillIn(b, envName, ""))}`); }
+    parts.join(" ")
+  }
+
+  // In single quotes for a POSIX shell: each ' becomes '"'"'.
+  fn shellQuote(s: string): string {
+    let q = "'";
+    q + s.replaceAll(q, q + "\"" + q + "\"" + q) + q
+  }
+
+  fn copyCurl(text: string) {
+    clipboard.writeText(text);
+    notice = if text.includes("{{") { "copied as cURL; fill in the {{secrets}} it still names" } else { "copied as cURL" };
+  }
+
+  fn copySelCurl() {
+    if sel == none { return; }
+    copyCurl(curlOf(sel.method, sel.url, sel.reqHeaders, sel.reqBody, sel.env));
+  }
+
+  fn copyEditorCurl() {
+    copyCurl(curlOf(method, url, sentHeaders(), body, if envPick == NO_ENV { "" } else { envPick }));
+  }
+
+  // When a request was sent: the time, and the day too if not today.
+  fn when(ms: int): string {
+    if Date.date(ms) == Date.date(Date.now()) { Date.time(ms) } else { `${Date.date(ms)} ${Date.time(ms)}` }
   }
 
   fn previewWarning(): string {
@@ -941,8 +1001,8 @@
   async fn openEnvEditor() {
     blur();
     editingEnvs = true;
-    // Listed afresh: the live refresh on `environment_changed` doesn't
-    // finish (FINDINGS.md AW-029), and a panel opened should be current.
+    // Listed afresh, so a panel opened starts current even if the window
+    // missed a change while disconnected.
     await loadEnvs();
     let pick = if envPick != NO_ENV { envPick } else if envs.length > 0 { envs[0].name } else { "" };
     if pick != "" { pickEnv(pick); }
@@ -975,10 +1035,9 @@
     draftVars = draftVars.filter(v => v.id != id);
   }
 
-  // Each change below lists the environments again when it's done, so the
-  // panel shows it (the refresh on the change's event doesn't finish,
-  // FINDINGS.md AW-029).
-  async fn saveEnv() {
+  // Each change below reaches the panel as `environment_changed`, which
+  // lists the environments again, as a change made elsewhere does.
+  fn saveEnv() {
     let vars: Var[] = draftVars.filter(v => v.name.trim() != "").map(v => { name: v.name.trim(), value: v.value });
     try {
       editEnv = tracer.saveEnvironment(editEnv, vars);
@@ -986,7 +1045,6 @@
     } catch e {
       error = e.message;
     }
-    await loadEnvs();
   }
 
   fn newEnvKey(e: KeyEvent) {
@@ -996,7 +1054,7 @@
     }
   }
 
-  async fn createEnv() {
+  fn createEnv() {
     let name = newEnvName.trim();
     if name == "" { return; }
     try {
@@ -1007,10 +1065,9 @@
     } catch err {
       error = err.message;
     }
-    await loadEnvs();
   }
 
-  async fn deleteEnv() {
+  fn deleteEnv() {
     try {
       tracer.deleteEnvironment(editEnv);
       if envPick == editEnv { envPick = NO_ENV; }
@@ -1019,10 +1076,9 @@
     } catch e {
       error = e.message;
     }
-    await loadEnvs();
   }
 
-  async fn setSecret() {
+  fn setSecret() {
     if secretName.trim() == "" || secretValue == "" { return; }
     try {
       tracer.setSecret(editEnv, secretName.trim(), secretValue);
@@ -1032,16 +1088,14 @@
     } catch e {
       error = e.message;
     }
-    await loadEnvs();
   }
 
-  async fn removeSecret(name: string) {
+  fn removeSecret(name: string) {
     try {
       tracer.setSecret(editEnv, name, "");
     } catch e {
       error = e.message;
     }
-    await loadEnvs();
   }
 
   fn nameKey(e: KeyEvent) {
@@ -1072,7 +1126,7 @@
   }
 
   fn send() {
-    if !connected() {
+    if !connected {
       error = "not connected to a core";
       return;
     }
@@ -1246,12 +1300,6 @@
     }
   }
 
-  // A function, not a `computed`: a computed can't read a native signal
-  // (FINDINGS.md AW-019).
-  fn connected(): bool {
-    (tracer.link?.state ?? "") == "connected"
-  }
-
   fn linkText(): string {
     let l = tracer.link;
     if l == none {
@@ -1283,9 +1331,8 @@
     if e.phase == "end" { settings.set("reqHeight", reqHeight); }
   }
 
-  // `Math.min`/`Math.max` don't exist yet (FINDINGS.md AW-020).
   fn clamp(v: float, lo: float, hi: float): float {
-    if v < lo { lo } else if v > hi { hi } else { v }
+    Math.max(lo, Math.min(hi, v))
   }
 
   fn openPalette() {
@@ -1343,6 +1390,10 @@
       if history.length > 0 { selected = history[0].id; }
     } else if id == "rerun" {
       rerun();
+    } else if id == "curl-sel" {
+      copySelCurl();
+    } else if id == "curl-editor" {
+      copyEditorCurl();
     } else if id == "edit-past" {
       editPast();
     } else if id == "clear-filter" {
@@ -1365,7 +1416,7 @@
     } else if id == "reconnect" {
       // Connected already, `connect` replays the journal, which this page
       // has; only a lost or closed link is worth it.
-      if !connected() { connect(); }
+      if !connected { connect(); }
     }
   }
 

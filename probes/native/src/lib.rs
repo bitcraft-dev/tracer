@@ -3,7 +3,6 @@
 //! about Rux before the real app is built. See `probes/PROBES.md`.
 
 pub mod chart;
-pub mod clock;
 pub mod events;
 pub mod http;
 pub mod json;

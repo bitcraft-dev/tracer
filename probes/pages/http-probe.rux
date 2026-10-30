@@ -11,8 +11,14 @@
       <view class="url">
         <input r-model="url" placeholder="https://…" />
       </view>
-      <view class="send" :class="{ busy: busy }" @tap="send()">
-        <text class="send-label">{{ if busy { "Sending…" } else { "Send" } }}</text>
+      <view class="limit">
+        <input type="select" r-model="limit" :options="limits" />
+      </view>
+      <view class="send" r-if="!busy" @tap="start()">
+        <text class="send-label">Send</text>
+      </view>
+      <view class="send stop" r-if="busy" @tap="stop(&quot;cancelled&quot;)">
+        <text class="send-label">Cancel</text>
       </view>
     </view>
     <view class="body" r-if="method != &quot;GET&quot; && method != &quot;HEAD&quot;">
@@ -25,6 +31,7 @@
       <text class="chip">Headers {{ res.headers.length }}</text>
     </view>
     <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
+    <text class="p" r-if="outcome != &quot;&quot;">{{ outcome }}</text>
     <view class="split" r-if="res != none">
       <view class="pane">
         <text class="pane-h">Body (first 4 KiB)</text>
@@ -47,7 +54,8 @@
   .url { flex: 1; }
   .send { padding: 9px 22px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
   .send:hover { background: #8f81f5; }
-  .send.busy { background: #4a4380; }
+  .send.stop { background: #8a3a38; }
+  .limit { width: 130px; }
   .send-label { color: #ffffff; font-size: 14px; font-weight: 700; }
   .body { height: 140px; }
   .chips { display: flex; gap: 8px; }
@@ -73,23 +81,55 @@
   let res: HttpResult? = signal(none);
   let error = signal("");
   let busy = signal(false);
+  // How the last send ended, and how long it took, by the script's clock.
+  let outcome = signal("");
+  let started = signal(0.0);
+  // The run under way and its time limit, so either can stop the other.
+  let job = signal(0);
+  let timer = signal(0);
+  let limits = ["no limit", "2 s", "10 s"];
+  let limit = signal("no limit");
 
   async fn send() {
-    if busy { return; }
-    busy = true;
-    error = "";
     try {
       res = await http.send(method, url, body);
+      outcome = `answered in ${(now() - started).round()} ms`;
     } catch e {
       res = none;
       error = `${e.kind}: ${e.message}`;
     }
+    clearInterval(timer);
     busy = false;
+  }
+
+  // Sent without `await`, so its handle can be cancelled; a time limit is an
+  // interval that cancels it.
+  fn start() {
+    if busy { return; }
+    busy = true;
+    error = "";
+    outcome = "";
+    res = none;
+    started = now();
+    job = send();
+    if limit != "no limit" {
+      let ms = (parseInt(limit) ?? 0) * 1000;
+      timer = setInterval(ms) {
+        stop(`timed out after ${limit}`);
+      }
+    }
+  }
+
+  fn stop(why: string) {
+    cancel(job);
+    clearInterval(timer);
+    busy = false;
+    outcome = `${why} after ${(now() - started).round()} ms; a late answer writes nothing`;
   }
 
   fn onKey(e: KeyEvent) {
     if e.primary && e.key == "Enter" {
-      send();
+      start();
       return false;
     }
   }
