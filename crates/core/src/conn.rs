@@ -14,7 +14,7 @@ use tracer_protocol::{
     Actor, Command, EventKind, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::http;
+use crate::{envs, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -70,12 +70,16 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
                 });
                 continue;
             }
-            (Some((_, actor)), Command::Send { request }) => {
-                let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone());
+            (Some((_, actor)), Command::Send { request, env }) => {
+                let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone());
                 let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
                 let (hub, actor) = (hub.clone(), actor.clone());
                 thread::spawn(move || {
-                    let kind = match http::execute(&request, &cancelled) {
+                    // Resolved here, not before it started, so a missing
+                    // variable is a failed request every client sees.
+                    let env = env.as_deref().map(|name| hub.environment(name)).transpose();
+                    let resolved = env.and_then(|env| envs::resolve(&request, env.as_ref()));
+                    let kind = match resolved.and_then(|request| http::execute(&request, &cancelled)) {
                         Ok(response) => EventKind::RequestFinished { request_id, response },
                         Err(error) => EventKind::RequestFailed { request_id, error },
                     };
@@ -100,6 +104,16 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
             }
             (Some((_, actor)), Command::DeleteRequest { path }) => {
                 hub.delete_request(actor.clone(), &path).map(|_| ReplyBody::Deleted)
+            }
+            (Some(_), Command::ListEnvironments) => {
+                let (environments, as_of, skipped) = hub.list_environments();
+                Ok(ReplyBody::Environments { environments, as_of, skipped })
+            }
+            (Some((_, actor)), Command::SaveEnvironment { env }) => {
+                hub.save_environment(actor.clone(), env).map(|name| ReplyBody::EnvironmentSaved { name })
+            }
+            (Some((_, actor)), Command::DeleteEnvironment { name }) => {
+                hub.delete_environment(actor.clone(), &name).map(|_| ReplyBody::EnvironmentDeleted)
             }
             (Some(_), Command::Status) => {
                 let (clients, next_seq) = hub.status();

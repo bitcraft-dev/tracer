@@ -31,6 +31,10 @@ pub const JOURNAL_PATH: &str = ".tracer/journal.ndjson";
 /// `.http` file each, folders being collections.
 pub const REQUESTS_DIR: &str = "requests";
 
+/// The folder, relative to the workspace, that holds environments: one
+/// `<name>.env` file each, `KEY=value` a line.
+pub const ENVIRONMENTS_DIR: &str = "environments";
+
 /// Where the core is listening and what it wants to hear first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
@@ -84,8 +88,13 @@ pub enum Command {
     /// gap between the two.
     Subscribe { since: Option<u64> },
     /// Send an HTTP request. The reply gives its id at once; what happens to
-    /// it arrives as events, which every client sees.
-    Send { request: HttpRequest },
+    /// it arrives as events, which every client sees. `{{name}}` in it is
+    /// filled from `env` when it is sent; one `env` doesn't define fails it.
+    Send {
+        request: HttpRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+    },
     /// Cancel a request still running, whoever sent it. The core publishes
     /// `request_cancelled` and nothing else follows for that request; a
     /// request that has already finished or failed is refused.
@@ -99,6 +108,13 @@ pub enum Command {
     SaveRequest { path: String, request: HttpRequest },
     /// Delete the saved request at `path`. Published as `request_deleted`.
     DeleteRequest { path: String },
+    /// Every environment, and the event number the list is true at.
+    ListEnvironments,
+    /// Save an environment, over any of that name. Published as
+    /// `environment_saved`.
+    SaveEnvironment { env: Environment },
+    /// Published as `environment_deleted`.
+    DeleteEnvironment { name: String },
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -115,6 +131,14 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub body: Option<String>,
+}
+
+/// A named set of variables, filling `{{name}}` in requests sent with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Environment {
+    /// One word, such as `local`: the file is `environments/<name>.env`.
+    pub name: String,
+    pub vars: Vec<(String, String)>,
 }
 
 /// A request saved in the workspace, by its path: relative to
@@ -174,6 +198,9 @@ pub enum ReplyBody {
     /// The path as the core wrote it, which may be tidier than the one sent.
     Saved { path: String },
     Deleted,
+    Environments { environments: Vec<Environment>, as_of: u64, skipped: Vec<String> },
+    EnvironmentSaved { name: String },
+    EnvironmentDeleted,
     Stopping,
 }
 
@@ -194,7 +221,14 @@ pub struct Event {
 pub enum EventKind {
     ClientJoined { client: u64 },
     ClientLeft { client: u64 },
-    RequestStarted { request_id: u64, request: HttpRequest },
+    /// `request` as written, `{{name}}` and all; `env` names the environment
+    /// it was sent with. Resolved values stay out of the journal.
+    RequestStarted {
+        request_id: u64,
+        request: HttpRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+    },
     RequestFinished { request_id: u64, response: HttpResponse },
     RequestFailed { request_id: u64, error: String },
     /// Cancelled by this event's actor. A request ends with exactly one of
@@ -202,6 +236,8 @@ pub enum EventKind {
     RequestCancelled { request_id: u64 },
     RequestSaved { path: String, request: HttpRequest },
     RequestDeleted { path: String },
+    EnvironmentSaved { env: Environment },
+    EnvironmentDeleted { name: String },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
     CoreStopping,
@@ -232,7 +268,8 @@ mod tests {
                     url: "http://x/".into(),
                     headers: vec![],
                     body: None,
-                }
+                },
+                env: None,
             }
         );
     }

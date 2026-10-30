@@ -67,7 +67,7 @@ fn answer(mut stream: TcpStream) {
 }
 
 fn get(url: String) -> Command {
-    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None } }
+    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None }, env: None }
 }
 
 #[test]
@@ -525,4 +525,47 @@ fn a_request_a_dead_core_left_running_is_closed_when_the_next_one_opens() {
     let journal = std::fs::read_to_string(ws.join(".tracer/journal.ndjson")).unwrap();
     let failures = journal.lines().filter(|l| l.contains("\"request_failed\"") && l.contains("\"request_id\":7")).count();
     assert_eq!(failures, 1, "{journal}");
+}
+
+#[test]
+fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_written() {
+    let ws = workspace("envs");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    let env = tracer_protocol::Environment { name: "local".into(), vars: vec![("baseUrl".into(), base.clone()), ("id".into(), "7".into())] };
+    assert_eq!(agent.call(Command::SaveEnvironment { env }).unwrap(), Ok(ReplyBody::EnvironmentSaved { name: "local".into() }));
+    let text = std::fs::read_to_string(ws.join("environments/local.env")).unwrap();
+    assert_eq!(text, format!("baseUrl={base}\nid=7\n"));
+
+    let send = |url: &str| Command::Send {
+        request: HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], body: None },
+        env: Some("local".into()),
+    };
+    let Ok(ReplyBody::Accepted { request_id: ok_id }) = agent.call(send("{{baseUrl}}/albums/{{ id }}")).unwrap() else { panic!() };
+    let Ok(ReplyBody::Accepted { request_id: bad_id }) = agent.call(send("{{baseUrl}}/{{nope}}")).unwrap() else { panic!() };
+
+    let (mut started, mut finished, mut failed) = (None, None, None);
+    while finished.is_none() || failed.is_none() {
+        let e = window.next_event().unwrap();
+        match e.kind {
+            EventKind::RequestStarted { request_id, request, env } if request_id == ok_id => started = Some((request.url, env)),
+            EventKind::RequestFinished { request_id, response } if request_id == ok_id => finished = Some(response.body),
+            EventKind::RequestFailed { request_id, error } if request_id == bad_id => failed = Some(error),
+            _ => {}
+        }
+    }
+    // As written in the journal; filled in on the wire.
+    assert_eq!(started.unwrap(), ("{{baseUrl}}/albums/{{ id }}".to_string(), Some("local".to_string())));
+    assert_eq!(finished.unwrap(), r#"{"path":"/albums/7","got":0}"#);
+    assert_eq!(failed.unwrap(), "{{nope}} not defined in environment `local`");
+
+    let Ok(ReplyBody::Environments { environments, .. }) = window.call(Command::ListEnvironments).unwrap() else { panic!() };
+    assert_eq!(environments.len(), 1);
+    assert_eq!(agent.call(Command::DeleteEnvironment { name: "local".into() }).unwrap(), Ok(ReplyBody::EnvironmentDeleted));
+    assert!(!ws.join("environments/local.env").exists());
+    core.stop();
 }

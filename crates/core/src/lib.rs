@@ -11,6 +11,7 @@
 //! [`Command::Hello`]: tracer_protocol::Command::Hello
 
 mod conn;
+mod envs;
 mod files;
 mod http;
 mod hub;

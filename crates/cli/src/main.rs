@@ -7,6 +7,7 @@
 //! tracer ls                         list the saved requests
 //! tracer save <PATH> GET https://…  save a request as requests/<PATH>.http
 //! tracer run <PATH>                 send a saved request
+//! tracer env                        list the environments
 //! tracer rm <PATH>                  delete a saved request
 //! tracer watch [--all | --since N]  print events as they happen
 //! tracer cancel <ID>                 cancel a running request, whoever sent it
@@ -22,16 +23,21 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
 
+/// `{{name}}` values are shown cut to this, so a long token doesn't fill the
+/// terminal.
+const VALUE_SHOWN: usize = 48;
+
 const USAGE: &str = "\
 usage:
   tracer core                         run the core for the workspace
   tracer status                       who is connected, how far the journal goes
-  tracer send <METHOD> <URL> [-H 'Name: value']... [-d <body>]
+  tracer send <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--env <NAME>]
                                       send a request and print its answer
   tracer ls                           list the saved requests
   tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>]
                                       save a request as requests/<PATH>.http
-  tracer run <PATH>                   send a saved request and print its answer
+  tracer run <PATH> [--env <NAME>]    send a saved request and print its answer
+  tracer env                          list the environments and their variables
   tracer rm <PATH>                    delete a saved request
   tracer watch [--all | --since <N>]  print events as they happen
   tracer cancel <ID>                  cancel a running request, whoever sent it
@@ -54,6 +60,7 @@ fn main() -> ExitCode {
         Some("save") => save(workspace, args[1..].to_vec()),
         Some("run") => run(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
+        Some("env") => env_list(workspace),
         Some("watch") => watch(workspace, args[1..].to_vec()),
         Some("cancel") => cancel(workspace, args[1..].to_vec()),
         Some("stop") => stop(workspace),
@@ -126,9 +133,10 @@ fn cancel(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     }
 }
 
-fn send(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let env = take_value(&mut args, "--env");
     let request = request_from(args)?;
-    send_and_wait(&workspace, request, "tracer send")
+    send_and_wait(&workspace, request, env, "tracer send")
 }
 
 /// `<METHOD> <URL> [-H 'Name: value']... [-d <body>]`.
@@ -176,7 +184,8 @@ fn save(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     }
 }
 
-fn run(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let env = take_value(&mut args, "--env");
     let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
     // Matched as the core names paths, so `requests/a/b.http` finds `a/b`.
     let wanted = path.trim().replace('\\', "/");
@@ -186,7 +195,29 @@ fn run(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
         return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
     };
-    send_and_wait(&workspace, found.request, "tracer run")
+    send_and_wait(&workspace, found.request, env, "tracer run")
+}
+
+fn env_list(workspace: PathBuf) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer env")?;
+    let ReplyBody::Environments { environments, skipped, .. } = client.call(Command::ListEnvironments)?.map_err(io::Error::other)? else {
+        return Err(io::Error::other("unexpected answer"));
+    };
+    for env in &environments {
+        println!("{}", env.name);
+        for (key, value) in &env.vars {
+            let shown: String = value.chars().take(VALUE_SHOWN).collect();
+            let more = if shown.len() < value.len() { "…" } else { "" };
+            println!("  {key:<20} {shown}{more}");
+        }
+    }
+    for why in &skipped {
+        eprintln!("tracer: skipped {why}");
+    }
+    if environments.is_empty() && skipped.is_empty() {
+        eprintln!("tracer: no environments; write environments/<name>.env with KEY=value lines");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn rm(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
@@ -212,11 +243,11 @@ fn saved(workspace: &PathBuf, name: &str) -> io::Result<(Vec<SavedRequest>, Vec<
 }
 
 /// Send `request` and print its answer when it comes.
-fn send_and_wait(workspace: &PathBuf, request: HttpRequest, name: &str) -> io::Result<ExitCode> {
+fn send_and_wait(workspace: &PathBuf, request: HttpRequest, env: Option<String>, name: &str) -> io::Result<ExitCode> {
     let mut client = Client::connect(workspace, ClientKind::Cli, name)?;
     // Subscribed before sending, so the answer cannot go past unseen.
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
-    let request_id = match client.call(Command::Send { request })? {
+    let request_id = match client.call(Command::Send { request, env })? {
         Ok(ReplyBody::Accepted { request_id }) => request_id,
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),
@@ -269,8 +300,9 @@ fn describe(event: &Event) -> String {
     let what = match &event.kind {
         EventKind::ClientJoined { client } => format!("joined as client {client}"),
         EventKind::ClientLeft { client } => format!("left (client {client})"),
-        EventKind::RequestStarted { request_id, request } => {
-            format!("#{request_id} {} {}", request.method, request.url)
+        EventKind::RequestStarted { request_id, request, env } => {
+            let with = env.as_ref().map(|e| format!(" (env {e})")).unwrap_or_default();
+            format!("#{request_id} {} {}{with}", request.method, request.url)
         }
         EventKind::RequestFinished { request_id, response } => format!(
             "#{request_id} → {} in {:.0} ms ({} B)",
@@ -280,6 +312,8 @@ fn describe(event: &Event) -> String {
         EventKind::RequestCancelled { request_id } => format!("#{request_id} cancelled"),
         EventKind::RequestSaved { path, request } => format!("saved {path} ({} {})", request.method, request.url),
         EventKind::RequestDeleted { path } => format!("deleted {path}"),
+        EventKind::EnvironmentSaved { env } => format!("saved environment {} ({} variables)", env.name, env.vars.len()),
+        EventKind::EnvironmentDeleted { name } => format!("deleted environment {name}"),
         EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)

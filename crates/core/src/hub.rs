@@ -15,9 +15,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracer_protocol::{Actor, Event, EventKind, HttpRequest, SavedRequest, ServerMessage, JOURNAL_PATH};
+use tracer_protocol::{Actor, Environment, Event, EventKind, HttpRequest, SavedRequest, ServerMessage, JOURNAL_PATH};
 
-use crate::files;
+use crate::{envs, files};
 
 pub struct Hub {
     inner: Mutex<Inner>,
@@ -154,13 +154,13 @@ impl Hub {
 
     /// Number a new request and publish that it started. Gives its id and
     /// the flag that says it was cancelled.
-    pub fn start_request(&self, actor: Actor, request: HttpRequest) -> (u64, Arc<AtomicBool>) {
+    pub fn start_request(&self, actor: Actor, request: HttpRequest, env: Option<String>) -> (u64, Arc<AtomicBool>) {
         let mut inner = self.inner.lock().unwrap();
         let request_id = inner.next_request;
         inner.next_request += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         inner.running.insert(request_id, cancelled.clone());
-        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request });
+        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env });
         (request_id, cancelled)
     }
 
@@ -212,6 +212,39 @@ impl Hub {
             _ => format!("could not delete `{path}`: {e}"),
         })?;
         publish_locked(&mut inner, actor, EventKind::RequestDeleted { path });
+        Ok(())
+    }
+
+    pub fn list_environments(&self) -> (Vec<Environment>, u64, Vec<String>) {
+        let inner = self.inner.lock().unwrap();
+        let (environments, skipped) = envs::list(&self.root);
+        (environments, inner.next_seq, skipped)
+    }
+
+    pub fn environment(&self, name: &str) -> Result<Environment, String> {
+        let _inner = self.inner.lock().unwrap();
+        envs::read(&self.root, name)
+    }
+
+    pub fn save_environment(&self, actor: Actor, mut env: Environment) -> Result<String, String> {
+        env.name = envs::normalize(&env.name)?;
+        // What's written must read back the same.
+        envs::from_text(&envs::to_text(&env))?;
+        let mut inner = self.inner.lock().unwrap();
+        envs::write(&self.root, &env).map_err(|e| format!("could not save environment `{}`: {e}", env.name))?;
+        let name = env.name.clone();
+        publish_locked(&mut inner, actor, EventKind::EnvironmentSaved { env });
+        Ok(name)
+    }
+
+    pub fn delete_environment(&self, actor: Actor, name: &str) -> Result<(), String> {
+        let name = envs::normalize(name)?;
+        let mut inner = self.inner.lock().unwrap();
+        envs::remove(&self.root, &name).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => format!("there is no environment `{name}`"),
+            _ => format!("could not delete environment `{name}`: {e}"),
+        })?;
+        publish_locked(&mut inner, actor, EventKind::EnvironmentDeleted { name });
         Ok(())
     }
 

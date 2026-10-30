@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tracer_protocol::client::{Client, Incoming, Shared};
-use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody};
+use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
 
 /// The most of a response body handed to the page. The core and its journal
 /// keep the whole body; a viewer for large ones is Phase 4.
@@ -53,8 +53,11 @@ pub struct CoreEvent {
     pub actor_kind: String,
     pub actor: String,
     /// `client_joined`, `client_left`, `request_started`, `request_finished`,
-    /// `request_failed`, `request_cancelled` or `core_stopping`.
+    /// `request_failed`, `request_cancelled`, `request_saved`,
+    /// `request_deleted` or `core_stopping`.
     pub kind: String,
+    /// A saved request's path, for `request_saved` and `request_deleted`.
+    pub path: String,
     pub client: u64,
     pub request_id: u64,
     pub method: String,
@@ -68,6 +71,29 @@ pub struct CoreEvent {
     pub ttfb_ms: f64,
     pub total_ms: f64,
     pub error: String,
+}
+
+/// A request saved in the workspace.
+#[rux::export]
+#[derive(Clone)]
+pub struct Saved {
+    /// Relative to `requests/`, `/` between folders, no extension.
+    pub path: String,
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<Header>,
+    pub body: String,
+}
+
+/// Every saved request, as of event `as_of`: saves and deletes numbered from
+/// `as_of` on came after it.
+#[rux::export]
+#[derive(Clone)]
+pub struct Collection {
+    pub requests: Vec<Saved>,
+    pub as_of: u64,
+    /// Files under `requests/` that don't parse, and why.
+    pub skipped: Vec<String>,
 }
 
 /// The window's connection, for the status bar.
@@ -169,17 +195,8 @@ pub async fn connect(workspace: String) -> Result<Link, CoreError> {
 /// arrives on `events`, to this window and to every other client alike.
 #[rux::export]
 pub fn send(method: String, url: String, headers: Vec<Header>, body: String) -> Result<u64, CoreError> {
-    let shared = match SESSION.lock().unwrap().as_ref() {
-        Some(session) => session.shared.clone(),
-        None => return Err(CoreError("not connected to a core".into())),
-    };
-    let request = HttpRequest {
-        method: method.to_uppercase(),
-        url: url.trim().to_string(),
-        headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
-        body: if body.is_empty() { None } else { Some(body) },
-    };
-    match shared.call(Command::Send { request }) {
+    let request = request_of(method, url, headers, body);
+    match shared()?.call(Command::Send { request, env: None }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
@@ -191,11 +208,42 @@ pub fn send(method: String, url: String, headers: Vec<Header>, body: String) -> 
 /// arrives on `events` like everything else.
 #[rux::export]
 pub fn cancel(request_id: u64) -> Result<(), CoreError> {
-    let shared = match SESSION.lock().unwrap().as_ref() {
-        Some(session) => session.shared.clone(),
-        None => return Err(CoreError("not connected to a core".into())),
-    };
-    match shared.call(Command::Cancel { request_id }) {
+    match shared()?.call(Command::Cancel { request_id }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// The workspace's saved requests, read from its files by the core.
+#[rux::export]
+pub async fn list_requests() -> Result<Collection, CoreError> {
+    match shared()?.call(Command::ListRequests) {
+        Ok(Ok(ReplyBody::Requests { requests, as_of, skipped })) => {
+            Ok(Collection { requests: requests.into_iter().map(saved_of).collect(), as_of, skipped })
+        }
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Save a request at `path`, over any there. Gives the path as the core
+/// wrote it; every client hears `request_saved`.
+#[rux::export]
+pub fn save_request(path: String, method: String, url: String, headers: Vec<Header>, body: String) -> Result<String, CoreError> {
+    let request = request_of(method, url, headers, body);
+    match shared()?.call(Command::SaveRequest { path, request }) {
+        Ok(Ok(ReplyBody::Saved { path })) => Ok(path),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+#[rux::export]
+pub fn delete_request(path: String) -> Result<(), CoreError> {
+    match shared()?.call(Command::DeleteRequest { path }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
@@ -318,6 +366,31 @@ fn tracer_bin() -> PathBuf {
     PathBuf::from(name)
 }
 
+fn shared() -> Result<Arc<Shared>, CoreError> {
+    match SESSION.lock().unwrap().as_ref() {
+        Some(session) => Ok(session.shared.clone()),
+        None => Err(CoreError("not connected to a core".into())),
+    }
+}
+
+fn request_of(method: String, url: String, headers: Vec<Header>, body: String) -> HttpRequest {
+    HttpRequest {
+        method: method.to_uppercase(),
+        url: url.trim().to_string(),
+        headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
+        body: if body.is_empty() { None } else { Some(body) },
+    }
+}
+
+fn headers_of(list: Vec<(String, String)>) -> Vec<Header> {
+    list.into_iter().map(|(name, value)| Header { name, value }).collect()
+}
+
+fn saved_of(saved: SavedRequest) -> Saved {
+    let r = saved.request;
+    Saved { path: saved.path, method: r.method, url: r.url, headers: headers_of(r.headers), body: r.body.unwrap_or_default() }
+}
+
 fn set_link(state: &str, detail: &str, workspace: &str, started_core: bool) -> Link {
     let link = Link {
         state: state.into(),
@@ -336,6 +409,7 @@ fn to_page(event: Event) -> CoreEvent {
         actor_kind: format!("{:?}", event.actor.kind).to_lowercase(),
         actor: event.actor.name,
         kind: String::new(),
+        path: String::new(),
         client: 0,
         request_id: 0,
         method: String::new(),
@@ -348,11 +422,11 @@ fn to_page(event: Event) -> CoreEvent {
         total_ms: 0.0,
         error: String::new(),
     };
-    let headers = |list: Vec<(String, String)>| list.into_iter().map(|(name, value)| Header { name, value }).collect();
+    let headers = headers_of;
     match event.kind {
         EventKind::ClientJoined { client } => (out.kind, out.client) = ("client_joined".into(), client),
         EventKind::ClientLeft { client } => (out.kind, out.client) = ("client_left".into(), client),
-        EventKind::RequestStarted { request_id, request } => {
+        EventKind::RequestStarted { request_id, request, .. } => {
             out.kind = "request_started".into();
             out.request_id = request_id;
             out.method = request.method;
@@ -379,6 +453,20 @@ fn to_page(event: Event) -> CoreEvent {
             out.kind = "request_cancelled".into();
             out.request_id = request_id;
         }
+        EventKind::RequestSaved { path, request } => {
+            out.kind = "request_saved".into();
+            out.path = path;
+            out.method = request.method;
+            out.url = request.url;
+            out.headers = headers(request.headers);
+            out.body = request.body.unwrap_or_default();
+        }
+        EventKind::RequestDeleted { path } => {
+            out.kind = "request_deleted".into();
+            out.path = path;
+        }
+        // Environments reach the window in the next step.
+        EventKind::EnvironmentSaved { .. } | EventKind::EnvironmentDeleted { .. } => out.kind = "environment_changed".into(),
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }
     out
