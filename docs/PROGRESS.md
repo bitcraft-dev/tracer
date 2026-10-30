@@ -17,9 +17,13 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 - Phases 0 to 3 are done: the MCP server (tried from Claude Code),
   guardrails, `agents.policy` and the local HTTP/WS API (see Done). Next
   is Phase 4.
-- **Open Rux findings: AW-036 only**, which is new and not yet answered.
-  AW-035 was closed on 2026-10-30 after a re-drive on the pushed and
-  installed Rux b4fe20a. Everything from AW-001 to AW-035 is closed.
+- **Open Rux findings: AW-036 and AW-037**, neither answered yet.
+  **AW-037 is a blocker**: an empty inline `<text>` after a non-empty one
+  panics the window. Everything from AW-001 to AW-035 is closed.
+- **Phase 4's response viewer is on branch `phase-4-response-tools`**, not
+  on `phase-1-core`: written and unit-tested, but opening any finished
+  request's body panics the window (AW-037). Merge it once AW-037 is fixed
+  and the viewer is driven.
 - **Other Claude sessions:** the Rux team works in sessions on
   `C:\Users\USER\Mobile\UI Research` (named ui-research-97 and
   ui-research-eb on 2026-10-30), and they message Tracer's session when a
@@ -284,15 +288,31 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   a foreign Origin refused 403) and Node 24's built-in `WebSocket` (hello
   as a person, subscribe with replay, allowed curl's request).
 
+- **Phase 4 started: the response viewer** (branch
+  `phase-4-response-tools`). `app/native/src/view.rs`: `body_view(id,
+  folded, limit)` fetches the whole body from the core (`Response`; events
+  carry 64 KiB), lays it out once per request on show, and gives the lines
+  the folds leave visible, up to a limit (1,000 more per "Show more").
+  JSON is pretty-printed from its own text by a small parser, so keys keep
+  their order and numbers read as sent (`1.50`, `-2e3`); a fold gives
+  `{ … }` with "3 keys" / "12 items"; anything else is its own lines. Fold
+  numbers are the unfolded line numbers, so inner folds stay put. Page:
+  numbered lines, ▾/▸ per foldable line, colours by kind. 4 unit tests.
+  Driving it found **AW-037** (the window panics on the first body shown).
+
 ### Next
 
-1. Phase 4: response tools, then assertions and flows, then benchmarking
+1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
+   nested body of about 40k lines, an HTML page; folding, Show more,
+   scroll cost in a release build), then merge `phase-4-response-tools`.
+2. Phase 4: the rest of the response tools, then assertions and flows, then benchmarking
    (with bench-size caps in the policy), then realtime and GraphQL. The
    timing waterfall (DNS, connect, TLS, TTFB) comes early: it would have
    told the network's faults from Tracer's in a minute (see the gotcha).
-2. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
+   It's in the core, not the window, so it isn't blocked by AW-037.
+3. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
-3. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
+4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
    wants it.
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
@@ -392,6 +412,11 @@ Things that cost a round trip once. Check here before debugging them again.
   every host (no IPv6 here). curl meets the same (connects of 2.4 and
   3.2 s); a few quick curl runs had first misled me into blaming Tracer's
   resolver. Measure resolve and connect apart before blaming anything.
+
+- **A Rux app with no native crate runs inside the `rux` process**: its
+  window belongs to `rux.exe` (title = the app's name), not to an exe of
+  its own. Find it with `Get-Process rux | ? MainWindowTitle -eq <name>`.
+  A minimal page for a finding needs only `rux.toml` and `app.rux`.
 
 ### Driving the window
 

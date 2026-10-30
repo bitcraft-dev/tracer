@@ -1010,6 +1010,45 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   and check `flex: 1` sets a 0 basis.
 - **Status:** open.
 
+## AW-037 An empty inline `<text>` after a non-empty one panics the window
+
+- **Found:** 2026-10-30, building Tracer's response viewer (Phase 4), on
+  Rux b4fe20a (pushed; checkout clean, installed `rux` 21:33).
+- **Severity:** blocker: the window's process exits on a parley assertion,
+  so the app is gone, not one line wrong. `rux check` finds nothing. Any
+  line of coloured pieces where a piece can be empty meets it: a JSON
+  viewer (a line's key, value, note), a search hit's before/match/after, a
+  label with an optional suffix.
+- **Limit:** a sentence (`<text>` holding `<text>` pieces) whose piece is
+  empty, after a piece that isn't, panics on layout:
+  `parley-0.11.1/src/analysis/mod.rs:289: assertion failed:
+  style_run.range.start < style_run.range.end`. An empty *first* piece is
+  fine, and so is a sentence whose pieces are all empty; an empty piece in
+  the middle or at the end is not.
+- **Reproduction:** (installed `rux` b4fe20a, no native crate)
+  ```html
+  <screen>
+    <text r-for="l in lines"><text class="a">{{ l.a }}</text><text class="b">{{ l.b }}</text><text class="c">{{ l.c }}</text></text>
+  </screen>
+  ```
+  with `let lines = signal([{ a: "\"k\": ", b: "1,", c: "" }])`: `rux run`
+  panics before the window shows. `{ a: "x ", b: "", c: " z" }` panics too;
+  `{ a: "", b: "first", c: " x" }` and `{ a: "", b: "", c: "" }` draw. The
+  same page with classes on the pieces or without them; with literal empty
+  text in place of `{{ }}`, untried.
+- **Cause, as far as read:** `rux-text/src/lib.rs` (about line 613) pushes
+  every run of a sentence to parley's builder as a style span, empty ranges
+  included; parley's analysis then asserts each style run is non-empty. The
+  same file already skips empty runs when it measures runs' boxes (about
+  line 1010, `if run.range.is_empty()`).
+- **Workaround:** none taken. Tracer's response viewer is written as it
+  should be and waits for this: opening any finished request's body panics
+  the window, so the viewer is kept off `phase-1-core` (see PROGRESS.md).
+- **Suggested fix:** skip empty runs when pushing style spans (they style
+  no text), and a test that lays out a sentence with an empty piece first,
+  in the middle and last.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,
