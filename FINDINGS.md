@@ -819,6 +819,87 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   script doesn't cover symbols, which are script "Common".
 - **Status:** open.
 
+## AW-031 Keyboard focus is kept by position: when a focusable element appears before it, focus moves to the newcomer
+
+- **Found:** 2026-10-30, Tracer's history filter (a "clear" link appears
+  beside the title once the search field has text).
+- **Severity:** bug. Visible as a ring on a button nobody focused, and Tab
+  takes an extra press; the same index drives Space/Enter on a focused box.
+- **Limit:** the shell remembers keyboard focus as `focus_index`, a position
+  in `focusables` (document order). On every rebuild it keeps the number if
+  it is still in range (`rux-shell/src/lib.rs`, around line 7799:
+  "Keep the focus index in range…", then `*focusables = layout.focusables`),
+  and `sync_focus_state` takes the path of whatever is at that position now.
+  So when an `r-if` box with `@tap` appears **before** the focused element,
+  the index names the newcomer: it matches `:focus`, and `:focus-visible`
+  too once the keyboard has been used, so it grows the default ring. The text
+  field keeps its own focus (known by `r-model`), so two elements show focus
+  at once. Tab then steps from the newcomer, landing on the field itself.
+  Seen three ways in Tracer at Rux 4906409:
+  1. Typing in the history search makes "clear" appear, ringed.
+  2. Tapping a history row, then typing in the Ctrl+K palette's `autofocus`
+     field: the row lights up behind the palette (an `autofocus` doesn't
+     move `focus_index` off the tapped row either).
+  3. A request arriving at the top of the history list moves that ring from
+     the row that was tapped to the new first row.
+- **Reproduction:** (installed `rux`, a page with no native crate)
+  ```html
+  <view class="head">
+    <text>Title</text>
+    <view r-if="q != &quot;&quot;" @tap="q = &quot;&quot;"><text>clear</text></view>
+  </view>
+  <input r-model="q" />
+  <view r-if="q != &quot;&quot;" @tap="q = &quot;&quot;"><text>after</text></view>
+  ```
+  with `let q = signal("");`. Click the field, type `a`: "clear" gets a ring;
+  "after" doesn't. Press Tab: the field keeps the caret; Tab again reaches
+  "after". A browser rings nothing but the field and reaches "after" in one
+  Tab.
+- **Workaround:** none in Tracer; the ring is left showing.
+- **Suggested fix:** remember the focused element by identity (its path or
+  key, as text fields are by `r-model`, row and instance) and find its new
+  index after each layout, dropping focus only if it is gone; and have a
+  text field taking focus (tap or `autofocus`) set `focus_index` to itself.
+- **Status:** open.
+
+## AW-032 A select's dropdown runs off the bottom of the window, and what's below can't be reached
+
+- **Found:** 2026-10-30, Tracer's history status filter (8 options, the
+  select about 270 px above the window's bottom at 1280×800, 150% scale).
+- **Severity:** bug: options are unreachable.
+- **Limit:** the dropdown always opens below its field and is cut by the
+  window's edge. Here 5 of 8 options show; `failed` is half cut and
+  `cancelled` and `running` can't be picked. The wheel doesn't scroll the
+  open list, and ArrowDown/Enter don't move or take its pick (the select
+  only gains a focus ring). A browser flips the list above the field, or
+  makes it scroll, when there isn't room below, and arrows move the pick.
+- **Reproduction:** `<input type="select" r-model="v" :options="list">` with
+  ten options, placed near the bottom of the window; open it.
+- **Workaround:** none in Tracer. Making the window taller shows them.
+- **Suggested fix:** place the panel with the room there is (flip up, or
+  cap its height to the window and scroll it, as browsers do), and let the
+  arrows and Enter pick within an open dropdown.
+- **Status:** open.
+
+## AW-033 Script has no wall clock or `Date`: an app can't say when something happened
+
+- **Found:** 2026-10-30, Tracer's history (each request carries the time it
+  was sent, in milliseconds since the Unix epoch, from the core).
+- **Severity:** friction; every app with a log, a feed or a history meets it.
+- **Limit:** `now()` (AW-009's fix) is monotonic, so it can't be compared
+  with an epoch time to say "3 min ago", and there is no `Date` to format
+  one as "14:02" in the local time zone. `docs/07-script.md` lists `Date` as
+  "not there yet". Tracer's history rows show no time.
+- **Reproduction:** given `atMs = 1793345000000`, there is no way in script
+  to print the local time it names, or how long ago it was.
+- **Workaround:** none taken. Formatting in the native crate would work, but
+  would hide the gap (an app without a `native/` crate has no such option).
+- **Suggested fix:** `Date.now()` (epoch ms), and `new Date(ms)` with the
+  local-time getters and `toLocaleTimeString` / `toLocaleDateString`, or
+  `Intl.RelativeTimeFormat` for "3 min ago"; JavaScript's names, as AW-020
+  went.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,

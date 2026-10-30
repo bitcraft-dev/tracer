@@ -5,7 +5,7 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-30, afternoon)
+## Where it stands (2026-10-30, evening)
 
 Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `master` holds Phase 0, `phase-1-core` everything since, and both track `origin`. Push when the user asks.
 
@@ -139,17 +139,50 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     boxes; Tracer uses ×). The Rux team fixed AW-021 meanwhile (73ff9a7),
     unverified.
 
+- **Phase 2 finished: searchable, replayable history (2026-10-30, evening).**
+  - Core and CLI (1550ac8): `History { filter }` gives past requests newest
+    first, as written, with how each ended (status, total, size, or the
+    error, or who cancelled), filtered by text (method, URL as written, env,
+    sender, status, `#id`), actor kind and status class (`2xx`…`5xx`,
+    `failed`, `cancelled`, `running`), up to a limit (50). `Rerun
+    { request_id, env }` sends one again as written, with its env unless
+    told otherwise (`""` for none); `request_started` carries `rerun_of`
+    (defaulted, so old journals read). CLI `tracer history [TEXT] --actor
+    --status -n` and `tracer rerun <ID> [--env | --no-env]`. Two core tests
+    and two protocol tests; 27 in all, passing. Built for Phase 3's
+    `read_history` agent tool too.
+  - Window: a search field and actor/status selects under History, "n of
+    m" and a clear link; rows tagged `↻ #n` for re-runs; the response pane
+    shows `#id`, the env, a "re-run of #n" chip that jumps to the original,
+    and **Edit** (puts the request, headers and body into the editor,
+    unsaved, and picks its env if it still exists) and **Re-run**. Palette:
+    re-run, edit, clear the filter. Driven against Rux 4906409 (checkout
+    clean): search, 5xx filter, Re-run (sent with the original's env, not
+    the picker's), the chip, Edit of a POST with body and header, a CLI
+    re-run arriving live, the palette's re-run.
+  - `tools/drive.ps1 -Do print`: PrintWindow capture, works with the
+    display asleep.
+  - Findings: **AW-031** (focus is kept by position: an element appearing
+    before the focused one takes the ring and Tab's place; root cause in
+    `rux-shell`), **AW-032** (a select's dropdown runs off the window's
+    bottom; the options below can't be reached by wheel or keys),
+    **AW-033** (no wall clock or `Date`: history rows can't say when).
+
 ### Next
 
 1. When the user installs the new Rux build: move `connected()` back to a
-   `computed` and close AW-019; go through AW-020's list under `rux check`;
-   verify AW-021; re-test AW-027 and AW-029 when they're fixed.
-2. Phase 2 remainder: history worth keeping (search, filter by actor or
-   status, re-run a past request into the editor).
-3. Phase 3: the local API and MCP bridge (`tracer mcp`), so an agent drives
-   Tracer; guardrails (approval prompt in the window for non-GET or `prod`).
+   `computed` and close AW-019; go through AW-020's list under `rux check`
+   (and `clamp` can use `Math.min`/`Math.max`); verify AW-021 and AW-030
+   (cf9e563); re-test AW-027 and AW-029 (f7876a4, 59923cf say fixed). Rux
+   e0405b8 adds a clipboard for script: try Copy as cURL (AW-025).
+2. Phase 3: the local API and MCP bridge (`tracer mcp`), so an agent drives
+   Tracer, with `History`/`Rerun` as its `read_history` and re-run tools;
+   guardrails (approval prompt in the window for non-GET or `prod`).
+3. When AW-033 is fixed: a time on each history row ("14:02", "3 min ago").
 4. Small: the Collections `+` doesn't sit at the right edge; the title row's
-   notice is cut short; the preview cuts long URLs.
+   notice is cut short; the preview cuts long URLs; the env picker shows a
+   remembered env the open workspace doesn't have (seen: "typicode" in a
+   fresh workspace), and Send would use it.
 
 ## Gotchas and how they were solved
 
@@ -226,10 +259,15 @@ Things that cost a round trip once. Check here before debugging them again.
 ### Driving the window
 
 - **When the display is asleep, `drive.ps1 -Do shot` gives a black image**
-  (it copies the screen). `PrintWindow` with flag 3 asks the window for its
-  own pixels and works; a script for it was in the 2026-10-30 session's
-  scratchpad (`pw.ps1`). Worth folding into `drive.ps1` as `-Do print`.
-  Clicks still work with the display asleep.
+  (it copies the screen). Use `-Do print` (PrintWindow, flag 3), which asks
+  the window for its own pixels. Clicks and keys still work with the
+  display asleep.
+- There's no `~/Tracer` workspace on this machine. Make one in the session's
+  scratchpad, `tracer core -w <ws>` in the background, seed it with
+  `tracer send`, and launch the window with `TRACER_WORKSPACE` set to it;
+  `tracer stop -w <ws>` at the end.
+- A select's dropdown near the window's bottom is cut off (AW-032): open
+  selects high in the window when testing their last options.
 
 - Drive it yourself with `tools/drive.ps1` (`move`, `shot`, `click`, `drag`,
   `keys`, `rect`); don't hand the user a checklist. Process name:
@@ -273,7 +311,13 @@ Things that cost a round trip once. Check here before debugging them again.
   `effect`.
 - `reverse()` and `replace()` return nothing and change their receiver
   (AW-020). Use `sort((a, b) => b.id - a.id)` for newest first, and `a + [x]`
-  for spread.
+  for spread. (Fixed at runtime since Rux a2c986b; the installed `rux check`
+  may still disagree.)
+- **Since Rux a2c986b, `/` always gives a `float`**, as in JavaScript:
+  `503 / 100` is `5.03`. Inside a template string nothing complains, so
+  `${n / 1024}` silently prints `1.0742…`. Use `intDiv(a, b)` for whole
+  numbers (cost a round trip on 2026-10-30: the 5xx filter matched nothing,
+  and `size()` had been printing long decimals).
 - In text, write `{{ x ?? "" }}` with plain quotes; `&quot;` is only for
   attributes (AW-021).
 - Annotate event handler parameters (`fn onKey(e: KeyEvent)`,
