@@ -5,3 +5,4 @@
 //! stream; see `docs/PLAN.md`.
 
 pub mod tracer;
+pub mod view;

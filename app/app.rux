@@ -177,7 +177,21 @@
               <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
               <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
               <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
-              <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
+              <view class="viewer" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">
+                <text class="mono dim" r-if="sel.size == 0">(empty body)</text>
+                <text class="mono err" r-if="viewError != &quot;&quot;">{{ viewError }}</text>
+                <view class="ln" r-for="l in bodyLines" r-key="l.no">
+                  <text class="ln-no">{{ l.no }}</text>
+                  <view class="fold" @tap="toggleFold(l.no)">
+                    <text class="fold-t">{{ if l.folds == 0 { "" } else if l.folded { "▸" } else { "▾" } }}</text>
+                  </view>
+                  <text class="code" :style="`padding-left: ${l.indent * 16}px`"><text class="j-key">{{ l.key }}</text><text :class="`j-${l.kind}`">{{ l.value }}</text><text class="j-note">{{ if l.note == "" { "" } else { `  ${l.note}` } }}</text></text>
+                </view>
+                <view class="more" r-if="viewVisible > bodyLines.length">
+                  <text class="mono dim">{{ bodyLines.length }} of {{ viewVisible }} lines</text>
+                  <view class="link" @tap="showMore()"><text class="link-t">Show {{ Math.min(VIEW_STEP, viewVisible - bodyLines.length) }} more</text></view>
+                </view>
+              </view>
               <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
                 <text class="hdr-n">{{ h.name }}</text>
                 <text class="hdr-v">{{ h.value }}</text>
@@ -471,6 +485,22 @@
     overflow-y: auto;
   }
   .mono { color: #d4d4d4; font-size: 12px; font-family: monospace; white-space: pre-wrap; }
+
+  .viewer { display: flex; flex-direction: column; }
+  .ln { display: flex; }
+  .ln-no { width: 40px; flex-shrink: 0; padding-right: 6px; color: #4a4a4a; font-size: 12px; font-family: monospace; text-align: right; }
+  .fold { width: 14px; flex-shrink: 0; cursor: pointer; }
+  .fold-t { color: #7a7a7a; font-size: 11px; font-family: monospace; }
+  .code { flex: 1; min-width: 0; color: #d4d4d4; font-size: 12px; font-family: monospace; white-space: pre-wrap; }
+  .j-key { color: #9cdcfe; }
+  .j-string { color: #ce9178; }
+  .j-number { color: #b5cea8; }
+  .j-bool { color: #569cd6; }
+  .j-null { color: #c586c0; }
+  .j-punct { color: #d4d4d4; }
+  .j-plain { color: #d4d4d4; }
+  .j-note { color: #6a6a6a; }
+  .more { display: flex; align-items: center; gap: 10px; padding-top: 8px; }
   .mono.err { color: #f0716c; }
   .dim { color: #6a6a6a; }
   .hdr { display: flex; gap: 12px; }
@@ -548,6 +578,8 @@
   use type native::tracer::Saved;
   use type native::tracer::Env;
   use type native::tracer::Var;
+  use native::view;
+  use type native::view::BodyLine;
 
   // One request as the core described it: started, then finished or failed.
   type Row = {
@@ -670,6 +702,16 @@
   // Why agents.policy, as last changed, was not taken; "" when it was.
   let policyError = signal("");
 
+  // The response viewer: the body of request `viewFor`, laid out by native
+  // code, the line numbers folded, and how many lines to draw.
+  let VIEW_STEP = 1000;
+  let viewFor = signal(0);
+  let bodyLines: BodyLine[] = signal([]);
+  let viewVisible = signal(0);
+  let viewError = signal("");
+  let folded: int[] = signal([]);
+  let viewLimit = signal(VIEW_STEP);
+
   // History's filter: text, who sent it, and how it ended. The same filter
   // as the core's `History` command, applied to what the window already has.
   let ANYONE = "anyone";
@@ -697,6 +739,45 @@
   // never has their values.
   computed preview = fillVars(url.trim());
   computed hits = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
+
+  // The viewer follows the request on show once it has its answer.
+  effect {
+    let id = sel?.id ?? 0;
+    let done = (sel?.state ?? "") == "done";
+    if done && id != viewFor {
+      viewFor = id;
+      folded = [];
+      viewLimit = VIEW_STEP;
+      loadView();
+    }
+  }
+
+  async fn loadView() {
+    let id = viewFor;
+    try {
+      let v = await view.bodyView(id, folded, viewLimit);
+      if id != viewFor { return; }
+      bodyLines = v.lines;
+      viewVisible = v.visible;
+      viewError = "";
+    } catch e {
+      if id == viewFor {
+        bodyLines = [];
+        viewVisible = 0;
+        viewError = `could not show the body: ${e.message}`;
+      }
+    }
+  }
+
+  fn toggleFold(no: int) {
+    folded = if folded.includes(no) { folded.filter(n => n != no) } else { folded + [no] };
+    loadView();
+  }
+
+  fn showMore() {
+    viewLimit = viewLimit + VIEW_STEP;
+    loadView();
+  }
 
   // A new filter starts at its first match.
   effect {
@@ -1246,16 +1327,6 @@
       }
     }
     out
-  }
-
-  fn shownBody(r: Row): string {
-    if r.body == "" {
-      "(empty body)"
-    } else if r.body.length < r.size {
-      `${r.body}\n\n… showing the first 64 KiB of ${size(r.size)}`
-    } else {
-      r.body
-    }
   }
 
   fn statusText(r: Row): string {
