@@ -5,7 +5,7 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-30, morning)
+## Where it stands (2026-10-30, afternoon)
 
 Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
 
@@ -96,13 +96,35 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
     core's PID; 8 closes at 0 to 1000 ms after the window appears leave no
     core.
 
+- **Phase 2, started (2026-10-30, afternoon):**
+  - **Saved requests** (000d752): one `.http` file per request under
+    `requests/`, folders as collections (the REST Client / JetBrains format).
+    `ListRequests` (with the event number it's true at), `SaveRequest`,
+    `DeleteRequest`, published as events. CLI `ls`, `save`, `run`, `rm`.
+  - **Dangling requests** (d3581a8): a core opening a journal closes requests
+    a dead core left running, once.
+  - **Environments** (8c3b98b): `environments/<name>.env`, `KEY=value`.
+    `Send` takes an env; the core fills `{{name}}` just before sending and
+    fails the request naming any variable that's missing. Events keep the
+    request as written plus the env's name. CLI `env`, `--env`.
+  - **Window, written and `rux check`-clean but not yet driven** (uncommitted
+    `app/`): Collections section with open/save/save-as/new/delete, unsaved
+    dot, live follow of others' saves (dev's edits win on conflict); the
+    environment picker heading the sidebar, env on send, env tags in history,
+    env in the status bar. **Blocked on building**: the Rux checkout has
+    half-done work (`interp/json.rs`, 9 files) that doesn't compile, and
+    `rux run` builds Rux from it.
+
 ### Next
 
-1. Phase 2: requests and collections saved as plain files in the workspace,
-   then environments with `{{var}}` substitution and an environment picker.
-2. A journal that ends with `request_started` and no outcome (a core killed
-   mid-request) leaves that row "running" forever in the window. The core
-   should close such requests when it opens the journal.
+1. When the Rux checkout is clean: rebuild the window, drive saved requests
+   and environments, commit `app/`. Re-check AW-019 against Rux 800250d ("A
+   computed can read a native signal on the first run"): if fixed, move
+   `connected()` back to a `computed` and close the finding.
+2. Watching files: an agent or `git pull` changing `requests/` or
+   `environments/` behind the core isn't seen until a list is asked for.
+3. Secrets: a git-ignored vault for values agents must never see.
+4. Variable preview under the URL bar (needs `replaceAll`, AW-020).
 3. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
    Open leads for them: a frame that loads or clears 1k rows still costs up to
    2 s in debug, clear costs more than load, and a list's scroll cost is
