@@ -569,3 +569,53 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
     assert!(!ws.join("environments/local.env").exists());
     core.stop();
 }
+
+#[test]
+fn files_changed_behind_the_core_are_published_once_and_its_own_saves_are_not_echoed() {
+    let ws = workspace("disk");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let (tx, events) = mpsc::channel();
+    let window = window.into_shared(move |incoming| {
+        if let Incoming::Event(e) = incoming {
+            let _ = tx.send(e);
+        }
+    }).unwrap();
+    // Everything that arrives within `secs`.
+    let collect = |secs: u64| {
+        let mut got = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(secs);
+        while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+            if let Ok(e) = events.recv_timeout(left) {
+                got.push(e);
+            }
+        }
+        got
+    };
+
+    // The core's own save: one event, from the window, none from disk.
+    let request = HttpRequest { method: "GET".into(), url: "http://x.test/a".into(), headers: vec![], body: None };
+    window.call(Command::SaveRequest { path: "a".into(), request }).unwrap().unwrap();
+    let got = collect(3);
+    let saves: Vec<&Event> = got.iter().filter(|e| matches!(e.kind, EventKind::RequestSaved { .. })).collect();
+    assert_eq!(saves.len(), 1, "{got:?}");
+    assert_eq!(saves[0].actor.kind, ClientKind::Window);
+
+    // Half a file, as an editor might leave it for a moment: nothing yet.
+    std::fs::write(ws.join("requests/b.http"), "GE").unwrap();
+    assert!(collect(2).is_empty());
+    // Finished, then an environment written by hand, then a delete.
+    std::fs::write(ws.join("requests/b.http"), "GET http://x.test/b\n").unwrap();
+    std::fs::create_dir_all(ws.join("environments")).unwrap();
+    std::fs::write(ws.join("environments/local.env"), "baseUrl=http://localhost\n").unwrap();
+    std::fs::remove_file(ws.join("requests/a.http")).unwrap();
+    let got = collect(3);
+    let kinds: Vec<String> = got.iter().map(|e| format!("{:?}:{:?}", e.actor.kind, e.kind)).collect();
+    assert!(got.iter().all(|e| e.actor.kind == ClientKind::Disk), "{kinds:?}");
+    assert!(got.iter().any(|e| matches!(&e.kind, EventKind::RequestSaved { path, request } if path == "b" && request.url == "http://x.test/b")), "{kinds:?}");
+    assert!(got.iter().any(|e| matches!(&e.kind, EventKind::RequestDeleted { path } if path == "a")), "{kinds:?}");
+    assert!(got.iter().any(|e| matches!(&e.kind, EventKind::EnvironmentSaved { env } if env.name == "local")), "{kinds:?}");
+    assert_eq!(got.len(), 3, "{kinds:?}");
+    core.stop();
+}

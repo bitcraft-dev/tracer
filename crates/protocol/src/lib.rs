@@ -55,6 +55,9 @@ pub enum ClientKind {
     Cli,
     /// An AI agent, through MCP or the local API.
     Agent,
+    /// Not a client: a file under `requests/` or `environments/` that changed
+    /// on disk behind the core, by an editor, an agent writing files, or git.
+    Disk,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

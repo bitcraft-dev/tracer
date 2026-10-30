@@ -15,7 +15,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracer_protocol::{Actor, Environment, Event, EventKind, HttpRequest, SavedRequest, ServerMessage, JOURNAL_PATH};
+use tracer_protocol::{
+    Actor, ClientKind, Environment, Event, EventKind, HttpRequest, SavedRequest, ServerMessage, JOURNAL_PATH,
+};
 
 use crate::{envs, files};
 
@@ -39,6 +41,25 @@ struct Inner {
     /// early. Whoever takes a request out of here publishes how it ended, so
     /// it ends exactly once.
     running: HashMap<u64, Arc<AtomicBool>>,
+    /// What the core last knew of the files, so a rescan publishes only what
+    /// changed behind it. Its own saves and deletes update this under the
+    /// same lock, so they aren't echoed back as disk changes.
+    disk: Disk,
+}
+
+#[derive(Default)]
+struct Disk {
+    requests: BTreeMap<String, HttpRequest>,
+    environments: BTreeMap<String, Vec<(String, String)>>,
+}
+
+impl Disk {
+    fn read(root: &Path) -> Disk {
+        Disk {
+            requests: files::list(root).0.into_iter().map(|r| (r.path, r.request)).collect(),
+            environments: envs::list(root).0.into_iter().map(|e| (e.name, e.vars)).collect(),
+        }
+    }
 }
 
 impl Hub {
@@ -92,6 +113,7 @@ impl Hub {
                 clients: BTreeMap::new(),
                 subscribers: Vec::new(),
                 running: HashMap::new(),
+                disk: Disk::read(workspace),
             }),
             workspace: workspace.display().to_string(),
             root: workspace.to_path_buf(),
@@ -200,6 +222,7 @@ impl Hub {
         let path = files::normalize(path)?;
         let mut inner = self.inner.lock().unwrap();
         files::write(&self.root, &path, &request).map_err(|e| format!("could not save `{path}`: {e}"))?;
+        inner.disk.requests.insert(path.clone(), request.clone());
         publish_locked(&mut inner, actor, EventKind::RequestSaved { path: path.clone(), request });
         Ok(path)
     }
@@ -211,6 +234,7 @@ impl Hub {
             io::ErrorKind::NotFound => format!("there is no saved request `{path}`"),
             _ => format!("could not delete `{path}`: {e}"),
         })?;
+        inner.disk.requests.remove(&path);
         publish_locked(&mut inner, actor, EventKind::RequestDeleted { path });
         Ok(())
     }
@@ -232,6 +256,7 @@ impl Hub {
         envs::from_text(&envs::to_text(&env))?;
         let mut inner = self.inner.lock().unwrap();
         envs::write(&self.root, &env).map_err(|e| format!("could not save environment `{}`: {e}", env.name))?;
+        inner.disk.environments.insert(env.name.clone(), env.vars.clone());
         let name = env.name.clone();
         publish_locked(&mut inner, actor, EventKind::EnvironmentSaved { env });
         Ok(name)
@@ -244,8 +269,58 @@ impl Hub {
             io::ErrorKind::NotFound => format!("there is no environment `{name}`"),
             _ => format!("could not delete environment `{name}`: {e}"),
         })?;
+        inner.disk.environments.remove(&name);
         publish_locked(&mut inner, actor, EventKind::EnvironmentDeleted { name });
         Ok(())
+    }
+
+    /// Read `requests/` and `environments/` again and publish what changed
+    /// behind the core, in the name of [`ClientKind::Disk`]. A file that
+    /// doesn't parse (an editor halfway through writing it, say) is left as
+    /// it was last known until it does.
+    pub fn rescan(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let now = Disk::read(&self.root);
+        let disk = Actor { kind: ClientKind::Disk, name: "disk".into() };
+        let mut changes = Vec::new();
+        for (path, request) in &now.requests {
+            if inner.disk.requests.get(path) != Some(request) {
+                changes.push(EventKind::RequestSaved { path: path.clone(), request: request.clone() });
+            }
+        }
+        for path in inner.disk.requests.keys() {
+            if !now.requests.contains_key(path) && !files::file_of(&self.root, path).exists() {
+                changes.push(EventKind::RequestDeleted { path: path.clone() });
+            }
+        }
+        for (name, vars) in &now.environments {
+            if inner.disk.environments.get(name) != Some(vars) {
+                changes.push(EventKind::EnvironmentSaved { env: Environment { name: name.clone(), vars: vars.clone() } });
+            }
+        }
+        for name in inner.disk.environments.keys() {
+            if !now.environments.contains_key(name) && !envs::file_of(&self.root, name).exists() {
+                changes.push(EventKind::EnvironmentDeleted { name: name.clone() });
+            }
+        }
+        for change in changes {
+            match &change {
+                EventKind::RequestSaved { path, request } => {
+                    inner.disk.requests.insert(path.clone(), request.clone());
+                }
+                EventKind::RequestDeleted { path } => {
+                    inner.disk.requests.remove(path);
+                }
+                EventKind::EnvironmentSaved { env } => {
+                    inner.disk.environments.insert(env.name.clone(), env.vars.clone());
+                }
+                EventKind::EnvironmentDeleted { name } => {
+                    inner.disk.environments.remove(name);
+                }
+                _ => {}
+            }
+            publish_locked(&mut inner, disk.clone(), change);
+        }
     }
 
     pub fn status(&self) -> (Vec<Actor>, u64) {

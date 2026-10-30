@@ -92,6 +92,9 @@ impl Running {
 
 /// Open `workspace` (creating `.tracer/` in it), listen on an ephemeral port
 /// on `127.0.0.1`, and write the discovery file.
+/// How often the core looks for files changed behind it.
+const DISK_SCAN: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub fn start(workspace: &Path) -> io::Result<Running> {
     fs::create_dir_all(workspace.join(".tracer"))?;
     let hub = Arc::new(Hub::open(workspace)?);
@@ -107,6 +110,17 @@ pub fn start(workspace: &Path) -> io::Result<Running> {
     };
     let discovery = serde_json::to_string_pretty(&running.discovery()).map_err(io::Error::other)?;
     fs::write(workspace.join(DISCOVERY_PATH), discovery)?;
+
+    // Files changed behind the core, by an editor, an agent or git, are
+    // published as they're found. Small workspaces read in well under the
+    // second between scans.
+    let (scan_hub, scan_stop) = (hub.clone(), running.stop.clone());
+    thread::Builder::new().name("tracer-disk".into()).spawn(move || {
+        while !scan_stop.stopping.load(Ordering::SeqCst) {
+            thread::sleep(DISK_SCAN);
+            scan_hub.rescan();
+        }
+    })?;
 
     let stop = running.stop.clone();
     let accept = thread::Builder::new().name("tracer-accept".into()).spawn(move || {
