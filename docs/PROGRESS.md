@@ -200,20 +200,31 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     would hang); the server now marks its standard handles not
     inheritable before spawning. A BOM at the start of stdin is skipped.
 
+- **Every open finding re-driven on Rux 4deca46 (2026-10-30, evening)**,
+  installed `rux` 17:17, checkout clean. AW-019 to AW-033 all verified
+  fixed (each status in FINDINGS.md says how), except AW-020's spread,
+  which is still missing (documented). Workarounds removed: `fn connected()`
+  is a `computed` again; `clamp` uses `Math`; the env panel's reloads after
+  its own changes (AW-029); × back to ✕ (AW-030); the probes'
+  `native/src/clock.rs` (AW-009, `now()` instead). Unlocked: **Copy as
+  cURL** (variables filled, secrets left `{{name}}`, POSIX quoting; response
+  pane and palette), **sent times** on history rows and the response pane
+  (`Date`), and probe 3's **Cancel and time limit** (AW-026). The palette's
+  list now scrolls within the window.
+  - New: **AW-034**, the probes window paints only its top part (layout
+    and hit-testing are fine below the line). Suspected: the AW-022 vello
+    buffer sizing. Tracer's window is not affected.
+
 ### Next
 
-1. When the user installs the new Rux build: move `connected()` back to a
-   `computed` and close AW-019; go through AW-020's list under `rux check`
-   (and `clamp` can use `Math.min`/`Math.max`); verify AW-021 and AW-030
-   (cf9e563); re-test AW-027 and AW-029 (f7876a4, 59923cf say fixed). Rux
-   e0405b8 adds a clipboard for script: try Copy as cURL (AW-025).
+1. When AW-034 is fixed: re-drive the probes (all six), and check
+   Tracer's window with a tall scene (1k-row history).
 2. Phase 3 remainder: try `tracer mcp` from a real client (`claude mcp add`,
    README); the local HTTP/WS API for anything that isn't MCP; per-agent
    permissions (read-only / local env only / anywhere) and rate and size
    caps, from a workspace policy file rather than the fixed rules in
    `guard.rs`.
-3. When AW-033 is fixed: a time on each history row ("14:02", "3 min ago").
-4. Small: the Collections `+` doesn't sit at the right edge; the title row's
+3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
    remembered env the open workspace doesn't have (seen: "typicode" in a
    fresh workspace), and Send would use it.
