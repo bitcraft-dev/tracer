@@ -16,6 +16,7 @@ mod files;
 mod guard;
 mod http;
 mod hub;
+mod policy;
 
 use std::collections::hash_map::RandomState;
 use std::fs;

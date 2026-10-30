@@ -55,7 +55,8 @@ pub struct CoreEvent {
     /// `client_joined`, `client_left`, `request_started`, `request_finished`,
     /// `request_failed`, `request_cancelled`, `request_saved`,
     /// `request_deleted`, `environment_changed`, `approval_asked`,
-    /// `approval_given`, `agents_switched` or `core_stopping`.
+    /// `approval_given`, `agents_switched`, `policy_changed` or
+    /// `core_stopping`.
     pub kind: String,
     /// A saved request's path, for `request_saved` and `request_deleted`.
     pub path: String,
@@ -75,6 +76,8 @@ pub struct CoreEvent {
     pub status: u32,
     pub ttfb_ms: f64,
     pub total_ms: f64,
+    /// Why a request failed; for `policy_changed`, why the policy file was
+    /// not taken, or "" if it was.
     pub error: String,
     /// Why a request waits for approval, for `approval_asked`.
     pub reason: String,
@@ -619,6 +622,9 @@ fn to_page(event: Event) -> CoreEvent {
             out.allow = allow;
         }
         EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
+        EventKind::PolicyChanged { error, .. } => {
+            (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
+        }
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }
     out

@@ -194,6 +194,7 @@
       <text class="status-t">env: {{ if envPick == NO_ENV { "none" } else { envPick } }}</text>
       <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
       <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
+      <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
       <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
         <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
       </view>
@@ -536,6 +537,7 @@
   .prompt-h { color: #f0f0f0; font-size: 13px; font-weight: 700; padding: 2px 4px 8px 4px; }
   .prompt-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; padding: 2px 4px; }
   .status-t { color: #b0b0b0; font-size: 11px; white-space: nowrap; }
+  .status-t.policy-bad { min-width: 0; color: #f0716c; overflow: hidden; text-overflow: ellipsis; }
   .status-t.dim { flex: 1; min-width: 0; color: #6a6a6a; overflow: hidden; text-overflow: ellipsis; }
 </style>
 
@@ -665,6 +667,8 @@
   let lastSeq = signal(0);
   // The kill switch, as the core's events last left it.
   let agentsOn = signal(true);
+  // Why agents.policy, as last changed, was not taken; "" when it was.
+  let policyError = signal("");
 
   // History's filter: text, who sent it, and how it ended. The same filter
   // as the core's `History` command, applied to what the window already has.
@@ -781,6 +785,8 @@
         }
       } else if e.kind == "agents_switched" {
         agentsOn = e.allow;
+      } else if e.kind == "policy_changed" {
+        policyError = e.error;
       } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {
         requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
       } else if e.kind == "client_joined" {

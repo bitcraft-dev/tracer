@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Actor, Command, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+    Access, Actor, Command, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
 use crate::{envs, guard, http};
@@ -48,7 +48,7 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
         };
         let id = request.id;
         if let Some((_, actor)) = &session {
-            if let Some(why) = guard::refused(actor, &request.command, hub.agents_allowed()) {
+            if let Some(why) = hub.refused(actor, &request.command) {
                 if out.send(reply(id, Err(why))).is_err() {
                     break;
                 }
@@ -142,6 +142,10 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
             (Some((_, actor)), Command::SetAgents { allowed }) => {
                 hub.set_agents(actor.clone(), allowed).map(|_| ReplyBody::AgentsSwitched)
             }
+            (Some((_, actor)), Command::Policy) => {
+                let (rules, error) = hub.policy(actor);
+                Ok(ReplyBody::Policy { rules, error })
+            }
             (Some(_), Command::Status) => {
                 let (clients, next_seq, agents_allowed) = hub.status();
                 Ok(ReplyBody::Status { clients, next_seq, workspace: hub.workspace().to_string(), agents_allowed })
@@ -180,28 +184,39 @@ fn send(
     rerun_of: Option<u64>,
     accepted: impl FnOnce(u64),
 ) {
+    // The rules as they stand when it's sent, for the whole of its run.
+    let rules = hub.rules_for(actor);
     let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of);
     // Before the thread starts, so the sender hears its id before the end.
     accepted(request_id);
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
-        if let Some(reason) = guard::needs_approval(&actor, &request, env.as_deref()) {
-            if !approved(&hub, &actor, request_id, reason) {
-                return;
-            }
-        }
         // Resolved here, not before it started, so a missing variable is a
-        // failed request every client sees.
-        let env = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
-        let (env, secrets) = match env {
-            Ok(Some((env, secrets))) => (Ok(Some(env)), secrets),
-            Ok(None) => (Ok(None), Vec::new()),
+        // failed request every client sees; and before any approval, so a
+        // person is only asked about what the policy lets through.
+        let resolved = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
+        let (resolved, secrets) = match resolved {
+            Ok(Some((env, secrets))) => (envs::resolve(&request, Some(&env)), secrets),
+            Ok(None) => (envs::resolve(&request, None), Vec::new()),
             Err(e) => (Err(e), Vec::new()),
         };
-        let resolved = env.and_then(|env| envs::resolve(&request, env.as_ref()));
+        if let (Some(rules), Ok(sending)) = (&rules, &resolved) {
+            if let Some(why) = guard::outside_rules(rules, sending) {
+                let error = envs::redact(&format!("refused by the workspace's policy: {why}"), &secrets);
+                hub.end_request(actor, request_id, EventKind::RequestFailed { request_id, error });
+                return;
+            }
+            if let Some(reason) = guard::needs_approval(rules, &request, env.as_deref()) {
+                if !approved(&hub, &actor, request_id, reason) {
+                    return;
+                }
+            }
+        }
+        // A local agent's request mustn't be redirected off the machine.
+        let redirects = rules.is_none_or(|r| r.access != Access::Local);
         // Secret values that come back are replaced by their names before
         // anything is published or journalled.
-        let kind = match resolved.and_then(|request| http::execute(&request, &cancelled)) {
+        let kind = match resolved.and_then(|request| http::execute(&request, redirects, &cancelled)) {
             Ok(response) => EventKind::RequestFinished { request_id, response: envs::redact_response(response, &secrets) },
             Err(error) => EventKind::RequestFailed { request_id, error: envs::redact(&error, &secrets) },
         };

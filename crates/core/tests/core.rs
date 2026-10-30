@@ -929,3 +929,95 @@ fn the_kill_switch_stops_agents_cancels_their_requests_and_outlives_the_core() {
     assert!(matches!(agent.call(get(format!("{base}/y"))).unwrap(), Ok(ReplyBody::Accepted { .. })));
     core.stop();
 }
+
+/// A server that answers everything with a redirect to `to`. Gives its base
+/// URL.
+fn redirect_server(to: &'static str) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+            let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn the_workspace_policy_holds_each_agent_to_its_rules_and_is_followed_as_it_changes() {
+    use tracer_protocol::{Access, POLICY_PATH};
+    let ws = workspace("policy");
+    let base = stub_server();
+    let bounce = redirect_server("http://example.invalid/");
+    let policy = "[*]\naccess = read-only\n\n[claude-code]\naccess = local\napprove = none\nrate = 5/min\nmax_body = 4\n";
+    std::fs::write(ws.join(POLICY_PATH), policy).unwrap();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut claude = Client::connect(&ws, ClientKind::Agent, "Claude-Code").unwrap();
+    let mut other = Client::connect(&ws, ClientKind::Agent, "cursor").unwrap();
+
+    // Anyone unnamed may only read, and is told its own rules.
+    assert!(other.call(get(format!("{base}/a"))).unwrap().unwrap_err().contains("only read"));
+    let Ok(ReplyBody::Policy { rules, error: None }) = other.call(Command::Policy).unwrap() else { panic!() };
+    assert_eq!((rules.len(), rules[0].agent.as_str(), rules[0].access), (1, "*", Access::ReadOnly));
+    let Ok(ReplyBody::Policy { rules, .. }) = window.call(Command::Policy).unwrap() else { panic!() };
+    assert_eq!(rules.len(), 2, "a person sees every rule");
+
+    // Claude, by name whatever its case: a POST with nothing to approve.
+    let send = |client: &mut Client, method: &str, url: String, body: &str| {
+        let request = HttpRequest { method: method.into(), url, headers: vec![], body: Some(body.into()) };
+        let Ok(ReplyBody::Accepted { request_id }) = client.call(Command::Send { request, env: None }).unwrap() else {
+            panic!("not accepted")
+        };
+        request_id
+    };
+    let id = send(&mut claude, "POST", format!("{base}/b"), "x");
+    assert!(matches!(end_of(&mut window, id), EventKind::RequestFinished { .. }));
+    // Off the machine, it fails visibly, before anyone is asked.
+    let id = send(&mut claude, "GET", "https://example.com/".into(), "");
+    let EventKind::RequestFailed { error, .. } = end_of(&mut window, id) else { panic!() };
+    assert!(error.starts_with("refused by the workspace's policy: example.com is not this machine"), "{error}");
+    // Too big a body.
+    let id = send(&mut claude, "POST", format!("{base}/c"), "12345");
+    let EventKind::RequestFailed { error, .. } = end_of(&mut window, id) else { panic!() };
+    assert!(error.contains("its body is 5 bytes; the policy allows 4"), "{error}");
+    // A redirect off the machine is the answer, not followed.
+    let id = send(&mut claude, "GET", format!("{bounce}/d"), "");
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, id) else { panic!() };
+    assert_eq!(response.status, 302);
+    // The fifth in the minute goes; the sixth is refused, unnumbered.
+    send(&mut claude, "GET", format!("{base}/e"), "");
+    let refused = claude.call(get(format!("{base}/f"))).unwrap().unwrap_err();
+    assert!(refused.contains("start 5 requests every 60 s"), "{refused}");
+
+    // Changed on disk, it's followed and published.
+    std::fs::write(ws.join(POLICY_PATH), "[*]\naccess = anywhere\n").unwrap();
+    let (rules, error) = wait_for(&mut window, |e| match &e.kind {
+        EventKind::PolicyChanged { rules, error } => Some((rules.clone(), error.clone())),
+        _ => None,
+    });
+    assert_eq!((rules[0].access, rules.len(), error), (Access::Anywhere, 1, None));
+    assert!(other.call(get(format!("{base}/g"))).unwrap().is_ok());
+    // A mistake keeps the rules there were, and says so.
+    std::fs::write(ws.join(POLICY_PATH), "[*]\naccess = everywhere\n").unwrap();
+    let (rules, error) = wait_for(&mut window, |e| match &e.kind {
+        EventKind::PolicyChanged { rules, error } => Some((rules.clone(), error.clone())),
+        _ => None,
+    });
+    assert_eq!(rules[0].access, Access::Anywhere);
+    assert!(error.unwrap().contains("line 2"));
+
+    // A core that starts on a mistake lets agents only read.
+    drop((window, claude, other));
+    core.stop();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "cursor").unwrap();
+    assert!(agent.call(get(format!("{base}/h"))).unwrap().unwrap_err().contains("only read"));
+    let Ok(ReplyBody::Policy { error: Some(error), .. }) = agent.call(Command::Policy).unwrap() else { panic!() };
+    assert!(error.starts_with("agents.policy: line 2"), "{error}");
+    core.stop();
+}

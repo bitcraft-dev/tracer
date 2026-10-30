@@ -16,9 +16,13 @@ use tracer_protocol::{HttpRequest, HttpResponse, Timing};
 use ureq::Agent;
 
 /// An error status is an answer, not a failure: only a request that got no
-/// answer at all is an `Err`.
-pub fn execute(req: &HttpRequest, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
-    let agent: Agent = Agent::config_builder().http_status_as_error(false).build().into();
+/// answer at all is an `Err`. Without `redirects`, a redirect is the answer.
+pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
+    let mut config = Agent::config_builder().http_status_as_error(false);
+    if !redirects {
+        config = config.max_redirects(0);
+    }
+    let agent: Agent = config.build().into();
     let mut builder = ureq::http::Request::builder().method(req.method.as_str()).uri(req.url.as_str());
     for (name, value) in &req.headers {
         builder = builder.header(name.as_str(), value.as_str());

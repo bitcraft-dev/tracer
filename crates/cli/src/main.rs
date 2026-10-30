@@ -17,6 +17,7 @@
 //! tracer cancel <ID>                cancel a running request, whoever sent it
 //! tracer approve <ID> / deny <ID>   answer an agent's request waiting for a person
 //! tracer agents on|off              the kill switch for agents
+//! tracer policy                     what agents may do, from agents.policy
 //! tracer mcp                        an MCP server on stdio, for AI agents
 //! tracer stop                       stop the workspace's core
 //! ```
@@ -31,7 +32,8 @@ use std::process::ExitCode;
 
 use tracer_protocol::client::Client;
 use tracer_protocol::{
-    ClientKind, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody, SavedRequest, StatusClass,
+    Access, AgentRules, ApproveWhen, ClientKind, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
+    SavedRequest, StatusClass,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -65,6 +67,8 @@ usage:
   tracer deny <ID>                    refuse it
   tracer agents on|off                let agents act, or stop them (their running
                                       requests are cancelled); `tracer status` shows it
+  tracer policy                       what agents may do: the rules agents.policy
+                                      gives every agent, and agents by name
   tracer mcp [--name <AGENT>]         an MCP server on stdio: an AI agent drives
                                       Tracer through it, as AGENT or the name its
                                       client gives; starts a core if none runs
@@ -96,6 +100,7 @@ fn main() -> ExitCode {
         Some("approve") => decide(workspace, args[1..].to_vec(), true),
         Some("deny") => decide(workspace, args[1..].to_vec(), false),
         Some("agents") => agents(workspace, args[1..].to_vec()),
+        Some("policy") => policy(workspace),
         Some("mcp") => {
             let name = take_value(&mut args, "--name");
             mcp::serve(workspace, name).map(|_| ExitCode::SUCCESS)
@@ -165,6 +170,51 @@ fn agents(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     let what = if allowed { "agents may act again" } else { "agents are stopped; their running requests were cancelled" };
     println!("tracer: {what}");
     Ok(ExitCode::SUCCESS)
+}
+
+fn policy(workspace: PathBuf) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer policy")?;
+    let Ok(ReplyBody::Policy { rules, error }) = client.call(Command::Policy)? else {
+        return Err(io::Error::other("unexpected answer to policy"));
+    };
+    if let Some(error) = &error {
+        println!("not taken, so the rules below stand: {error}");
+    }
+    for r in &rules {
+        println!("{}", describe_rules(r));
+    }
+    Ok(if error.is_some() { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
+/// `[claude-code] local · approve writes, prod · 60 per 60 s · bodies up to 1048576 B`
+fn describe_rules(r: &AgentRules) -> String {
+    let access = match r.access {
+        Access::ReadOnly => "read-only",
+        Access::Local => "local",
+        Access::Anywhere => "anywhere",
+    };
+    let approve = match r.approve.as_slice() {
+        [] => "approve none".to_string(),
+        whens => {
+            let names: Vec<&str> = whens
+                .iter()
+                .map(|w| match w {
+                    ApproveWhen::Writes => "writes",
+                    ApproveWhen::Prod => "prod",
+                    ApproveWhen::All => "all",
+                })
+                .collect();
+            format!("approve {}", names.join(", "))
+        }
+    };
+    let mut parts = vec![access.to_string(), approve];
+    if let Some(rate) = r.rate {
+        parts.push(format!("{} per {} s", rate.count, rate.per_secs));
+    }
+    if let Some(max) = r.max_body {
+        parts.push(format!("bodies up to {max} B"));
+    }
+    format!("[{}] {}", r.agent, parts.join(" · "))
 }
 
 /// Who is at the terminal, for decisions that name the person who made them
@@ -491,6 +541,13 @@ fn describe(event: &Event) -> String {
             format!("#{request_id} {}", if *allow { "allowed" } else { "refused" })
         }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
+        EventKind::PolicyChanged { rules, error: Some(error) } => {
+            format!("agents.policy not taken, {} rules stand: {error}", rules.len())
+        }
+        EventKind::PolicyChanged { rules, error: None } => {
+            let each: Vec<String> = rules.iter().map(describe_rules).collect();
+            format!("agents.policy changed: {}", each.join("; "))
+        }
         EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)

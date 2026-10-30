@@ -4,9 +4,10 @@
 //! It is a client of the workspace's core like the window and the CLI, as
 //! [`ClientKind::Agent`] under the name the agent gives in `initialize`, so
 //! everything it does shows in the window as that agent's, live, and goes
-//! through the core's guardrails: a request that changes something, or uses
-//! a production environment, waits for a person to allow it; secrets stay
-//! `{{name}}`; a person can switch agents off.
+//! through the core's guardrails: the workspace's `agents.policy` says where
+//! its requests may go, how many and how big, and which wait for a person to
+//! allow them (by default, any that changes something or uses a production
+//! environment); secrets stay `{{name}}`; a person can switch agents off.
 //!
 //! JSON-RPC 2.0, one message per line, as MCP's stdio transport has it.
 //! Nothing but messages goes to stdout; anything else goes to stderr.
@@ -49,10 +50,13 @@ everything you do appears under your name.
 values you never see: use `{{name}}`, and wherever a secret's value comes \
 back in a response it reads `{{name}}` again.
 
-Any request other than GET, HEAD or OPTIONS, and any request sent with an \
-environment whose name starts with `prod`, waits for a person to allow it \
-in the window. Such a send returns `awaiting_approval`; call get_response \
-later for the outcome. A refused request fails with `refused by <person>`.";
+By default, any request other than GET, HEAD or OPTIONS, and any request \
+sent with an environment whose name starts with `prod`, waits for a person \
+to allow it in the window. Such a send returns `awaiting_approval`; call \
+get_response later for the outcome. A refused request fails with `refused by \
+<person>`. The workspace's policy may say otherwise for you, and may limit \
+where your requests go, how many you start and how big their bodies are: \
+read_policy says what applies to you.";
 
 pub fn serve(workspace: PathBuf, name_override: Option<String>) -> io::Result<()> {
     let mut server = Server { workspace, name_override, core: None };
@@ -277,6 +281,16 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 return Err(unexpected());
             };
             Ok(json!({ "path": path, "file": format!("requests/{path}.http") }))
+        }
+        "read_policy" => {
+            let ReplyBody::Policy { rules, error } = call(core, Command::Policy)? else {
+                return Err(unexpected());
+            };
+            let mut out = json!({ "rules": rules.first() });
+            if let Some(error) = error {
+                out["note"] = json!(format!("the policy file has a mistake, so the last rules taken stand: {error}"));
+            }
+            Ok(out)
         }
         "cancel_request" => {
             let request_id = id_arg(args)?;
@@ -538,7 +552,7 @@ fn tools() -> Value {
         },
         {
             "name": "send_request",
-            "description": "Send an HTTP request through Tracer and wait for its answer: status, timing, headers and body. Anything but GET, HEAD or OPTIONS, or a prod environment, waits for a person to allow it.",
+            "description": "Send an HTTP request through Tracer and wait for its answer: status, timing, headers and body. By default anything but GET, HEAD or OPTIONS, or a prod environment, waits for a person to allow it; read_policy says what applies to you.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -608,6 +622,12 @@ fn tools() -> Value {
                 },
                 "required": ["path", "url"],
             },
+        },
+        {
+            "name": "read_policy",
+            "description": "What the workspace's policy lets you do: `access` (read-only, local: this machine only, or anywhere), what waits for a person's approval, how many requests you may start (`rate`: count per per_secs), and the largest request body (`max_body`, bytes).",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true },
         },
         {
             "name": "cancel_request",

@@ -40,6 +40,11 @@ pub const ENVIRONMENTS_DIR: &str = "environments";
 /// keeps out of git. Their values never leave the core.
 pub const SECRETS_DIR: &str = ".tracer/secrets";
 
+/// The file, relative to the workspace, that says what AI agents may do in
+/// it: [`AgentRules`] for every agent and for agents by name. Plain text,
+/// meant to be committed with the workspace.
+pub const POLICY_PATH: &str = "agents.policy";
+
 /// Where the core is listening and what it wants to hear first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
@@ -155,6 +160,9 @@ pub enum Command {
     /// The kill switch. Off, every agent is refused anything but reading,
     /// and their running requests are cancelled. Only a person may switch it.
     SetAgents { allowed: bool },
+    /// The rules the workspace's policy gives agents, for `tracer policy`.
+    /// An agent asking is told its own.
+    Policy,
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -214,6 +222,52 @@ pub struct Timing {
     pub ttfb_ms: f64,
     /// Until the whole body had arrived.
     pub total_ms: f64,
+}
+
+/// What an agent may do, from [`POLICY_PATH`]: the rules for every agent
+/// (`agent` is `*`) or for agents connecting under one name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRules {
+    pub agent: String,
+    pub access: Access,
+    /// What waits for a person to allow it. Empty: nothing does.
+    pub approve: Vec<ApproveWhen>,
+    /// The most requests the agent may start in a window of time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<Rate>,
+    /// The largest request body it may send, in bytes, once `{{name}}` is
+    /// filled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body: Option<u64>,
+}
+
+/// Where an agent's requests may go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Access {
+    /// Reading the workspace and its history; no sends, saves or cancels.
+    ReadOnly,
+    /// Sends only to this machine (`localhost`, `127.x.x.x`, `::1`), checked
+    /// once variables are filled in, without following redirects.
+    Local,
+    Anywhere,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproveWhen {
+    /// Any method but `GET`, `HEAD` and `OPTIONS`.
+    Writes,
+    /// An environment whose name starts with `prod`.
+    Prod,
+    /// Every request.
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rate {
+    pub count: u32,
+    pub per_secs: u64,
 }
 
 /// Which past requests [`Command::History`] gives. Every filter given must
@@ -386,6 +440,14 @@ pub enum ReplyBody {
     EnvironmentSaved { name: String },
     EnvironmentDeleted,
     SecretSet,
+    /// The rules for every agent first, then by name; for an agent, only
+    /// the rules it gets. `error` says why the policy file was not taken,
+    /// in which case the rules are the last ones that were.
+    Policy {
+        rules: Vec<AgentRules>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Stopping,
 }
 
@@ -436,6 +498,13 @@ pub enum EventKind {
     ApprovalGiven { request_id: u64, allow: bool },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
+    /// The policy file changed. `rules` are what agents get from now on;
+    /// with an `error`, the file was not taken and they are the old rules.
+    PolicyChanged {
+        rules: Vec<AgentRules>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
     CoreStopping,

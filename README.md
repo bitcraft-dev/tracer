@@ -45,13 +45,15 @@ claude mcp add tracer -- "<repo>/target/debug/tracer.exe" mcp -w <dir>
 
 The agent gets `list_requests`, `list_environments`, `send_request`,
 `run_saved_request`, `rerun_request`, `read_history`, `get_response`,
-`save_request` and `cancel_request`. What it does shows in the window as
+`save_request`, `read_policy` and `cancel_request`. What it does shows in the window as
 its own, live. The guardrails, held by the core:
 
-- An agent's request other than `GET`, `HEAD` or `OPTIONS`, or one using an
-  environment named `prod…`, waits for a person: **Allow** / **Refuse** in
-  the window, or `tracer approve <id>` / `tracer deny <id>`. Unanswered, it
-  fails after 5 minutes.
+- By default, an agent's request other than `GET`, `HEAD` or `OPTIONS`, or
+  one using an environment named `prod…`, waits for a person: **Allow** /
+  **Refuse** in the window, or `tracer approve <id>` / `tracer deny <id>`.
+  Unanswered, it fails after 5 minutes.
+- `agents.policy` in the workspace, if there is one, sets that per agent,
+  with where its requests may go, how many and how big (below).
 - Agents see secret names, never values; a secret's value that comes back
   in a response reads `{{name}}`.
 - Setting secrets, deleting environments, approving and stopping the core
@@ -60,6 +62,38 @@ its own, live. The guardrails, held by the core:
   off`, stops agents (reading aside) and cancels their running requests. It
   stays off across restarts until switched back on.
 - Every agent action is in the journal under its name.
+
+### `agents.policy`
+
+A plain file at the workspace's root, meant to be committed. `[*]` is every
+agent; a section named after an agent (the name it connects as, such as
+`claude-code`) sets only what it names and takes the rest from `[*]`.
+
+```ini
+[*]
+access = read-only       # read-only | local | anywhere (the default)
+approve = writes, prod   # writes, prod, all, or none (default: writes, prod)
+rate = 60/min            # requests it may start, per s, min or h (default: none)
+max_body = 1 MiB         # largest request body, variables filled in (default: none)
+
+[claude-code]
+access = local
+```
+
+- `local` is this machine only (`localhost`, `127.x.x.x`, `::1`), checked
+  once `{{variables}}` are filled in, and its redirects aren't followed.
+- A request outside the rules fails in history, before anyone is asked to
+  approve it: `refused by the workspace's policy: …`. One over the rate is
+  refused without a number.
+- The core reads the file again within a second of a change, and the
+  change is in the journal (`tracer watch`). A file with a mistake isn't
+  taken: the rules there were stand, the window's status bar says what's
+  wrong, and a core that starts on it lets agents only read.
+- `tracer policy` prints the rules; an agent's `read_policy` gives its own.
+- The name is the one an agent gives, and any program that can read the
+  workspace can read the core's token. The policy keeps a well-meaning
+  agent within bounds; it is no wall against one that sets out to get round
+  it.
 
 ## Running the probes
 

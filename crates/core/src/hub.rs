@@ -6,21 +6,22 @@
 //! critical section, so no event falls between its replay and its first live
 //! one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
-    Actor, ClientKind, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, SavedRequest,
-    ServerMessage, HISTORY_LIMIT, JOURNAL_PATH,
+    Actor, AgentRules, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
+    HttpResponse, SavedRequest, ServerMessage, HISTORY_LIMIT, JOURNAL_PATH, POLICY_PATH,
 };
 
-use crate::{envs, files};
+use crate::policy::Policy;
+use crate::{envs, files, guard};
 
 pub struct Hub {
     inner: Mutex<Inner>,
@@ -47,6 +48,16 @@ struct Inner {
     awaiting: HashMap<u64, mpsc::Sender<(bool, Actor)>>,
     /// The kill switch: false while agents are stopped.
     agents_allowed: bool,
+    /// What agents may do, from the policy file, and why the file as it
+    /// stands was not taken, if it wasn't.
+    policy: Policy,
+    policy_error: Option<String>,
+    /// The policy file's text when last read (`None`: no file), so a rescan
+    /// acts only on a change.
+    policy_text: Option<String>,
+    /// When each agent, by lowercased name, started its recent requests,
+    /// for the policy's rate.
+    starts: HashMap<String, VecDeque<Instant>>,
     /// What the core last knew of the files, so a rescan publishes only what
     /// changed behind it. Its own saves and deletes update this under the
     /// same lock, so they aren't echoed back as disk changes.
@@ -125,6 +136,17 @@ impl Hub {
         }
         fs::create_dir_all(path.parent().expect("the journal is inside .tracer/"))?;
         let journal = OpenOptions::new().create(true).append(true).open(&path)?;
+        // A policy that doesn't parse leaves agents only reading until a
+        // person fixes it, rather than free.
+        let (policy, policy_error, policy_text) = match read_policy(workspace) {
+            Ok(None) => (Policy::default(), None, None),
+            Ok(Some(text)) => match Policy::parse(&text) {
+                Ok(policy) => (policy, None, Some(text)),
+                Err(e) => (Policy::read_only(), Some(format!("{POLICY_PATH}: {e}")), Some(text)),
+            },
+            // Text no file has, so the next scan reads it again as a change.
+            Err(e) => (Policy::read_only(), Some(e), Some("\0unread".into())),
+        };
         let hub = Hub {
             inner: Mutex::new(Inner {
                 next_seq,
@@ -137,6 +159,10 @@ impl Hub {
                 running: HashMap::new(),
                 awaiting: HashMap::new(),
                 agents_allowed,
+                policy,
+                policy_error,
+                policy_text,
+                starts: HashMap::new(),
                 disk: Disk::read(workspace),
             }),
             workspace: workspace.display().to_string(),
@@ -328,8 +354,53 @@ impl Hub {
         Ok(())
     }
 
-    pub fn agents_allowed(&self) -> bool {
-        self.inner.lock().unwrap().agents_allowed
+    /// Why `actor` may not send `command`, if it may not: the guard's
+    /// rules, then, for a send, the policy's rate. A send let through here
+    /// counts towards the rate.
+    pub fn refused(&self, actor: &Actor, command: &Command) -> Option<String> {
+        if actor.kind != ClientKind::Agent {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let rules = inner.policy.for_agent(&actor.name);
+        if let Some(why) = guard::refused(actor, command, inner.agents_allowed, rules.access) {
+            return Some(why);
+        }
+        let (Command::Send { .. } | Command::Rerun { .. }, Some(rate)) = (command, rules.rate) else { return None };
+        let window = Duration::from_secs(rate.per_secs);
+        let now = Instant::now();
+        let starts = inner.starts.entry(actor.name.to_ascii_lowercase()).or_default();
+        while starts.front().is_some_and(|at| now.duration_since(*at) >= window) {
+            starts.pop_front();
+        }
+        if starts.len() >= rate.count as usize {
+            let wait = window - now.duration_since(starts[0]);
+            return Some(format!(
+                "the workspace's policy lets {} start {} requests every {} s; the next in {} s",
+                actor.name,
+                rate.count,
+                rate.per_secs,
+                wait.as_secs() + 1
+            ));
+        }
+        starts.push_back(now);
+        None
+    }
+
+    /// The rules `actor` is held to, if it is an agent.
+    pub fn rules_for(&self, actor: &Actor) -> Option<AgentRules> {
+        (actor.kind == ClientKind::Agent).then(|| self.inner.lock().unwrap().policy.for_agent(&actor.name))
+    }
+
+    /// The policy's rules, every agent's first, and why the file was not
+    /// taken, if it wasn't. An agent is given only its own rules.
+    pub fn policy(&self, actor: &Actor) -> (Vec<AgentRules>, Option<String>) {
+        let inner = self.inner.lock().unwrap();
+        let rules = match actor.kind {
+            ClientKind::Agent => vec![inner.policy.for_agent(&actor.name)],
+            _ => inner.policy.rules().to_vec(),
+        };
+        (rules, inner.policy_error.clone())
     }
 
     pub fn publish(&self, actor: Actor, kind: EventKind) -> u64 {
@@ -470,11 +541,38 @@ impl Hub {
             }
             publish_locked(&mut inner, disk.clone(), change);
         }
+
+        // A policy that stops parsing keeps the rules it had: agents aren't
+        // freed or locked out halfway through someone's edit.
+        let Ok(text) = read_policy(&self.root) else { return };
+        if text != inner.policy_text {
+            let parsed = text.as_deref().map(Policy::parse).unwrap_or_else(|| Ok(Policy::default()));
+            inner.policy_text = text;
+            match parsed {
+                Ok(policy) => {
+                    inner.policy = policy;
+                    inner.policy_error = None;
+                }
+                Err(e) => inner.policy_error = Some(format!("{POLICY_PATH}: {e}")),
+            }
+            let (rules, error) = (inner.policy.rules().to_vec(), inner.policy_error.clone());
+            publish_locked(&mut inner, disk, EventKind::PolicyChanged { rules, error });
+        }
     }
 
     pub fn status(&self) -> (Vec<Actor>, u64, bool) {
         let inner = self.inner.lock().unwrap();
         (inner.clients.values().cloned().collect(), inner.next_seq, inner.agents_allowed)
+    }
+}
+
+/// The policy file's text, `None` if there is none, or why it couldn't be
+/// read (locked by an editor saving it, say), which is not the same as none.
+fn read_policy(root: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(root.join(POLICY_PATH)) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{POLICY_PATH}: {e}")),
     }
 }
 

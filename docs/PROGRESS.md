@@ -5,7 +5,7 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-30, late evening: handoff)
+## Where it stands (2026-10-30, night)
 
 Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `master` holds Phase 0, `phase-1-core` everything since, and both track `origin`. Push when the user asks. **`phase-1-core` is 12 commits ahead of `origin`, not pushed** (Phase 2 history, Phase 3 agents, the Rux re-verification, FINDINGS AW-031 to AW-036).
 
@@ -14,11 +14,12 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   core or probes). The scratch workspace and drivers used to test lived in
   that session's scratchpad and are gone with it; see the gotchas for how
   to set them up again.
-- Phases 0 to 2 are done, Phase 3's MCP server and guardrails are done
-  (see Done); what's left is under Next.
-- **Open Rux findings: AW-035 and AW-036 only.** AW-035 is fixed in Rux
-  b4fe20a, which was local and not pushed when re-driven; AW-036 is new
-  and not yet answered. Everything from AW-001 to AW-034 is closed.
+- Phases 0 to 2 are done. Phase 3's MCP server, guardrails and
+  `agents.policy` are done and tried from Claude Code (see Done), but not
+  committed yet. What's left is under Next.
+- **Open Rux findings: AW-036 only**, which is new and not yet answered.
+  AW-035 was closed on 2026-10-30 after a re-drive on the pushed and
+  installed Rux b4fe20a. Everything from AW-001 to AW-035 is closed.
 - **Other Claude sessions:** the Rux team works in sessions on
   `C:\Users\USER\Mobile\UI Research` (named ui-research-97 and
   ui-research-eb on 2026-10-30), and they message Tracer's session when a
@@ -245,15 +246,38 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     history URL squeezes the method column and overflows the row
     (pre-existing: the installed 08c314f does it).
 
+- **Phase 3, from a real client, and the policy file (2026-10-30, night).**
+  - `tracer mcp` driven by Claude Code (the VS Code extension's
+    `claude.exe -p --strict-mcp-config --mcp-config`, Haiku, under 1 cent a
+    run): all nine tools listed, `list_*`, `run_saved_request`, a POST that
+    returned `awaiting_approval`, `read_history`; allowed afterwards with
+    `tracer approve`, it was sent (201) under `agent:claude-code` although
+    the agent had exited. No Tracer change was needed.
+  - **`agents.policy`** at the workspace root (`crates/core/src/policy.rs`):
+    `[*]` and `[agent-name]` sections with `access` (read-only, local,
+    anywhere), `approve` (writes, prod, all, none), `rate` (`N/s|min|h`)
+    and `max_body`. A named section takes its gaps from `[*]`; no file is
+    the old fixed rules. `local` is checked on the URL with variables filled
+    in, and turns off redirects. Out of bounds: a failed request, before
+    any approval; over the rate: a refused command, unnumbered. Re-read with
+    the disk scan; `policy_changed` events; a mistake keeps the old rules
+    (and a core starting on one lets agents only read). `Command::Policy`,
+    `tracer policy`, MCP `read_policy` (an agent sees only its own rules).
+    Window: the status bar shows a policy mistake in red until it's fixed.
+    39 tests (7 unit, 1 integration new), three runs clean.
+  - Driven: Claude Code under `[claude-code] access = local` read its
+    policy, and its run of a jsonplaceholder request failed "refused by the
+    workspace's policy: jsonplaceholder.typicode.com is not this machine";
+    the window showed it, and the red notice for a broken file, gone once
+    fixed.
+
 ### Next
 
-1. When b4fe20a is pushed, mark AW-035 closed. When AW-036 is fixed:
-   re-drive Tracer's history with a long URL in a narrow sidebar.
-2. Phase 3 remainder: try `tracer mcp` from a real client (`claude mcp add`,
-   README); the local HTTP/WS API for anything that isn't MCP; per-agent
-   permissions (read-only / local env only / anywhere) and rate and size
-   caps, from a workspace policy file rather than the fixed rules in
-   `guard.rs`.
+1. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
+   narrow sidebar.
+2. Commit the policy work (asked the user on 2026-10-30; not committed).
+3. Phase 3 remainder: the local HTTP/WS API for anything that isn't MCP.
+   Bench-size caps belong in the policy once benchmarking exists (Phase 4).
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
    remembered env the open workspace doesn't have (seen: "typicode" in a
@@ -334,6 +358,21 @@ Things that cost a round trip once. Check here before debugging them again.
 - An app with no `native/` crate runs inside `rux.exe`, so its process is
   named `rux`, not after the app.
 
+- **Scripted edits: many files here are CRLF.** A Python replace written
+  with `\n` silently doesn't match (that cost two rounds on 2026-10-30).
+  Read with `newline=''` and swap `\n` for the file's own line ending, or
+  use the Edit tool.
+- **Trying `tracer mcp` with Claude Code without touching its settings:**
+  `claude` isn't on PATH; the extension's binary is
+  `~/.vscode/extensions/anthropic.claude-code-<ver>-win32-x64/resources/native-binary/claude.exe`.
+  Run it from the scratchpad with `-p --model haiku --max-budget-usd 0.5
+  --strict-mcp-config --mcp-config <json> --allowedTools mcp__tracer
+  --output-format stream-json --verbose`, and `< /dev/null` (it waits 3 s
+  for stdin otherwise). Stop the core it starts with `tracer stop`.
+- The network here was erratic on 2026-10-30 night: one DNS failure and
+  sends of 9 s and 23 s, while `curl` itself took 7 s to connect at times.
+  Compare with `curl` before blaming Tracer's HTTP engine.
+
 ### Driving the window
 
 - **When the display is asleep, `drive.ps1 -Do shot` gives a black image**
@@ -411,7 +450,10 @@ Things that cost a round trip once. Check here before debugging them again.
   `DragEvent`, `TapEvent`, `SwipeEvent`; no `use` needed) or `rux check` warns.
 - Ruled out in Phase 0 as Tracer's own mistakes, not Rux's: a flex item grows
   to its longest unbreakable line (CSS does the same); an overlay is not
-  centred without `display: flex`.
+  centred without `display: flex`. Ruled out 2026-10-30: probe 2's button
+  row overflowing at 978×984, with a horizontal scrollbar on the stage once
+  the note shows. Edge with the same CSS overflows by 58 px, Rux by about
+  61; items don't shrink below their longest word.
 
 ### Reporting
 
