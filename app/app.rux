@@ -12,8 +12,11 @@
       </view>
 
       <view class="side" :style="`width: ${sideWidth}px`">
-        <view class="env">
-          <input type="select" r-model="envPick" :options="envOptions" />
+        <view class="env-row">
+          <view class="env">
+            <input type="select" r-model="envPick" :options="envOptions" />
+          </view>
+          <view class="gear" @tap="openEnvEditor()"><text class="gear-t">⚙</text></view>
         </view>
         <text class="empty warn" r-for="w in envSkipped">skipped {{ w }}</text>
         <view class="side-h">
@@ -163,6 +166,55 @@
       </view>
     </view>
 
+    <view class="scrim" r-if="editingEnvs" @tap="editingEnvs = false">
+      <view class="envpanel" @tap="noop()">
+        <view class="envlist">
+          <text class="prompt-h">Environments</text>
+          <view
+            class="row"
+            r-for="e in envs"
+            r-key="e.name"
+            :class="{ on: e.name == editEnv }"
+            @tap="pickEnv(e.name)">
+            <text class="row-url">{{ e.name }}</text>
+          </view>
+          <view class="pal-field small">
+            <input r-model="newEnvName" placeholder="new environment, Enter" @key="newEnvKey(event)" />
+          </view>
+        </view>
+        <view class="envbody">
+          <text class="empty" r-if="editEnv == &quot;&quot;">Pick an environment, or name a new one.</text>
+          <view class="envbody-in" r-if="editEnv != &quot;&quot;">
+            <view class="envbody-h">
+              <text class="prompt-h">{{ editEnv }}</text>
+              <view class="link danger" @tap="deleteEnv()"><text class="link-t">Delete</text></view>
+            </view>
+            <text class="sub">Variables · environments/{{ editEnv }}.env</text>
+            <view class="var" r-for="v in draftVars" r-key="v.id">
+              <view class="vf name"><input r-model="v.name" placeholder="name" /></view>
+              <view class="vf grow"><input r-model="v.value" placeholder="value" /></view>
+              <view class="x" @tap="removeVar(v.id)"><text class="x-t">×</text></view>
+            </view>
+            <view class="envbody-h">
+              <view class="link" @tap="addVar()"><text class="link-t">+ variable</text></view>
+              <view class="save" @tap="saveEnv()"><text class="save-t">Save variables</text></view>
+            </view>
+            <text class="sub">Secrets · kept out of git; values never shown or sent to clients</text>
+            <view class="var" r-for="name in editSecrets" r-key="name">
+              <text class="secret-n">{{ name }}</text>
+              <text class="secret-v">••••••</text>
+              <view class="x" @tap="removeSecret(name)"><text class="x-t">×</text></view>
+            </view>
+            <view class="var">
+              <view class="vf name"><input r-model="secretName" placeholder="name" /></view>
+              <view class="vf grow"><input r-model="secretValue" placeholder="value (replaces one of that name)" /></view>
+              <view class="link" @tap="setSecret()"><text class="link-t">Set</text></view>
+            </view>
+          </view>
+        </view>
+      </view>
+    </view>
+
     <view class="scrim" r-if="palette" @tap="closePalette()">
       <view class="palette" @tap="noop()">
         <view class="pal-field">
@@ -242,6 +294,40 @@
     border: 1px solid #2e2e2e;
     border-radius: 6px;
   }
+  .env-row { display: flex; align-items: center; gap: 6px; margin: 12px 10px 2px 10px; }
+  .env-row .env { flex: 1; margin: 0; }
+  .gear { padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+  .gear:hover { background: #2b2540; }
+  .gear-t { color: #9d8ff5; font-size: 16px; }
+  .envpanel {
+    display: flex;
+    width: 760px;
+    height: 460px;
+    background: #1e1e1e;
+    border: 1px solid #333333;
+    border-radius: 10px;
+  }
+  .envlist { display: flex; flex-direction: column; gap: 2px; width: 200px; padding: 12px; border-right: 1px solid #2e2e2e; overflow-y: auto; }
+  .envbody { flex: 1; display: flex; flex-direction: column; padding: 12px 16px; overflow-y: auto; }
+  .envbody-in { display: flex; flex-direction: column; gap: 6px; }
+  .envbody-h { display: flex; align-items: center; gap: 8px; }
+  .envbody-h .save { margin-left: auto; }
+  .sub { color: #7a7a7a; font-size: 11px; padding-top: 10px; }
+  .var { display: flex; align-items: center; gap: 6px; }
+  .vf { display: flex; align-items: center; height: 30px; padding: 0 8px; background: #141414; border: 1px solid #2e2e2e; border-radius: 5px; }
+  .vf.name { width: 160px; }
+  .vf.grow { flex: 1; min-width: 0; }
+  .x { padding: 2px 6px; border-radius: 4px; cursor: pointer; }
+  .x:hover { background: #3a2626; }
+  .x-t { color: #8a8a8a; font-size: 12px; }
+  .link { padding: 3px 8px; border-radius: 4px; cursor: pointer; }
+  .link:hover { background: #2b2540; }
+  .link-t { color: #9d8ff5; font-size: 12px; font-weight: 700; }
+  .link.danger { margin-left: auto; }
+  .link.danger .link-t { color: #f0716c; }
+  .secret-n { width: 176px; color: #d4d4d4; font-size: 12px; font-family: monospace; }
+  .secret-v { flex: 1; color: #7a7a7a; font-size: 12px; font-family: monospace; }
+  .pal-field.small { height: 30px; margin-top: 8px; }
   .env-tag { color: #9d8ff5; font-size: 10px; padding: 0 5px; border: 1px solid #3a3550; border-radius: 4px; }
   .side-add { margin-left: auto; padding: 0 8px; border-radius: 4px; cursor: pointer; }
   .side-add:hover { background: #2b2540; }
@@ -376,6 +462,7 @@
   use type native::tracer::Header;
   use type native::tracer::Saved;
   use type native::tracer::Env;
+  use type native::tracer::Var;
 
   // One request as the core described it: started, then finished or failed.
   type Row = {
@@ -424,6 +511,7 @@
     { id: "new", label: "New request", hint: "" },
     { id: "delete", label: "Delete the open request", hint: "" },
     { id: "reload-saved", label: "Reload the saved requests", hint: "" },
+    { id: "envs", label: "Edit environments", hint: "" },
     { id: "cancel", label: "Cancel the request on show", hint: "" },
     { id: "newest", label: "Open the newest request", hint: "" },
     { id: "req:body", label: "Edit the request body", hint: "" },
@@ -452,6 +540,17 @@
 
   let envs: Env[] = signal([]);
   let envSkipped: string[] = signal([]);
+  // The environments panel: the one being edited, its variables as draft
+  // rows (saved with "Save variables"), and a secret being set.
+  type DraftVar = { id: int, name: string, value: string };
+  let editingEnvs = signal(false);
+  let editEnv = signal("");
+  let draftVars: DraftVar[] = signal([]);
+  let nextVarId = signal(1);
+  let newEnvName = signal("");
+  let secretName = signal("");
+  let secretValue = signal("");
+
   // The environment requests are sent with, remembered across launches.
   let envPick = signal(settings.get("env") ?? NO_ENV);
 
@@ -470,6 +569,7 @@
   // Unsaved edits to a saved request. A request never saved is a scratch pad.
   computed dirty = if openPath == "" { false } else if current == none { true } else { !sameAs(current) };
   computed envOptions = [NO_ENV] + envs.map(e => e.name);
+  computed editSecrets = envs.find(e => e.name == editEnv)?.secrets ?? [];
   computed hits = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
 
   // A new filter starts at its first match.
@@ -697,6 +797,112 @@
     }
   }
 
+  async fn openEnvEditor() {
+    blur();
+    editingEnvs = true;
+    // Listed afresh: the live refresh on `environment_changed` doesn't
+    // finish (FINDINGS.md AW-029), and a panel opened should be current.
+    await loadEnvs();
+    let pick = if envPick != NO_ENV { envPick } else if envs.length > 0 { envs[0].name } else { "" };
+    if pick != "" { pickEnv(pick); }
+  }
+
+  fn pickEnv(name: string) {
+    let e = envs.find(x => x.name == name);
+    editEnv = name;
+    draftVars = [];
+    secretName = "";
+    secretValue = "";
+    if e != none {
+      for v in e.vars {
+        // Secrets are listed below, by name only.
+        if !e.secrets.includes(v.name) { addVarRow(v.name, v.value); }
+      }
+    }
+  }
+
+  fn addVarRow(name: string, value: string) {
+    draftVars.push({ id: nextVarId, name: name, value: value });
+    nextVarId += 1;
+  }
+
+  fn addVar() {
+    addVarRow("", "");
+  }
+
+  fn removeVar(id: int) {
+    draftVars = draftVars.filter(v => v.id != id);
+  }
+
+  // Each change below lists the environments again when it's done, so the
+  // panel shows it (the refresh on the change's event doesn't finish,
+  // FINDINGS.md AW-029).
+  async fn saveEnv() {
+    let vars: Var[] = draftVars.filter(v => v.name.trim() != "").map(v => { name: v.name.trim(), value: v.value });
+    try {
+      editEnv = tracer.saveEnvironment(editEnv, vars);
+      error = "";
+    } catch e {
+      error = e.message;
+    }
+    await loadEnvs();
+  }
+
+  fn newEnvKey(e: KeyEvent) {
+    if e.key == "Enter" {
+      createEnv();
+      return false;
+    }
+  }
+
+  async fn createEnv() {
+    let name = newEnvName.trim();
+    if name == "" { return; }
+    try {
+      editEnv = tracer.saveEnvironment(name, []);
+      draftVars = [];
+      newEnvName = "";
+      error = "";
+    } catch err {
+      error = err.message;
+    }
+    await loadEnvs();
+  }
+
+  async fn deleteEnv() {
+    try {
+      tracer.deleteEnvironment(editEnv);
+      if envPick == editEnv { envPick = NO_ENV; }
+      editEnv = "";
+      draftVars = [];
+    } catch e {
+      error = e.message;
+    }
+    await loadEnvs();
+  }
+
+  async fn setSecret() {
+    if secretName.trim() == "" || secretValue == "" { return; }
+    try {
+      tracer.setSecret(editEnv, secretName.trim(), secretValue);
+      secretName = "";
+      secretValue = "";
+      error = "";
+    } catch e {
+      error = e.message;
+    }
+    await loadEnvs();
+  }
+
+  async fn removeSecret(name: string) {
+    try {
+      tracer.setSecret(editEnv, name, "");
+    } catch e {
+      error = e.message;
+    }
+    await loadEnvs();
+  }
+
   fn nameKey(e: KeyEvent) {
     if e.key == "Enter" {
       saveAs(saveName);
@@ -910,6 +1116,8 @@
       deleteOpen();
     } else if id == "reload-saved" {
       loadSaved();
+    } else if id == "envs" {
+      openEnvEditor();
     } else if id == "cancel" {
       cancel();
     } else if id == "newest" {
@@ -943,6 +1151,10 @@
     }
     if e.key == "Escape" && naming {
       naming = false;
+      return false;
+    }
+    if e.key == "Escape" && editingEnvs {
+      editingEnvs = false;
       return false;
     }
     if e.primary && e.key == "s" {

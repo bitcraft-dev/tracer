@@ -766,6 +766,59 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   document that a reload replays the last list.
 - **Status:** open.
 
+## AW-029 An `async fn` an effect starts, when a channel woke it, never comes back from its `await`
+
+- **Found:** 2026-10-30, Tracer's environments panel: an environment changed
+  by the CLI or an agent never showed in an open window.
+- **Severity:** **bug**, silent. "React to what Rust pushed by asking Rust
+  for more" is the ordinary use of a channel, and the docs say an effect may
+  start an `async fn`.
+- **Limit:** Tracer's effect reads the core's `rux::Channel` and, on an
+  `environment_changed` event, starts `loadEnvs()`, an `async fn` that awaits
+  the native `listEnvironments()` and writes the result. Counted with two
+  signals, one written before the `await` and one after:
+
+  | what happened | started | finished |
+  |---|---|---|
+  | page loaded (the journal's replay started three, `mounted` one) | 4 | 4 |
+  | `tracer secret set` from the CLI: the event arrives (status bar shows it), the effect starts one | 5 | **4** |
+  | 3 s later, after a hover, after a click | 5 | **4** |
+  | the same `loadEnvs()` started from a palette command (a handler) | 6 | 5 |
+
+  Reproduced twice (events 75 and 78). The native call and the core are
+  fine: the handler's call completes with the change in it, and the CLI
+  lists it. The one the effect started never finishes and never throws. The
+  ones started from the same effect during the page's load did finish, so the
+  difference seems to be a live push into an idle window.
+- **Where:** Tracer's window built against Rux 73ff9a7 (the checkout's
+  uncommitted work at the time was in `rux-cli` and `vendor/`, outside the
+  app's build).
+- **Workaround:** none for the live refresh. Tracer's panel lists
+  environments when it opens and after each change made from it (handlers),
+  which it should do anyway; a change made elsewhere while it's open shows
+  only when it's opened again.
+- **Suggested fix:** a test with an effect that, on a channel value, starts an
+  `async fn` awaiting a native `async fn`, the push made from another thread
+  while the window is idle.
+- **Status:** open.
+
+## AW-030 Symbols outside the UI font draw as boxes: no fallback to Segoe UI Symbol
+
+- **Found:** 2026-10-30, Tracer's remove buttons (✕).
+- **Severity:** friction; ✕, ▾ and ▸ are in every UI.
+- **Limit:** on Windows 11, `font-family: sans-serif` and `monospace`, these
+  draw as empty boxes: **✕** (U+2715), **▾** (U+25BE), **▸** (U+25B8),
+  **⧉** (U+29C9), **⌫** (U+232B). These draw: × ✓ ✔ ⌘ ★ ← → ↑ ● … · ⏎, and
+  emoji (⚙ 🔒 👁, in colour from Segoe UI Emoji). `seguisym.ttf` (Segoe UI
+  Symbol, which has ✕ ▾ ▸ ⌫) is installed, and a browser falls back to it.
+- **Reproduction:** `<text>✕ ▾ ▸ ⧉ ⌫</text>` in any page.
+- **Workaround:** Tracer uses × (U+00D7) for its remove buttons.
+- **Suggested fix:** add Segoe UI Symbol (and Segoe UI Emoji, Cambria Math)
+  to the fallback chain on Windows, and the platform equivalents elsewhere
+  (Apple Symbols; DejaVu Sans / Noto Sans Symbols 2); fontique's fallback by
+  script doesn't cover symbols, which are script "Common".
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,

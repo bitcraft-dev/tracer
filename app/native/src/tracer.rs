@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tracer_protocol::client::{Client, Incoming, Shared};
-use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
+use tracer_protocol::{ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
 
 /// The most of a response body handed to the page. The core and its journal
 /// keep the whole body; a viewer for large ones is Phase 4.
@@ -111,6 +111,8 @@ pub struct Var {
 pub struct Env {
     pub name: String,
     pub vars: Vec<Var>,
+    /// The names of its secrets; their values never leave the core.
+    pub secrets: Vec<String>,
 }
 
 #[rux::export]
@@ -269,11 +271,50 @@ pub async fn list_environments() -> Result<EnvList, CoreError> {
         Ok(Ok(ReplyBody::Environments { environments, skipped, .. })) => Ok(EnvList {
             environments: environments
                 .into_iter()
-                .map(|e| Env { name: e.name, vars: e.vars.into_iter().map(|(name, value)| Var { name, value }).collect() })
+                .map(|e| Env {
+                    name: e.name,
+                    vars: e.vars.into_iter().map(|(name, value)| Var { name, value }).collect(),
+                    secrets: e.secrets,
+                })
                 .collect(),
             skipped,
         }),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Save environment `name` with `vars`, over any of that name. Its secrets
+/// are kept. Gives the name as the core wrote it.
+#[rux::export]
+pub fn save_environment(name: String, vars: Vec<Var>) -> Result<String, CoreError> {
+    let env = Environment { name, vars: vars.into_iter().map(|v| (v.name, v.value)).collect(), secrets: Vec::new() };
+    match shared()?.call(Command::SaveEnvironment { env }) {
+        Ok(Ok(ReplyBody::EnvironmentSaved { name })) => Ok(name),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Delete environment `name`, and its secrets.
+#[rux::export]
+pub fn delete_environment(name: String) -> Result<(), CoreError> {
+    match shared()?.call(Command::DeleteEnvironment { name }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Set secret `name` of environment `env` to `value`, or remove it when
+/// `value` is "". The value goes to the core and is never read back.
+#[rux::export]
+pub fn set_secret(env: String, name: String, value: String) -> Result<(), CoreError> {
+    let value = if value.is_empty() { None } else { Some(value) };
+    match shared()?.call(Command::SetSecret { env, name, value }) {
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
     }
