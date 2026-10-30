@@ -62,6 +62,8 @@ pub struct CoreEvent {
     pub env: String,
     pub client: u64,
     pub request_id: u64,
+    /// The request a started one sends again, or 0.
+    pub rerun_of: u64,
     pub method: String,
     pub url: String,
     /// What was sent with a started request, or received with a finished one.
@@ -233,6 +235,18 @@ pub fn send(method: String, url: String, headers: Vec<Header>, body: String, env
     let request = request_of(method, url, headers, body);
     let env = if env.is_empty() { None } else { Some(env) };
     match shared()?.call(Command::Send { request, env }) {
+        Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Send past request `request_id` again, as it was written and with the
+/// environment it was sent with, whoever sent it first. Gives the new id.
+#[rux::export]
+pub fn rerun(request_id: u64) -> Result<u64, CoreError> {
+    match shared()?.call(Command::Rerun { request_id, env: None }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
@@ -505,6 +519,7 @@ fn to_page(event: Event) -> CoreEvent {
         env: String::new(),
         client: 0,
         request_id: 0,
+        rerun_of: 0,
         method: String::new(),
         url: String::new(),
         headers: Vec::new(),
@@ -519,10 +534,11 @@ fn to_page(event: Event) -> CoreEvent {
     match event.kind {
         EventKind::ClientJoined { client } => (out.kind, out.client) = ("client_joined".into(), client),
         EventKind::ClientLeft { client } => (out.kind, out.client) = ("client_left".into(), client),
-        EventKind::RequestStarted { request_id, request, env } => {
+        EventKind::RequestStarted { request_id, request, env, rerun_of } => {
             out.kind = "request_started".into();
             out.env = env.unwrap_or_default();
             out.request_id = request_id;
+            out.rerun_of = rerun_of.unwrap_or(0);
             out.method = request.method;
             out.url = request.url;
             out.headers = headers(request.headers);

@@ -131,6 +131,21 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<String>,
     },
+    /// Past requests, newest first, each as it was written and with how it
+    /// ended. Only those `filter` matches, and at most its `limit`.
+    History {
+        #[serde(default)]
+        filter: HistoryFilter,
+    },
+    /// Send a past request again, exactly as it was written, with the
+    /// environment it was sent with, or with `env` in its place (`""` for
+    /// none). Published as `request_started` with `rerun_of`; otherwise it
+    /// goes as `Send` does.
+    Rerun {
+        request_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+    },
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -192,6 +207,120 @@ pub struct Timing {
     pub total_ms: f64,
 }
 
+/// Which past requests [`Command::History`] gives. Every filter given must
+/// match.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryFilter {
+    /// Found, ignoring case, in the method, the URL as written, the
+    /// environment, the sender's name, the status, or `#<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Sent by this kind of client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<ClientKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatusClass>,
+    /// The most to give, newest first; [`HISTORY_LIMIT`] when not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// What [`Command::History`] gives when no limit is asked for.
+pub const HISTORY_LIMIT: usize = 50;
+
+/// How a request ended, broadly, for filtering history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatusClass {
+    #[serde(rename = "2xx")]
+    Success,
+    #[serde(rename = "3xx")]
+    Redirect,
+    #[serde(rename = "4xx")]
+    ClientError,
+    #[serde(rename = "5xx")]
+    ServerError,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    #[serde(rename = "running")]
+    Running,
+}
+
+impl StatusClass {
+    pub const NAMES: &'static str = "2xx, 3xx, 4xx, 5xx, failed, cancelled or running";
+
+    /// From its name on the wire, such as `4xx` or `failed`.
+    pub fn parse(name: &str) -> Option<StatusClass> {
+        serde_json::from_value(serde_json::Value::String(name.to_ascii_lowercase())).ok()
+    }
+
+    pub fn of(ended: &Ended) -> StatusClass {
+        match ended {
+            Ended::Running => StatusClass::Running,
+            Ended::Failed { .. } => StatusClass::Failed,
+            Ended::Cancelled { .. } => StatusClass::Cancelled,
+            Ended::Done { status, .. } => match status {
+                500.. => StatusClass::ServerError,
+                400..=499 => StatusClass::ClientError,
+                300..=399 => StatusClass::Redirect,
+                _ => StatusClass::Success,
+            },
+        }
+    }
+}
+
+/// One past request, as [`Command::History`] gives it: as written, with how
+/// it ended, but without the response's body or headers, which the journal's
+/// `request_finished` has.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub request_id: u64,
+    /// When it was sent, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+    /// Who sent it.
+    pub actor: Actor,
+    pub request: HttpRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun_of: Option<u64>,
+    pub ended: Ended,
+}
+
+impl HistoryEntry {
+    /// Whether `filter` lets this one through, its limit aside.
+    pub fn matches(&self, filter: &HistoryFilter) -> bool {
+        if filter.actor.as_ref().is_some_and(|kind| *kind != self.actor.kind) {
+            return false;
+        }
+        if filter.status.is_some_and(|class| class != StatusClass::of(&self.ended)) {
+            return false;
+        }
+        let Some(text) = filter.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+            return true;
+        };
+        let text = text.to_lowercase();
+        let status = match &self.ended {
+            Ended::Done { status, .. } => status.to_string(),
+            _ => String::new(),
+        };
+        let id = format!("#{}", self.request_id);
+        [&self.request.method, &self.request.url, self.env.as_deref().unwrap_or(""), &self.actor.name, &status, &id]
+            .iter()
+            .any(|field| field.to_lowercase().contains(&text))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Ended {
+    Running,
+    Done { status: u16, total_ms: f64, size: u64 },
+    Failed { error: String },
+    Cancelled { by: Actor },
+}
+
 /// The core's answer to one [`Request`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Reply {
@@ -214,6 +343,9 @@ pub enum ReplyBody {
     Subscribed { replayed: u64, next_seq: u64 },
     Accepted { request_id: u64 },
     Status { clients: Vec<Actor>, next_seq: u64, workspace: String },
+    /// `matched` counts every entry the filter let through, `entries` the
+    /// newest of them up to its limit; both as of event `as_of`.
+    History { entries: Vec<HistoryEntry>, matched: u64, as_of: u64 },
     Cancelled,
     /// `skipped` names files under `requests/` that don't parse, and why.
     Requests { requests: Vec<SavedRequest>, as_of: u64, skipped: Vec<String> },
@@ -245,12 +377,15 @@ pub enum EventKind {
     ClientJoined { client: u64 },
     ClientLeft { client: u64 },
     /// `request` as written, `{{name}}` and all; `env` names the environment
-    /// it was sent with. Resolved values stay out of the journal.
+    /// it was sent with. Resolved values stay out of the journal. `rerun_of`
+    /// is the request this one sent again, through [`Command::Rerun`].
     RequestStarted {
         request_id: u64,
         request: HttpRequest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rerun_of: Option<u64>,
     },
     RequestFinished { request_id: u64, response: HttpResponse },
     RequestFailed { request_id: u64, error: String },
@@ -316,5 +451,41 @@ mod tests {
             assert!(!line.contains('\n'), "one message, one line");
             assert_eq!(serde_json::from_str::<ServerMessage>(&line).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn a_journal_line_from_before_reruns_still_reads() {
+        let line = r#"{"seq":1,"at_ms":0,"actor":{"kind":"cli","name":"x"},"event":"request_started","request_id":1,"request":{"method":"GET","url":"http://x/"}}"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        assert!(matches!(event.kind, EventKind::RequestStarted { rerun_of: None, env: None, .. }));
+    }
+
+    #[test]
+    fn a_history_filter_matches_on_every_field_it_names() {
+        let entry = HistoryEntry {
+            request_id: 12,
+            at_ms: 0,
+            actor: Actor { kind: ClientKind::Agent, name: "claude-code".into() },
+            request: HttpRequest { method: "POST".into(), url: "{{base}}/albums".into(), headers: vec![], body: None },
+            env: Some("staging".into()),
+            rerun_of: None,
+            ended: Ended::Done { status: 404, total_ms: 3.0, size: 2 },
+        };
+        let with = |text: &str| HistoryFilter { text: Some(text.into()), ..HistoryFilter::default() };
+        for hit in ["ALBUMS", "post", "{{base}}", "stag", "claude", "404", "#12", "  "] {
+            assert!(entry.matches(&with(hit)), "{hit:?} should match");
+        }
+        for miss in ["photos", "#13", "200"] {
+            assert!(!entry.matches(&with(miss)), "{miss:?} should not match");
+        }
+        let class = |status| HistoryFilter { status: Some(status), ..HistoryFilter::default() };
+        assert!(entry.matches(&class(StatusClass::ClientError)));
+        assert!(!entry.matches(&class(StatusClass::Success)));
+        let kind = |actor| HistoryFilter { actor: Some(actor), ..HistoryFilter::default() };
+        assert!(entry.matches(&kind(ClientKind::Agent)));
+        assert!(!entry.matches(&kind(ClientKind::Window)));
+        assert_eq!(StatusClass::parse("5XX"), Some(StatusClass::ServerError));
+        assert_eq!(StatusClass::parse("cancelled"), Some(StatusClass::Cancelled));
+        assert_eq!(StatusClass::parse("6xx"), None);
     }
 }

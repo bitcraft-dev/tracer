@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Actor, Command, EventKind, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+    Actor, Command, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
 use crate::{envs, http};
@@ -71,31 +71,28 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
                 continue;
             }
             (Some((_, actor)), Command::Send { request, env }) => {
-                let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone());
-                let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
-                let (hub, actor) = (hub.clone(), actor.clone());
-                thread::spawn(move || {
-                    // Resolved here, not before it started, so a missing
-                    // variable is a failed request every client sees.
-                    let env = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
-                    let (env, secrets) = match env {
-                        Ok(Some((env, secrets))) => (Ok(Some(env)), secrets),
-                        Ok(None) => (Ok(None), Vec::new()),
-                        Err(e) => (Err(e), Vec::new()),
-                    };
-                    let resolved = env.and_then(|env| envs::resolve(&request, env.as_ref()));
-                    // Secret values that come back are replaced by their
-                    // names before anything is published or journalled.
-                    let kind = match resolved.and_then(|request| http::execute(&request, &cancelled)) {
-                        Ok(response) => {
-                            EventKind::RequestFinished { request_id, response: envs::redact_response(response, &secrets) }
-                        }
-                        Err(error) => EventKind::RequestFailed { request_id, error: envs::redact(&error, &secrets) },
-                    };
-                    // Dropped if the request was cancelled meanwhile.
-                    hub.end_request(actor, request_id, kind);
+                send(&hub, actor, request, env, None, |request_id| {
+                    let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
                 });
                 continue;
+            }
+            (Some((_, actor)), Command::Rerun { request_id, env }) => match hub.written(request_id) {
+                Some((request, was)) => {
+                    let env = match env {
+                        Some(name) if name.is_empty() => None,
+                        Some(name) => Some(name),
+                        None => was,
+                    };
+                    send(&hub, actor, request, env, Some(request_id), |request_id| {
+                        let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
+                    });
+                    continue;
+                }
+                None => Err(format!("there is no request #{request_id} in the history")),
+            },
+            (Some(_), Command::History { filter }) => {
+                let (entries, matched, as_of) = hub.history(&filter);
+                Ok(ReplyBody::History { entries, matched, as_of })
             }
             (Some((_, actor)), Command::Cancel { request_id }) => {
                 if hub.cancel_request(actor.clone(), request_id) {
@@ -153,6 +150,41 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
     if shutting_down {
         stop.stop();
     }
+}
+
+/// Publish that `request` started, have `accepted` answer the sender with
+/// its id, then send it on a thread of its own and publish how it ended.
+fn send(
+    hub: &Arc<Hub>,
+    actor: &Actor,
+    request: HttpRequest,
+    env: Option<String>,
+    rerun_of: Option<u64>,
+    accepted: impl FnOnce(u64),
+) {
+    let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of);
+    // Before the thread starts, so the sender hears its id before the end.
+    accepted(request_id);
+    let (hub, actor) = (hub.clone(), actor.clone());
+    thread::spawn(move || {
+        // Resolved here, not before it started, so a missing variable is a
+        // failed request every client sees.
+        let env = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
+        let (env, secrets) = match env {
+            Ok(Some((env, secrets))) => (Ok(Some(env)), secrets),
+            Ok(None) => (Ok(None), Vec::new()),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        let resolved = env.and_then(|env| envs::resolve(&request, env.as_ref()));
+        // Secret values that come back are replaced by their names before
+        // anything is published or journalled.
+        let kind = match resolved.and_then(|request| http::execute(&request, &cancelled)) {
+            Ok(response) => EventKind::RequestFinished { request_id, response: envs::redact_response(response, &secrets) },
+            Err(error) => EventKind::RequestFailed { request_id, error: envs::redact(&error, &secrets) },
+        };
+        // Dropped if the request was cancelled meanwhile.
+        hub.end_request(actor, request_id, kind);
+    });
 }
 
 fn reply(id: u64, outcome: Result<ReplyBody, String>) -> ServerMessage {

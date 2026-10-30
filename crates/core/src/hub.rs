@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
-    Actor, ClientKind, Environment, Event, EventKind, HttpRequest, SavedRequest, ServerMessage, JOURNAL_PATH,
+    Actor, ClientKind, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, SavedRequest,
+    ServerMessage, HISTORY_LIMIT, JOURNAL_PATH,
 };
 
 use crate::{envs, files};
@@ -176,14 +177,77 @@ impl Hub {
 
     /// Number a new request and publish that it started. Gives its id and
     /// the flag that says it was cancelled.
-    pub fn start_request(&self, actor: Actor, request: HttpRequest, env: Option<String>) -> (u64, Arc<AtomicBool>) {
+    pub fn start_request(
+        &self,
+        actor: Actor,
+        request: HttpRequest,
+        env: Option<String>,
+        rerun_of: Option<u64>,
+    ) -> (u64, Arc<AtomicBool>) {
         let mut inner = self.inner.lock().unwrap();
         let request_id = inner.next_request;
         inner.next_request += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         inner.running.insert(request_id, cancelled.clone());
-        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env });
+        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of });
         (request_id, cancelled)
+    }
+
+    /// Request `request_id` as it was written, and the environment it was
+    /// sent with.
+    pub fn written(&self, request_id: u64) -> Option<(HttpRequest, Option<String>)> {
+        let inner = self.inner.lock().unwrap();
+        inner.events.iter().find_map(|e| match &e.kind {
+            EventKind::RequestStarted { request_id: id, request, env, .. } if *id == request_id => {
+                Some((request.clone(), env.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// The past requests `filter` lets through, newest first and at most its
+    /// limit; how many it let through in all; and the event number that's
+    /// true at.
+    pub fn history(&self, filter: &HistoryFilter) -> (Vec<HistoryEntry>, u64, u64) {
+        let inner = self.inner.lock().unwrap();
+        let mut entries: Vec<HistoryEntry> = Vec::new();
+        for e in &inner.events {
+            let (request_id, ended) = match &e.kind {
+                EventKind::RequestStarted { request_id, request, env, rerun_of } => {
+                    entries.push(HistoryEntry {
+                        request_id: *request_id,
+                        at_ms: e.at_ms,
+                        actor: e.actor.clone(),
+                        request: request.clone(),
+                        env: env.clone(),
+                        rerun_of: *rerun_of,
+                        ended: Ended::Running,
+                    });
+                    continue;
+                }
+                EventKind::RequestFinished { request_id, response } => (
+                    *request_id,
+                    Ended::Done { status: response.status, total_ms: response.timing.total_ms, size: response.size },
+                ),
+                EventKind::RequestFailed { request_id, error } => (*request_id, Ended::Failed { error: error.clone() }),
+                EventKind::RequestCancelled { request_id } => (*request_id, Ended::Cancelled { by: e.actor.clone() }),
+                _ => continue,
+            };
+            // Ends come soon after their starts, so look from the newest.
+            if let Some(entry) = entries.iter_mut().rev().find(|x| x.request_id == request_id) {
+                entry.ended = ended;
+            }
+        }
+        let limit = filter.limit.unwrap_or(HISTORY_LIMIT);
+        let mut matched = 0;
+        let mut out = Vec::new();
+        for entry in entries.into_iter().rev().filter(|x| x.matches(filter)) {
+            matched += 1;
+            if out.len() < limit {
+                out.push(entry);
+            }
+        }
+        (out, matched, inner.next_seq)
     }
 
     /// Publish how a request ended, unless it was cancelled first.

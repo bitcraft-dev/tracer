@@ -552,7 +552,7 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
     while finished.is_none() || failed.is_none() {
         let e = window.next_event().unwrap();
         match e.kind {
-            EventKind::RequestStarted { request_id, request, env } if request_id == ok_id => started = Some((request.url, env)),
+            EventKind::RequestStarted { request_id, request, env, .. } if request_id == ok_id => started = Some((request.url, env)),
             EventKind::RequestFinished { request_id, response } if request_id == ok_id => finished = Some(response.body),
             EventKind::RequestFailed { request_id, error } if request_id == bad_id => failed = Some(error),
             _ => {}
@@ -567,6 +567,132 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
     assert_eq!(environments.len(), 1);
     assert_eq!(agent.call(Command::DeleteEnvironment { name: "local".into() }).unwrap(), Ok(ReplyBody::EnvironmentDeleted));
     assert!(!ws.join("environments/local.env").exists());
+    core.stop();
+}
+
+/// Waits for request `id` to end; gives its `request_started` and how it ended.
+fn ended(client: &mut Client, id: u64) -> (Event, EventKind) {
+    let mut started = None;
+    loop {
+        let e = client.next_event().unwrap();
+        match &e.kind {
+            EventKind::RequestStarted { request_id, .. } if *request_id == id => started = Some(e),
+            EventKind::RequestFinished { request_id, .. } | EventKind::RequestFailed { request_id, .. }
+                if *request_id == id =>
+            {
+                return (started.expect("started before it ended"), e.kind);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_rerun_sends_the_request_as_written_with_its_environment_unless_told_otherwise() {
+    let ws = workspace("rerun");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    for (name, id) in [("a", "1"), ("b", "2")] {
+        let vars = vec![("base".into(), base.clone()), ("id".into(), id.into())];
+        let env = tracer_protocol::Environment { name: name.into(), vars, secrets: vec![] };
+        agent.call(Command::SaveEnvironment { env }).unwrap().unwrap();
+    }
+
+    let request = HttpRequest {
+        method: "POST".into(),
+        url: "{{base}}/items/{{id}}".into(),
+        headers: vec![("X-Id".into(), "{{id}}".into())],
+        body: Some("abc".into()),
+    };
+    let Ok(ReplyBody::Accepted { request_id: first }) =
+        agent.call(Command::Send { request: request.clone(), env: Some("a".into()) }).unwrap()
+    else {
+        panic!("send was not accepted")
+    };
+    ended(&mut window, first);
+
+    // Again, by someone else: as written, with the env it had.
+    let rerun = |env: Option<&str>| Command::Rerun { request_id: first, env: env.map(String::from) };
+    let Ok(ReplyBody::Accepted { request_id: again }) = window.call(rerun(None)).unwrap() else { panic!() };
+    let (started, end) = ended(&mut window, again);
+    assert_eq!(started.actor.name, "window");
+    let EventKind::RequestStarted { request: r, env, rerun_of, .. } = started.kind else { unreachable!() };
+    assert_eq!((r, env, rerun_of), (request.clone(), Some("a".to_string()), Some(first)));
+    let EventKind::RequestFinished { response, .. } = end else { panic!("{end:?}") };
+    assert_eq!(response.body, r#"{"path":"/items/1","got":3}"#);
+
+    // With another env, and with none.
+    let Ok(ReplyBody::Accepted { request_id: in_b }) = window.call(rerun(Some("b"))).unwrap() else { panic!() };
+    let EventKind::RequestFinished { response, .. } = ended(&mut window, in_b).1 else { panic!() };
+    assert_eq!(response.body, r#"{"path":"/items/2","got":3}"#);
+    let Ok(ReplyBody::Accepted { request_id: bare }) = window.call(rerun(Some(""))).unwrap() else { panic!() };
+    let EventKind::RequestFailed { error, .. } = ended(&mut window, bare).1 else { panic!() };
+    assert!(error.contains("choose an environment"), "{error}");
+
+    // A request that never was.
+    let refused = window.call(Command::Rerun { request_id: 999, env: None }).unwrap();
+    assert_eq!(refused, Err("there is no request #999 in the history".to_string()));
+    core.stop();
+}
+
+#[test]
+fn history_gives_the_newest_first_filtered_and_survives_a_restart() {
+    use tracer_protocol::{Ended, HistoryFilter, StatusClass};
+    let ws = workspace("history");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
+    cli.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    let mut ids = Vec::new();
+    for (who, path) in [("cli", "/albums/1"), ("agent", "/photos/1"), ("cli", "/albums/2")] {
+        let sender = if who == "cli" { &mut cli } else { &mut agent };
+        let Ok(ReplyBody::Accepted { request_id }) = sender.call(get(format!("{base}{path}"))).unwrap() else { panic!() };
+        ids.push(request_id);
+    }
+    // One that fails: nothing listens on port 9.
+    let Ok(ReplyBody::Accepted { request_id: dead }) = cli.call(get("http://127.0.0.1:9/".into())).unwrap() else { panic!() };
+    let mut open: Vec<u64> = ids.iter().copied().chain([dead]).collect();
+    while !open.is_empty() {
+        if let EventKind::RequestFinished { request_id, .. } | EventKind::RequestFailed { request_id, .. } =
+            cli.next_event().unwrap().kind
+        {
+            open.retain(|id| *id != request_id);
+        }
+    }
+
+    let history = |client: &mut Client, filter: HistoryFilter| {
+        let Ok(ReplyBody::History { entries, matched, .. }) = client.call(Command::History { filter }).unwrap() else {
+            panic!()
+        };
+        (entries.iter().map(|e| e.request_id).collect::<Vec<_>>(), matched, entries)
+    };
+    let all = HistoryFilter::default();
+    let (order, matched, entries) = history(&mut cli, all.clone());
+    assert_eq!(order, vec![dead, ids[2], ids[1], ids[0]]);
+    assert_eq!(matched, 4);
+    assert!(matches!(entries[0].ended, Ended::Failed { .. }));
+    assert!(matches!(entries[1].ended, Ended::Done { status: 200, .. }), "{:?}", entries[1].ended);
+
+    let text = |t: &str| HistoryFilter { text: Some(t.into()), ..HistoryFilter::default() };
+    assert_eq!(history(&mut cli, text("albums")).0, vec![ids[2], ids[0]]);
+    let agents = HistoryFilter { actor: Some(ClientKind::Agent), ..HistoryFilter::default() };
+    assert_eq!(history(&mut cli, agents).0, vec![ids[1]]);
+    let failed = HistoryFilter { status: Some(StatusClass::Failed), ..HistoryFilter::default() };
+    assert_eq!(history(&mut cli, failed).0, vec![dead]);
+    let (newest, matched, _) = history(&mut cli, HistoryFilter { limit: Some(2), ..HistoryFilter::default() });
+    assert_eq!((newest, matched), (vec![dead, ids[2]], 4));
+
+    // A fresh core reads the same history from the journal.
+    drop((cli, agent));
+    core.stop();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
+    assert_eq!(history(&mut cli, all).0, vec![dead, ids[2], ids[1], ids[0]]);
     core.stop();
 }
 

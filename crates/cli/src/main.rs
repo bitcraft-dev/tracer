@@ -12,7 +12,9 @@
 //! tracer secret rm <ENV> <NAME>     remove a secret
 //! tracer rm <PATH>                  delete a saved request
 //! tracer watch [--all | --since N]  print events as they happen
-//! tracer cancel <ID>                 cancel a running request, whoever sent it
+//! tracer history [TEXT]             past requests, newest first, filtered
+//! tracer rerun <ID>                 send a past request again, as written
+//! tracer cancel <ID>                cancel a running request, whoever sent it
 //! tracer stop                       stop the workspace's core
 //! ```
 //!
@@ -23,7 +25,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tracer_protocol::client::Client;
-use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
+use tracer_protocol::{
+    ClientKind, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody, SavedRequest, StatusClass,
+};
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
 /// terminal.
@@ -45,6 +49,12 @@ usage:
   tracer secret rm <ENV> <NAME>       remove a secret
   tracer rm <PATH>                    delete a saved request
   tracer watch [--all | --since <N>]  print events as they happen
+  tracer history [TEXT] [--actor <window|cli|agent>] [--status <2xx|3xx|4xx|5xx|failed|cancelled|running>] [-n <N>]
+                                      past requests, newest first; TEXT is looked
+                                      for in the method, URL, env, sender, status, #id
+  tracer rerun <ID> [--env <NAME> | --no-env]
+                                      send a past request again as it was written,
+                                      with its environment unless told otherwise
   tracer cancel <ID>                  cancel a running request, whoever sent it
   tracer stop                         stop the workspace's core
 
@@ -68,6 +78,8 @@ fn main() -> ExitCode {
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
+        Some("history") => history(workspace, args[1..].to_vec()),
+        Some("rerun") => rerun(workspace, args[1..].to_vec()),
         Some("cancel") => cancel(workspace, args[1..].to_vec()),
         Some("stop") => stop(workspace),
         _ => {
@@ -142,7 +154,74 @@ fn cancel(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
 fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let env = take_value(&mut args, "--env");
     let request = request_from(args)?;
-    send_and_wait(&workspace, request, env, "tracer send")
+    send_and_wait(&workspace, Command::Send { request, env }, "tracer send")
+}
+
+fn history(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let actor = match take_value(&mut args, "--actor").as_deref() {
+        None => None,
+        Some("window") => Some(ClientKind::Window),
+        Some("cli") => Some(ClientKind::Cli),
+        Some("agent") => Some(ClientKind::Agent),
+        Some(other) => return Err(io::Error::other(format!("--actor is window, cli or agent, not `{other}`"))),
+    };
+    let status = take_value(&mut args, "--status")
+        .map(|s| StatusClass::parse(&s).ok_or_else(|| io::Error::other(format!("--status is {}, not `{s}`", StatusClass::NAMES))))
+        .transpose()?;
+    let limit = take_value(&mut args, "-n")
+        .map(|n| n.parse::<usize>().map_err(|_| io::Error::other(format!("-n takes a number, not `{n}`"))))
+        .transpose()?;
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+        return Err(io::Error::other(format!("unknown option `{flag}`\n{USAGE}")));
+    }
+    let text = if args.is_empty() { None } else { Some(args.join(" ")) };
+    let filter = HistoryFilter { text, actor, status, limit };
+
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer history")?;
+    let ReplyBody::History { entries, matched, .. } = client.call(Command::History { filter })?.map_err(io::Error::other)? else {
+        return Err(io::Error::other("unexpected answer"));
+    };
+    for e in &entries {
+        let outcome = match &e.ended {
+            Ended::Running => "…".to_string(),
+            Ended::Done { status, total_ms, .. } => format!("{status} {total_ms:>5.0}ms"),
+            Ended::Failed { .. } => "failed".to_string(),
+            Ended::Cancelled { .. } => "cancelled".to_string(),
+        };
+        let who = format!("{:?}:{}", e.actor.kind, e.actor.name).to_lowercase();
+        let env = e.env.as_ref().map(|n| format!(" [{n}]")).unwrap_or_default();
+        let again = e.rerun_of.map(|id| format!(" (re-run of #{id})")).unwrap_or_default();
+        println!(
+            "{:>6}  {outcome:<11}  {who:<20}  {:<7} {}{env}{again}",
+            format!("#{}", e.request_id),
+            e.request.method,
+            e.request.url
+        );
+    }
+    if entries.len() < matched as usize {
+        eprintln!("tracer: showing the newest {} of {matched}; -n shows more", entries.len());
+    } else if matched == 0 {
+        eprintln!("tracer: no request in the history matches");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn rerun(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let no_env = match args.iter().position(|a| a == "--no-env") {
+        Some(at) => {
+            args.remove(at);
+            true
+        }
+        None => false,
+    };
+    let env = take_value(&mut args, "--env");
+    if no_env && env.is_some() {
+        return Err(io::Error::other("--env and --no-env together"));
+    }
+    let env = if no_env { Some(String::new()) } else { env };
+    let [id] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let request_id = id.trim_start_matches('#').parse().map_err(|_| io::Error::other(format!("`{id}` is not a request id")))?;
+    send_and_wait(&workspace, Command::Rerun { request_id, env }, "tracer rerun")
 }
 
 /// `<METHOD> <URL> [-H 'Name: value']... [-d <body>]`.
@@ -201,7 +280,7 @@ fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
         return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
     };
-    send_and_wait(&workspace, found.request, env, "tracer run")
+    send_and_wait(&workspace, Command::Send { request: found.request, env }, "tracer run")
 }
 
 fn env_list(workspace: PathBuf) -> io::Result<ExitCode> {
@@ -280,12 +359,12 @@ fn saved(workspace: &PathBuf, name: &str) -> io::Result<(Vec<SavedRequest>, Vec<
     }
 }
 
-/// Send `request` and print its answer when it comes.
-fn send_and_wait(workspace: &PathBuf, request: HttpRequest, env: Option<String>, name: &str) -> io::Result<ExitCode> {
+/// Send a request (`Send` or `Rerun`) and print its answer when it comes.
+fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Result<ExitCode> {
     let mut client = Client::connect(workspace, ClientKind::Cli, name)?;
     // Subscribed before sending, so the answer cannot go past unseen.
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
-    let request_id = match client.call(Command::Send { request, env })? {
+    let request_id = match client.call(sending)? {
         Ok(ReplyBody::Accepted { request_id }) => request_id,
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),
@@ -338,9 +417,10 @@ fn describe(event: &Event) -> String {
     let what = match &event.kind {
         EventKind::ClientJoined { client } => format!("joined as client {client}"),
         EventKind::ClientLeft { client } => format!("left (client {client})"),
-        EventKind::RequestStarted { request_id, request, env } => {
+        EventKind::RequestStarted { request_id, request, env, rerun_of } => {
             let with = env.as_ref().map(|e| format!(" (env {e})")).unwrap_or_default();
-            format!("#{request_id} {} {}{with}", request.method, request.url)
+            let again = rerun_of.map(|id| format!(", re-run of #{id}")).unwrap_or_default();
+            format!("#{request_id} {} {}{with}{again}", request.method, request.url)
         }
         EventKind::RequestFinished { request_id, response } => format!(
             "#{request_id} → {} in {:.0} ms ({} B)",
