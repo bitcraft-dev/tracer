@@ -7,7 +7,7 @@ file is about working on Tracer.
 
 ## Where it stands (2026-10-30, afternoon)
 
-Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
+Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `master` holds Phase 0, `phase-1-core` everything since, and both track `origin`. Push when the user asks.
 
 ### Done
 
