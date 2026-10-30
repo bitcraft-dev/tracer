@@ -16,7 +16,7 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   to set them up again.
 - Phases 0 to 3 are done: the MCP server (tried from Claude Code),
   guardrails, `agents.policy` and the local HTTP/WS API (see Done). Next
-  is Phase 4, after the DNS fix under Next.
+  is Phase 4.
 - **Open Rux findings: AW-036 only**, which is new and not yet answered.
   AW-035 was closed on 2026-10-30 after a re-drive on the pushed and
   installed Rux b4fe20a. Everything from AW-001 to AW-035 is closed.
@@ -286,19 +286,13 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 
 ### Next
 
-1. **Happy eyeballs in the HTTP engine.** On this machine IPv4 (A)
-   lookups are slow or fail (`curl -4`: 11 s, then "couldn't resolve")
-   while IPv6 works; curl races the two, `ureq`'s resolver waits for both,
-   so Tracer's sends take 0.7 to 29 s, or fail "No such host is known",
-   where curl takes about 1 s. A resolver that races A and AAAA, and
-   connects to whichever answers, would fix it. It also feeds Phase 4's
-   timing waterfall (DNS, connect, TLS), which needs a lower-level client
-   anyway.
+1. Phase 4: response tools, then assertions and flows, then benchmarking
+   (with bench-size caps in the policy), then realtime and GraphQL. The
+   timing waterfall (DNS, connect, TLS, TTFB) comes early: it would have
+   told the network's faults from Tracer's in a minute (see the gotcha).
 2. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
-3. Phase 4: response tools, then assertions and flows, then benchmarking
-   (with bench-size caps in the policy), then realtime and GraphQL.
-4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
+3. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
    wants it.
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
@@ -391,10 +385,13 @@ Things that cost a round trip once. Check here before debugging them again.
   --strict-mcp-config --mcp-config <json> --allowedTools mcp__tracer
   --output-format stream-json --verbose`, and `< /dev/null` (it waits 3 s
   for stdin otherwise). Stop the core it starts with `tracer stop`.
-- **Slow or failing sends here are IPv4 DNS** (2026-10-30 night): `curl
-  -4` takes 11 s and fails, plain `curl` races IPv6 and is fine, Tracer
-  waits for both (Next, 1). Compare `curl` and `curl -4` before blaming
-  anything else.
+- **Slow or failing sends here are the network, not Tracer** (2026-10-30
+  night). Measured from a bare Rust program: the system resolver fails
+  after 11 s ("No such host is known") or takes 3 s, and TCP connects to a
+  known IP take 3 s or 17 s (lost SYNs, retried). IPv6 lookups fail for
+  every host (no IPv6 here). curl meets the same (connects of 2.4 and
+  3.2 s); a few quick curl runs had first misled me into blaming Tracer's
+  resolver. Measure resolve and connect apart before blaming anything.
 
 ### Driving the window
 
