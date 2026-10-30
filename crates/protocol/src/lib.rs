@@ -146,6 +146,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<String>,
     },
+    /// Request `request_id` as `History` describes it, with its whole
+    /// response once it has finished.
+    Response { request_id: u64 },
+    /// Allow or refuse a request waiting for approval (`approval_asked`).
+    /// Only a person may: a window or the CLI, never an agent.
+    Decide { request_id: u64, allow: bool },
+    /// The kill switch. Off, every agent is refused anything but reading,
+    /// and their running requests are cancelled. Only a person may switch it.
+    SetAgents { allowed: bool },
     /// The core's state, for `tracer status`.
     Status,
     /// Stop the core: it publishes `core_stopping`, replies, stops taking
@@ -228,6 +237,10 @@ pub struct HistoryFilter {
 /// What [`Command::History`] gives when no limit is asked for.
 pub const HISTORY_LIMIT: usize = 50;
 
+fn yes() -> bool {
+    true
+}
+
 /// How a request ended, broadly, for filtering history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusClass {
@@ -257,7 +270,7 @@ impl StatusClass {
 
     pub fn of(ended: &Ended) -> StatusClass {
         match ended {
-            Ended::Running => StatusClass::Running,
+            Ended::Running | Ended::AwaitingApproval { .. } => StatusClass::Running,
             Ended::Failed { .. } => StatusClass::Failed,
             Ended::Cancelled { .. } => StatusClass::Cancelled,
             Ended::Done { status, .. } => match status {
@@ -316,6 +329,8 @@ impl HistoryEntry {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Ended {
     Running,
+    /// Started, but nothing sent until a person allows it.
+    AwaitingApproval { reason: String },
     Done { status: u16, total_ms: f64, size: u64 },
     Failed { error: String },
     Cancelled { by: Actor },
@@ -342,7 +357,22 @@ pub enum ReplyBody {
     Welcome { client: u64, protocol: u32 },
     Subscribed { replayed: u64, next_seq: u64 },
     Accepted { request_id: u64 },
-    Status { clients: Vec<Actor>, next_seq: u64, workspace: String },
+    Status {
+        clients: Vec<Actor>,
+        next_seq: u64,
+        workspace: String,
+        /// False while the kill switch has agents stopped.
+        #[serde(default = "yes")]
+        agents_allowed: bool,
+    },
+    /// A past request and, once it finished, its whole response.
+    Response {
+        entry: HistoryEntry,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<HttpResponse>,
+    },
+    Decided,
+    AgentsSwitched,
     /// `matched` counts every entry the filter let through, `entries` the
     /// newest of them up to its limit; both as of event `as_of`.
     History { entries: Vec<HistoryEntry>, matched: u64, as_of: u64 },
@@ -398,6 +428,14 @@ pub enum EventKind {
     EnvironmentDeleted { name: String },
     /// A secret was set (`present`) or removed. Never carries the value.
     SecretSet { env: String, name: String, present: bool },
+    /// A started request waits for a person to allow it before anything is
+    /// sent; `reason` says why it needs one. Published in the sender's name.
+    ApprovalAsked { request_id: u64, reason: String },
+    /// A person allowed or refused it; this event's actor is who. A refused
+    /// request then fails, naming them.
+    ApprovalGiven { request_id: u64, allow: bool },
+    /// Agents were let act again, or stopped by this event's actor.
+    AgentsSwitched { allowed: bool },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
     CoreStopping,

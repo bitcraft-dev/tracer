@@ -13,6 +13,7 @@
 mod conn;
 mod envs;
 mod files;
+mod guard;
 mod http;
 mod hub;
 

@@ -54,7 +54,8 @@ pub struct CoreEvent {
     pub actor: String,
     /// `client_joined`, `client_left`, `request_started`, `request_finished`,
     /// `request_failed`, `request_cancelled`, `request_saved`,
-    /// `request_deleted` or `core_stopping`.
+    /// `request_deleted`, `environment_changed`, `approval_asked`,
+    /// `approval_given`, `agents_switched` or `core_stopping`.
     pub kind: String,
     /// A saved request's path, for `request_saved` and `request_deleted`.
     pub path: String,
@@ -75,6 +76,10 @@ pub struct CoreEvent {
     pub ttfb_ms: f64,
     pub total_ms: f64,
     pub error: String,
+    /// Why a request waits for approval, for `approval_asked`.
+    pub reason: String,
+    /// Allowed, for `approval_given`; agents on, for `agents_switched`.
+    pub allow: bool,
 }
 
 /// A request saved in the workspace.
@@ -249,6 +254,28 @@ pub fn rerun(request_id: u64) -> Result<u64, CoreError> {
     match shared()?.call(Command::Rerun { request_id, env: None }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Allow or refuse a request waiting for approval. Its `approval_given`
+/// arrives on `events`.
+#[rux::export]
+pub fn decide(request_id: u64, allow: bool) -> Result<(), CoreError> {
+    match shared()?.call(Command::Decide { request_id, allow }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// The kill switch: let agents act, or stop them and cancel what they have
+/// running. Its `agents_switched` arrives on `events`.
+#[rux::export]
+pub fn set_agents(allowed: bool) -> Result<(), CoreError> {
+    match shared()?.call(Command::SetAgents { allowed }) {
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
     }
@@ -529,6 +556,8 @@ fn to_page(event: Event) -> CoreEvent {
         ttfb_ms: 0.0,
         total_ms: 0.0,
         error: String::new(),
+        reason: String::new(),
+        allow: false,
     };
     let headers = headers_of;
     match event.kind {
@@ -579,6 +608,17 @@ fn to_page(event: Event) -> CoreEvent {
         EventKind::EnvironmentSaved { .. } | EventKind::EnvironmentDeleted { .. } | EventKind::SecretSet { .. } => {
             out.kind = "environment_changed".into()
         }
+        EventKind::ApprovalAsked { request_id, reason } => {
+            out.kind = "approval_asked".into();
+            out.request_id = request_id;
+            out.reason = reason;
+        }
+        EventKind::ApprovalGiven { request_id, allow } => {
+            out.kind = "approval_given".into();
+            out.request_id = request_id;
+            out.allow = allow;
+        }
+        EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }
     out

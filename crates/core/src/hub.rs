@@ -11,12 +11,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
-    Actor, ClientKind, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, SavedRequest,
+    Actor, ClientKind, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, SavedRequest,
     ServerMessage, HISTORY_LIMIT, JOURNAL_PATH,
 };
 
@@ -41,11 +41,23 @@ struct Inner {
     /// Requests still running, each with the flag its worker checks to stop
     /// early. Whoever takes a request out of here publishes how it ended, so
     /// it ends exactly once.
-    running: HashMap<u64, Arc<AtomicBool>>,
+    running: HashMap<u64, Flight>,
+    /// Requests waiting for a person to allow them, each with where the
+    /// answer goes.
+    awaiting: HashMap<u64, mpsc::Sender<(bool, Actor)>>,
+    /// The kill switch: false while agents are stopped.
+    agents_allowed: bool,
     /// What the core last knew of the files, so a rescan publishes only what
     /// changed behind it. Its own saves and deletes update this under the
     /// same lock, so they aren't echoed back as disk changes.
     disk: Disk,
+}
+
+/// A request in flight: the flag its worker checks to stop early, and what
+/// kind of client sent it, for the kill switch.
+struct Flight {
+    cancelled: Arc<AtomicBool>,
+    kind: ClientKind,
 }
 
 #[derive(Default)]
@@ -90,6 +102,15 @@ impl Hub {
             })
             .max()
             .map_or(1, |id| id + 1);
+        // The kill switch outlives the core: as a person last left it.
+        let agents_allowed = events
+            .iter()
+            .rev()
+            .find_map(|e| match e.kind {
+                EventKind::AgentsSwitched { allowed } => Some(allowed),
+                _ => None,
+            })
+            .unwrap_or(true);
         // Requests a previous core started and never ended: it stopped, or
         // was killed, with them in flight.
         let mut unfinished: Vec<(u64, Actor)> = Vec::new();
@@ -114,6 +135,8 @@ impl Hub {
                 clients: BTreeMap::new(),
                 subscribers: Vec::new(),
                 running: HashMap::new(),
+                awaiting: HashMap::new(),
+                agents_allowed,
                 disk: Disk::read(workspace),
             }),
             workspace: workspace.display().to_string(),
@@ -188,7 +211,7 @@ impl Hub {
         let request_id = inner.next_request;
         inner.next_request += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
-        inner.running.insert(request_id, cancelled.clone());
+        inner.running.insert(request_id, Flight { cancelled: cancelled.clone(), kind: actor.kind.clone() });
         publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of });
         (request_id, cancelled)
     }
@@ -210,38 +233,10 @@ impl Hub {
     /// true at.
     pub fn history(&self, filter: &HistoryFilter) -> (Vec<HistoryEntry>, u64, u64) {
         let inner = self.inner.lock().unwrap();
-        let mut entries: Vec<HistoryEntry> = Vec::new();
-        for e in &inner.events {
-            let (request_id, ended) = match &e.kind {
-                EventKind::RequestStarted { request_id, request, env, rerun_of } => {
-                    entries.push(HistoryEntry {
-                        request_id: *request_id,
-                        at_ms: e.at_ms,
-                        actor: e.actor.clone(),
-                        request: request.clone(),
-                        env: env.clone(),
-                        rerun_of: *rerun_of,
-                        ended: Ended::Running,
-                    });
-                    continue;
-                }
-                EventKind::RequestFinished { request_id, response } => (
-                    *request_id,
-                    Ended::Done { status: response.status, total_ms: response.timing.total_ms, size: response.size },
-                ),
-                EventKind::RequestFailed { request_id, error } => (*request_id, Ended::Failed { error: error.clone() }),
-                EventKind::RequestCancelled { request_id } => (*request_id, Ended::Cancelled { by: e.actor.clone() }),
-                _ => continue,
-            };
-            // Ends come soon after their starts, so look from the newest.
-            if let Some(entry) = entries.iter_mut().rev().find(|x| x.request_id == request_id) {
-                entry.ended = ended;
-            }
-        }
         let limit = filter.limit.unwrap_or(HISTORY_LIMIT);
         let mut matched = 0;
         let mut out = Vec::new();
-        for entry in entries.into_iter().rev().filter(|x| x.matches(filter)) {
+        for entry in entries(&inner.events).into_iter().rev().filter(|x| x.matches(filter)) {
             matched += 1;
             if out.len() < limit {
                 out.push(entry);
@@ -250,10 +245,23 @@ impl Hub {
         (out, matched, inner.next_seq)
     }
 
+    /// Request `request_id` as history has it, and its whole response once
+    /// it has finished.
+    pub fn response(&self, request_id: u64) -> Option<(HistoryEntry, Option<HttpResponse>)> {
+        let inner = self.inner.lock().unwrap();
+        let entry = entries(&inner.events).into_iter().find(|e| e.request_id == request_id)?;
+        let response = inner.events.iter().rev().find_map(|e| match &e.kind {
+            EventKind::RequestFinished { request_id: id, response } if *id == request_id => Some(response.clone()),
+            _ => None,
+        });
+        Some((entry, response))
+    }
+
     /// Publish how a request ended, unless it was cancelled first.
     pub fn end_request(&self, actor: Actor, request_id: u64, kind: EventKind) {
         let mut inner = self.inner.lock().unwrap();
         if inner.running.remove(&request_id).is_some() {
+            inner.awaiting.remove(&request_id);
             publish_locked(&mut inner, actor, kind);
         }
     }
@@ -262,10 +270,66 @@ impl Hub {
     /// running: never sent, or already ended.
     pub fn cancel_request(&self, actor: Actor, request_id: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        let Some(cancelled) = inner.running.remove(&request_id) else { return false };
-        cancelled.store(true, Ordering::SeqCst);
-        publish_locked(&mut inner, actor, EventKind::RequestCancelled { request_id });
-        true
+        cancel_locked(&mut inner, actor, request_id)
+    }
+
+    /// Publish that request `request_id` waits for a person, and give what
+    /// their answer arrives on: whether they allowed it, and who they are.
+    /// `None` if it was cancelled before it got here. A cancel drops the
+    /// sending side, which wakes the receiver with an error.
+    pub fn ask_approval(&self, actor: Actor, request_id: u64, reason: String) -> Option<Receiver<(bool, Actor)>> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.running.contains_key(&request_id) {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        inner.awaiting.insert(request_id, tx);
+        publish_locked(&mut inner, actor, EventKind::ApprovalAsked { request_id, reason });
+        Some(rx)
+    }
+
+    /// A person's answer to an approval asked for.
+    pub fn decide(&self, actor: Actor, request_id: u64, allow: bool) -> Result<(), String> {
+        if actor.kind == ClientKind::Agent {
+            return Err("an agent can't approve requests; a person does, in the window or with `tracer approve`".into());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Some(answer) = inner.awaiting.remove(&request_id) else {
+            return Err(format!("request #{request_id} is not waiting for approval"));
+        };
+        publish_locked(&mut inner, actor.clone(), EventKind::ApprovalGiven { request_id, allow });
+        let _ = answer.send((allow, actor));
+        Ok(())
+    }
+
+    /// Stop waiting for an answer nobody gave. False if one came meanwhile,
+    /// which the receiver then holds.
+    pub fn give_up_approval(&self, request_id: u64) -> bool {
+        self.inner.lock().unwrap().awaiting.remove(&request_id).is_some()
+    }
+
+    /// The kill switch. Switched off, agents' running requests are cancelled
+    /// in `actor`'s name.
+    pub fn set_agents(&self, actor: Actor, allowed: bool) -> Result<(), String> {
+        if actor.kind == ClientKind::Agent {
+            return Err("an agent can't switch agents on or off".into());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.agents_allowed = allowed;
+        publish_locked(&mut inner, actor.clone(), EventKind::AgentsSwitched { allowed });
+        if !allowed {
+            let mut theirs: Vec<u64> =
+                inner.running.iter().filter(|(_, f)| f.kind == ClientKind::Agent).map(|(id, _)| *id).collect();
+            theirs.sort();
+            for request_id in theirs {
+                cancel_locked(&mut inner, actor.clone(), request_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn agents_allowed(&self) -> bool {
+        self.inner.lock().unwrap().agents_allowed
     }
 
     pub fn publish(&self, actor: Actor, kind: EventKind) -> u64 {
@@ -408,10 +472,57 @@ impl Hub {
         }
     }
 
-    pub fn status(&self) -> (Vec<Actor>, u64) {
+    pub fn status(&self) -> (Vec<Actor>, u64, bool) {
         let inner = self.inner.lock().unwrap();
-        (inner.clients.values().cloned().collect(), inner.next_seq)
+        (inner.clients.values().cloned().collect(), inner.next_seq, inner.agents_allowed)
     }
+}
+
+fn cancel_locked(inner: &mut Inner, actor: Actor, request_id: u64) -> bool {
+    let Some(flight) = inner.running.remove(&request_id) else { return false };
+    flight.cancelled.store(true, Ordering::SeqCst);
+    // Dropping the answer's sender wakes a worker waiting for approval.
+    inner.awaiting.remove(&request_id);
+    publish_locked(inner, actor, EventKind::RequestCancelled { request_id });
+    true
+}
+
+/// Every request in `events`, oldest first, each with how it stands.
+fn entries(events: &[Event]) -> Vec<HistoryEntry> {
+    let mut entries: Vec<HistoryEntry> = Vec::new();
+    for e in events {
+        let (request_id, ended) = match &e.kind {
+            EventKind::RequestStarted { request_id, request, env, rerun_of } => {
+                entries.push(HistoryEntry {
+                    request_id: *request_id,
+                    at_ms: e.at_ms,
+                    actor: e.actor.clone(),
+                    request: request.clone(),
+                    env: env.clone(),
+                    rerun_of: *rerun_of,
+                    ended: Ended::Running,
+                });
+                continue;
+            }
+            EventKind::ApprovalAsked { request_id, reason } => {
+                (*request_id, Ended::AwaitingApproval { reason: reason.clone() })
+            }
+            // Refused, it fails next; allowed, it runs.
+            EventKind::ApprovalGiven { request_id, .. } => (*request_id, Ended::Running),
+            EventKind::RequestFinished { request_id, response } => (
+                *request_id,
+                Ended::Done { status: response.status, total_ms: response.timing.total_ms, size: response.size },
+            ),
+            EventKind::RequestFailed { request_id, error } => (*request_id, Ended::Failed { error: error.clone() }),
+            EventKind::RequestCancelled { request_id } => (*request_id, Ended::Cancelled { by: e.actor.clone() }),
+            _ => continue,
+        };
+        // Ends come soon after their starts, so look from the newest.
+        if let Some(entry) = entries.iter_mut().rev().find(|x| x.request_id == request_id) {
+            entry.ended = ended;
+        }
+    }
+    entries
 }
 
 fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {

@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
 
@@ -14,7 +14,7 @@ use tracer_protocol::{
     Actor, Command, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::{envs, http};
+use crate::{envs, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -47,6 +47,14 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
             }
         };
         let id = request.id;
+        if let Some((_, actor)) = &session {
+            if let Some(why) = guard::refused(actor, &request.command, hub.agents_allowed()) {
+                if out.send(reply(id, Err(why))).is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let outcome = match (&session, request.command) {
             (None, Command::Hello { protocol, token: given, kind, name }) => {
                 if protocol != PROTOCOL_VERSION {
@@ -124,9 +132,19 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
             (Some((_, actor)), Command::SetSecret { env, name, value }) => {
                 hub.set_secret(actor.clone(), &env, &name, value).map(|_| ReplyBody::SecretSet)
             }
+            (Some(_), Command::Response { request_id }) => match hub.response(request_id) {
+                Some((entry, response)) => Ok(ReplyBody::Response { entry, response }),
+                None => Err(format!("there is no request #{request_id} in the history")),
+            },
+            (Some((_, actor)), Command::Decide { request_id, allow }) => {
+                hub.decide(actor.clone(), request_id, allow).map(|_| ReplyBody::Decided)
+            }
+            (Some((_, actor)), Command::SetAgents { allowed }) => {
+                hub.set_agents(actor.clone(), allowed).map(|_| ReplyBody::AgentsSwitched)
+            }
             (Some(_), Command::Status) => {
-                let (clients, next_seq) = hub.status();
-                Ok(ReplyBody::Status { clients, next_seq, workspace: hub.workspace().to_string() })
+                let (clients, next_seq, agents_allowed) = hub.status();
+                Ok(ReplyBody::Status { clients, next_seq, workspace: hub.workspace().to_string(), agents_allowed })
             }
             (Some((_, actor)), Command::Shutdown) => {
                 hub.publish(actor.clone(), EventKind::CoreStopping);
@@ -167,6 +185,11 @@ fn send(
     accepted(request_id);
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
+        if let Some(reason) = guard::needs_approval(&actor, &request, env.as_deref()) {
+            if !approved(&hub, &actor, request_id, reason) {
+                return;
+            }
+        }
         // Resolved here, not before it started, so a missing variable is a
         // failed request every client sees.
         let env = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
@@ -185,6 +208,39 @@ fn send(
         // Dropped if the request was cancelled meanwhile.
         hub.end_request(actor, request_id, kind);
     });
+}
+
+/// Ask a person to allow request `request_id` and wait for them. True if
+/// they did; otherwise the request has been ended, refused, timed out or
+/// cancelled, and nothing more is to be done with it.
+fn approved(hub: &Hub, actor: &Actor, request_id: u64, reason: String) -> bool {
+    let Some(answer) = hub.ask_approval(actor.clone(), request_id, reason) else { return false };
+    let decision = match answer.recv_timeout(guard::APPROVAL_TIMEOUT) {
+        Ok(decision) => decision,
+        // A cancel dropped the sender, and has published the end.
+        Err(RecvTimeoutError::Disconnected) => return false,
+        Err(RecvTimeoutError::Timeout) => {
+            if hub.give_up_approval(request_id) {
+                let minutes = guard::APPROVAL_TIMEOUT.as_secs() / 60;
+                let error = format!("nobody allowed it within {minutes} minutes");
+                hub.end_request(actor.clone(), request_id, EventKind::RequestFailed { request_id, error });
+                return false;
+            }
+            // An answer came as the time ran out; it's in the channel.
+            match answer.recv() {
+                Ok(decision) => decision,
+                Err(_) => return false,
+            }
+        }
+    };
+    match decision {
+        (true, _) => true,
+        (false, person) => {
+            let error = format!("refused by {}", person.name);
+            hub.end_request(actor.clone(), request_id, EventKind::RequestFailed { request_id, error });
+            false
+        }
+    }
 }
 
 fn reply(id: u64, outcome: Result<ReplyBody, String>) -> ServerMessage {

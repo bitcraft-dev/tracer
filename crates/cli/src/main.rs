@@ -15,10 +15,15 @@
 //! tracer history [TEXT]             past requests, newest first, filtered
 //! tracer rerun <ID>                 send a past request again, as written
 //! tracer cancel <ID>                cancel a running request, whoever sent it
+//! tracer approve <ID> / deny <ID>   answer an agent's request waiting for a person
+//! tracer agents on|off              the kill switch for agents
+//! tracer mcp                        an MCP server on stdio, for AI agents
 //! tracer stop                       stop the workspace's core
 //! ```
 //!
 //! Every command takes `-w <dir>` for the workspace (default: here).
+
+mod mcp;
 
 use std::io;
 use std::path::PathBuf;
@@ -56,6 +61,13 @@ usage:
                                       send a past request again as it was written,
                                       with its environment unless told otherwise
   tracer cancel <ID>                  cancel a running request, whoever sent it
+  tracer approve <ID>                 allow an agent's request that waits for a person
+  tracer deny <ID>                    refuse it
+  tracer agents on|off                let agents act, or stop them (their running
+                                      requests are cancelled); `tracer status` shows it
+  tracer mcp [--name <AGENT>]         an MCP server on stdio: an AI agent drives
+                                      Tracer through it, as AGENT or the name its
+                                      client gives; starts a core if none runs
   tracer stop                         stop the workspace's core
 
 options:
@@ -81,6 +93,13 @@ fn main() -> ExitCode {
         Some("history") => history(workspace, args[1..].to_vec()),
         Some("rerun") => rerun(workspace, args[1..].to_vec()),
         Some("cancel") => cancel(workspace, args[1..].to_vec()),
+        Some("approve") => decide(workspace, args[1..].to_vec(), true),
+        Some("deny") => decide(workspace, args[1..].to_vec(), false),
+        Some("agents") => agents(workspace, args[1..].to_vec()),
+        Some("mcp") => {
+            let name = take_value(&mut args, "--name");
+            mcp::serve(workspace, name).map(|_| ExitCode::SUCCESS)
+        }
         Some("stop") => stop(workspace),
         _ => {
             eprintln!("{USAGE}");
@@ -111,9 +130,10 @@ fn core(workspace: PathBuf) -> io::Result<ExitCode> {
 fn status(workspace: PathBuf) -> io::Result<ExitCode> {
     let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer status")?;
     match client.call(Command::Status)? {
-        Ok(ReplyBody::Status { clients, next_seq, workspace }) => {
+        Ok(ReplyBody::Status { clients, next_seq, workspace, agents_allowed }) => {
             println!("workspace  {workspace}");
             println!("events     {}", next_seq - 1);
+            println!("agents     {}", if agents_allowed { "on" } else { "off (tracer agents on)" });
             println!("clients    {}", clients.len());
             for actor in clients {
                 println!("  {:?} {}", actor.kind, actor.name);
@@ -123,6 +143,34 @@ fn status(workspace: PathBuf) -> io::Result<ExitCode> {
         Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => Err(io::Error::other(e)),
     }
+}
+
+fn decide(workspace: PathBuf, args: Vec<String>, allow: bool) -> io::Result<ExitCode> {
+    let [id] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let request_id = id.trim_start_matches('#').parse().map_err(|_| io::Error::other(format!("`{id}` is not a request id")))?;
+    let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+    client.call(Command::Decide { request_id, allow })?.map_err(io::Error::other)?;
+    println!("tracer: {} #{request_id}", if allow { "allowed" } else { "refused" });
+    Ok(ExitCode::SUCCESS)
+}
+
+fn agents(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let allowed = match args.as_slice() {
+        [on] if on == "on" => true,
+        [off] if off == "off" => false,
+        _ => return Err(io::Error::other(USAGE)),
+    };
+    let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+    client.call(Command::SetAgents { allowed })?.map_err(io::Error::other)?;
+    let what = if allowed { "agents may act again" } else { "agents are stopped; their running requests were cancelled" };
+    println!("tracer: {what}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Who is at the terminal, for decisions that name the person who made them
+/// ("refused by …"), as the window names its user.
+fn person() -> String {
+    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "tracer".into())
 }
 
 fn stop(workspace: PathBuf) -> io::Result<ExitCode> {
@@ -184,6 +232,7 @@ fn history(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     for e in &entries {
         let outcome = match &e.ended {
             Ended::Running => "…".to_string(),
+            Ended::AwaitingApproval { .. } => "approval?".to_string(),
             Ended::Done { status, total_ms, .. } => format!("{status} {total_ms:>5.0}ms"),
             Ended::Failed { .. } => "failed".to_string(),
             Ended::Cancelled { .. } => "cancelled".to_string(),
@@ -435,6 +484,13 @@ fn describe(event: &Event) -> String {
         EventKind::SecretSet { env, name, present } => {
             format!("{} secret {name} of {env}", if *present { "set" } else { "removed" })
         }
+        EventKind::ApprovalAsked { request_id, reason } => {
+            format!("#{request_id} waits for a person: {reason}; `tracer approve {request_id}` or `tracer deny {request_id}`")
+        }
+        EventKind::ApprovalGiven { request_id, allow } => {
+            format!("#{request_id} {}", if *allow { "allowed" } else { "refused" })
+        }
+        EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
         EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)

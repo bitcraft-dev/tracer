@@ -565,7 +565,10 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
 
     let Ok(ReplyBody::Environments { environments, .. }) = window.call(Command::ListEnvironments).unwrap() else { panic!() };
     assert_eq!(environments.len(), 1);
-    assert_eq!(agent.call(Command::DeleteEnvironment { name: "local".into() }).unwrap(), Ok(ReplyBody::EnvironmentDeleted));
+    // Deleting one is a person's call (the guardrails), not an agent's.
+    let delete = || Command::DeleteEnvironment { name: "local".into() };
+    assert!(agent.call(delete()).unwrap().is_err());
+    assert_eq!(window.call(delete()).unwrap(), Ok(ReplyBody::EnvironmentDeleted));
     assert!(!ws.join("environments/local.env").exists());
     core.stop();
 }
@@ -594,11 +597,12 @@ fn a_rerun_sends_the_request_as_written_with_its_environment_unless_told_otherwi
     let core = tracer_core::start(&ws).unwrap();
     let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
     window.call(Command::Subscribe { since: None }).unwrap().unwrap();
-    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    // The CLI, not an agent: an agent's POST would wait for approval.
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
     for (name, id) in [("a", "1"), ("b", "2")] {
         let vars = vec![("base".into(), base.clone()), ("id".into(), id.into())];
         let env = tracer_protocol::Environment { name: name.into(), vars, secrets: vec![] };
-        agent.call(Command::SaveEnvironment { env }).unwrap().unwrap();
+        cli.call(Command::SaveEnvironment { env }).unwrap().unwrap();
     }
 
     let request = HttpRequest {
@@ -608,7 +612,7 @@ fn a_rerun_sends_the_request_as_written_with_its_environment_unless_told_otherwi
         body: Some("abc".into()),
     };
     let Ok(ReplyBody::Accepted { request_id: first }) =
-        agent.call(Command::Send { request: request.clone(), env: Some("a".into()) }).unwrap()
+        cli.call(Command::Send { request: request.clone(), env: Some("a".into()) }).unwrap()
     else {
         panic!("send was not accepted")
     };
@@ -774,6 +778,9 @@ fn a_secret_fills_in_but_its_value_never_reaches_a_client_or_the_journal() {
         env: Some("prod".into()),
     };
     let Ok(ReplyBody::Accepted { request_id }) = agent.call(send).unwrap() else { panic!() };
+    // An agent using `prod` waits for a person.
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::ApprovalAsked { request_id: id, .. } if id == request_id).then_some(()));
+    window.call(Command::Decide { request_id, allow: true }).unwrap().unwrap();
     let body = loop {
         if let EventKind::RequestFinished { request_id: id, response } = window.next_event().unwrap().kind {
             if id == request_id {
@@ -795,5 +802,130 @@ fn a_secret_fills_in_but_its_value_never_reaches_a_client_or_the_journal() {
     assert_eq!(window.call(rm()).unwrap(), Ok(ReplyBody::SecretSet));
     assert!(window.call(rm()).unwrap().is_err());
     assert!(!ws.join(".tracer/secrets/prod.env").exists());
+    core.stop();
+}
+
+/// How request `id` ended, its start already seen or not.
+fn end_of(client: &mut Client, id: u64) -> EventKind {
+    wait_for(client, |e| match &e.kind {
+        EventKind::RequestFinished { request_id, .. }
+        | EventKind::RequestFailed { request_id, .. }
+        | EventKind::RequestCancelled { request_id }
+            if *request_id == id =>
+        {
+            Some(e.kind.clone())
+        }
+        _ => None,
+    })
+}
+
+/// The next event `pick` takes, skipping the rest.
+fn wait_for<T>(client: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
+    loop {
+        let e = client.next_event().unwrap();
+        if let Some(found) = pick(&e) {
+            return found;
+        }
+    }
+}
+
+fn post(url: String) -> Command {
+    Command::Send { request: HttpRequest { method: "POST".into(), url, headers: vec![], body: Some("x".into()) }, env: None }
+}
+
+#[test]
+fn an_agents_post_waits_for_a_person_who_allows_or_refuses_it() {
+    use tracer_protocol::Ended;
+    let ws = workspace("approve");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    // A GET goes straight through.
+    let Ok(ReplyBody::Accepted { request_id: get_id }) = agent.call(get(format!("{base}/a"))).unwrap() else { panic!() };
+    assert!(matches!(ended(&mut window, get_id).1, EventKind::RequestFinished { .. }));
+
+    // A POST waits, and history and `Response` say so.
+    let Ok(ReplyBody::Accepted { request_id: first }) = agent.call(post(format!("{base}/b"))).unwrap() else { panic!() };
+    let reason = wait_for(&mut window, |e| match &e.kind {
+        EventKind::ApprovalAsked { request_id, reason } if *request_id == first => Some(reason.clone()),
+        _ => None,
+    });
+    assert_eq!(reason, "POST from an agent");
+    let Ok(ReplyBody::Response { entry, response }) = window.call(Command::Response { request_id: first }).unwrap() else {
+        panic!()
+    };
+    assert_eq!((entry.ended, response), (Ended::AwaitingApproval { reason }, None));
+
+    // An agent can't answer it; a person can.
+    assert!(agent.call(Command::Decide { request_id: first, allow: true }).unwrap().is_err());
+    assert_eq!(window.call(Command::Decide { request_id: first, allow: true }).unwrap(), Ok(ReplyBody::Decided));
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, first) else { panic!() };
+    assert_eq!(response.body, r#"{"path":"/b","got":1}"#);
+    let Ok(ReplyBody::Response { response: Some(full), .. }) = agent.call(Command::Response { request_id: first }).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(full.body, response.body);
+
+    // Refused, it fails naming who refused it, and nothing was sent.
+    let Ok(ReplyBody::Accepted { request_id: second }) = agent.call(post(format!("{base}/c"))).unwrap() else { panic!() };
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::ApprovalAsked { request_id, .. } if request_id == second).then_some(()));
+    window.call(Command::Decide { request_id: second, allow: false }).unwrap().unwrap();
+    let EventKind::RequestFailed { error, .. } = end_of(&mut window, second) else { panic!() };
+    assert_eq!(error, "refused by you");
+    assert!(window.call(Command::Decide { request_id: second, allow: true }).unwrap().is_err(), "answered once");
+
+    // Cancelled while it waits, it ends once.
+    let Ok(ReplyBody::Accepted { request_id: third }) = agent.call(post(format!("{base}/d"))).unwrap() else { panic!() };
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::ApprovalAsked { request_id, .. } if request_id == third).then_some(()));
+    assert_eq!(agent.call(Command::Cancel { request_id: third }).unwrap(), Ok(ReplyBody::Cancelled));
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::RequestCancelled { request_id } if request_id == third).then_some(()));
+    assert!(window.call(Command::Decide { request_id: third, allow: true }).unwrap().is_err());
+
+    // A person's own POST never asks.
+    let Ok(ReplyBody::Accepted { request_id: mine }) = window.call(post(format!("{base}/e"))).unwrap() else { panic!() };
+    assert!(matches!(ended(&mut window, mine).1, EventKind::RequestFinished { .. }));
+    core.stop();
+}
+
+#[test]
+fn the_kill_switch_stops_agents_cancels_their_requests_and_outlives_the_core() {
+    let ws = workspace("kill");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    let Ok(ReplyBody::Accepted { request_id: waiting }) = agent.call(post(format!("{base}/x"))).unwrap() else { panic!() };
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::ApprovalAsked { request_id, .. } if request_id == waiting).then_some(()));
+
+    assert!(agent.call(Command::SetAgents { allowed: false }).unwrap().is_err(), "not an agent's to throw");
+    window.call(Command::SetAgents { allowed: false }).unwrap().unwrap();
+    let who = wait_for(&mut window, |e| match e.kind {
+        EventKind::RequestCancelled { request_id } if request_id == waiting => Some(e.actor.name.clone()),
+        _ => None,
+    });
+    assert_eq!(who, "you");
+    let refused = agent.call(get(format!("{base}/y"))).unwrap().unwrap_err();
+    assert!(refused.contains("switched off"), "{refused}");
+    assert!(agent.call(Command::ListRequests).unwrap().is_ok(), "reading is still allowed");
+    let secret = Command::SetSecret { env: "a".into(), name: "b".into(), value: Some("c".into()) };
+    assert!(agent.call(secret).unwrap().unwrap_err().contains("for a person"));
+
+    // Still off after a restart, until a person switches it back.
+    drop((window, agent));
+    core.stop();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    let Ok(ReplyBody::Status { agents_allowed, .. }) = window.call(Command::Status).unwrap() else { panic!() };
+    assert!(!agents_allowed);
+    assert!(agent.call(get(format!("{base}/y"))).unwrap().is_err());
+    window.call(Command::SetAgents { allowed: true }).unwrap().unwrap();
+    assert!(matches!(agent.call(get(format!("{base}/y"))).unwrap(), Ok(ReplyBody::Accepted { .. })));
     core.stop();
 }
