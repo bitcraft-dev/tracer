@@ -86,6 +86,7 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::History { .. }
             | Command::Response { .. }
             | Command::Policy
+            | Command::Diff { .. }
             | Command::Status
     );
     if reads {

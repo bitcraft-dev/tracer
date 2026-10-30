@@ -12,6 +12,7 @@
 
 mod api;
 mod conn;
+mod diff;
 mod envs;
 mod files;
 mod guard;

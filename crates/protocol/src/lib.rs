@@ -160,6 +160,17 @@ pub enum Command {
     /// The kill switch. Off, every agent is refused anything but reading,
     /// and their running requests are cancelled. Only a person may switch it.
     SetAgents { allowed: bool },
+    /// Compare two finished requests' responses: status, headers, body.
+    /// `ignore` adds patterns to the default noisy ones (see
+    /// [`ResponseDiff::patterns`]), or replaces them with `no_defaults`.
+    Diff {
+        a: u64,
+        b: u64,
+        #[serde(default)]
+        ignore: Vec<String>,
+        #[serde(default)]
+        no_defaults: bool,
+    },
     /// The rules the workspace's policy gives agents, for `tracer policy`.
     /// An agent asking is told its own.
     Policy,
@@ -244,6 +255,86 @@ impl Timing {
         let before = self.dns_ms.unwrap_or(0.0) + self.connect_ms.unwrap_or(0.0) + self.tls_ms.unwrap_or(0.0);
         (self.ttfb_ms - before).max(0.0)
     }
+}
+
+/// How two responses differ, `a` being the earlier one asked about.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseDiff {
+    pub a: DiffSide,
+    pub b: DiffSide,
+    /// By header name, lowercased.
+    pub headers: Vec<Change>,
+    pub body: BodyDiff,
+    /// Where the two differed but a pattern said to ignore it: nothing is
+    /// left out without saying so.
+    pub ignored: Vec<String>,
+    /// The patterns in force. `$.meta.time` (a path, `*` for any one key or
+    /// index) ignores what's under it; a bare key such as `updatedAt`, that
+    /// key at any depth; `header:x-amzn-*`, headers (a trailing `*` matches
+    /// any ending).
+    pub patterns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffSide {
+    pub request_id: u64,
+    pub method: String,
+    pub url: String,
+    pub status: u16,
+}
+
+/// One difference: at a JSON path such as `$.data[3].name`, or a header.
+/// Values are compact JSON, or a header's text, cut to a few hundred bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    pub at: String,
+    pub kind: ChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Changed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BodyDiff {
+    /// No difference, ignored ones aside.
+    Same,
+    /// Both bodies are JSON: what changed, by path, and how many more past
+    /// the ones listed. Objects compare by key, arrays by position.
+    Json { changes: Vec<Change>, more: u64 },
+    /// Line by line, the changes with a little context, `gap` between hunks.
+    Text { lines: Vec<DiffLine>, more: u64 },
+    /// Too long to compare line by line.
+    TooLarge { a_lines: u64, b_lines: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub op: LineOp,
+    /// Line numbers in each body, from 1, where the line is in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineOp {
+    Same,
+    Removed,
+    Added,
+    Gap,
 }
 
 /// What an agent may do, from [`POLICY_PATH`]: the rules for every agent
@@ -462,6 +553,7 @@ pub enum ReplyBody {
     EnvironmentSaved { name: String },
     EnvironmentDeleted,
     SecretSet,
+    Diff { diff: ResponseDiff },
     /// The rules for every agent first, then by name; for an agent, only
     /// the rules it gets. `error` says why the policy file was not taken,
     /// in which case the rules are the last ones that were.

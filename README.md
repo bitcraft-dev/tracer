@@ -27,6 +27,7 @@ tracer core -w <dir>                 # run the core for a workspace
 tracer watch -w <dir> [--all]        # follow what every client does, live
 tracer send GET https://… -w <dir>   # send a request, print its answer and
                                      # where its time went (DNS, connect, TLS, wait)
+tracer diff 12 15 -w <dir>           # how two responses differ, noise aside
 tracer status -w <dir>               # who is connected
 ```
 
@@ -67,7 +68,7 @@ claude mcp add tracer -- "<repo>/target/debug/tracer.exe" mcp -w <dir>
 
 The agent gets `list_requests`, `list_environments`, `send_request`,
 `run_saved_request`, `rerun_request`, `read_history`, `get_response`,
-`save_request`, `read_policy` and `cancel_request`. What it does shows in the window as
+`save_request`, `diff_responses`, `read_policy` and `cancel_request`. What it does shows in the window as
 its own, live. The guardrails, held by the core:
 
 - By default, an agent's request other than `GET`, `HEAD` or `OPTIONS`, or

@@ -14,6 +14,7 @@
 //! tracer watch [--all | --since N]  print events as they happen
 //! tracer history [TEXT]             past requests, newest first, filtered
 //! tracer rerun <ID>                 send a past request again, as written
+//! tracer diff <A> <B>               how two responses differ, noise aside
 //! tracer cancel <ID>                cancel a running request, whoever sent it
 //! tracer approve <ID> / deny <ID>   answer an agent's request waiting for a person
 //! tracer agents on|off              the kill switch for agents
@@ -32,7 +33,7 @@ use std::process::ExitCode;
 
 use tracer_protocol::client::Client;
 use tracer_protocol::{
-    Access, AgentRules, ApproveWhen, ClientKind, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
+    Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
     Discovery, SavedRequest, StatusClass, Timing, DISCOVERY_PATH,
 };
 
@@ -62,6 +63,12 @@ usage:
   tracer rerun <ID> [--env <NAME> | --no-env]
                                       send a past request again as it was written,
                                       with its environment unless told otherwise
+  tracer diff <A> <B> [--ignore <PATTERN>]... [--all]
+                                      how two past responses differ: status,
+                                      headers, body (JSON by path, else by line);
+                                      noisy headers and keys (Date, timestamp, …)
+                                      are ignored and listed unless --all.
+                                      PATTERN: $.path[*].key, a bare key, header:name*
   tracer cancel <ID>                  cancel a running request, whoever sent it
   tracer approve <ID>                 allow an agent's request that waits for a person
   tracer deny <ID>                    refuse it
@@ -96,6 +103,7 @@ fn main() -> ExitCode {
         Some("watch") => watch(workspace, args[1..].to_vec()),
         Some("history") => history(workspace, args[1..].to_vec()),
         Some("rerun") => rerun(workspace, args[1..].to_vec()),
+        Some("diff") => diff(workspace, args[1..].to_vec()),
         Some("cancel") => cancel(workspace, args[1..].to_vec()),
         Some("approve") => decide(workspace, args[1..].to_vec(), true),
         Some("deny") => decide(workspace, args[1..].to_vec(), false),
@@ -326,6 +334,98 @@ fn rerun(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let [id] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
     let request_id = id.trim_start_matches('#').parse().map_err(|_| io::Error::other(format!("`{id}` is not a request id")))?;
     send_and_wait(&workspace, Command::Rerun { request_id, env }, "tracer rerun")
+}
+
+fn diff(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let mut ignore = Vec::new();
+    while let Some(p) = take_value(&mut args, "--ignore") {
+        ignore.push(p);
+    }
+    let no_defaults = match args.iter().position(|a| a == "--all") {
+        Some(at) => {
+            args.remove(at);
+            true
+        }
+        None => false,
+    };
+    let [a, b] = <[String; 2]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let id = |s: &str| s.trim_start_matches('#').parse::<u64>().map_err(|_| io::Error::other(format!("`{s}` is not a request id")));
+    let (a, b) = (id(&a)?, id(&b)?);
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer diff")?;
+    let d = match client.call(Command::Diff { a, b, ignore, no_defaults })? {
+        Ok(ReplyBody::Diff { diff }) => diff,
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    for s in [&d.a, &d.b] {
+        println!("#{:<5} {} {} → {}", s.request_id, s.method, s.url, s.status);
+    }
+    let mut same = true;
+    if d.a.status != d.b.status {
+        same = false;
+        println!("status   {} → {}", d.a.status, d.b.status);
+    }
+    for c in &d.headers {
+        same = false;
+        println!("header   {}", change_line(c));
+    }
+    match &d.body {
+        BodyDiff::Same => {}
+        BodyDiff::Json { changes, more } => {
+            same = false;
+            println!("body     JSON, {} change{}", changes.len() as u64 + more, if changes.len() as u64 + more == 1 { "" } else { "s" });
+            for c in changes {
+                println!("  {}", change_line(c));
+            }
+            if *more > 0 {
+                println!("  … and {more} more");
+            }
+        }
+        BodyDiff::Text { lines, more } => {
+            same = false;
+            println!("body     text, by line");
+            for l in lines {
+                match l.op {
+                    LineOp::Same => println!("  {:>5} {:>5}   {}", num(l.a), num(l.b), l.text),
+                    LineOp::Removed => println!("  {:>5} {:>5} - {}", num(l.a), "", l.text),
+                    LineOp::Added => println!("  {:>5} {:>5} + {}", "", num(l.b), l.text),
+                    LineOp::Gap => println!("  {:>5} {:>5}   …", "", ""),
+                }
+            }
+            if *more > 0 {
+                println!("  … and {more} more lines");
+            }
+        }
+        BodyDiff::TooLarge { a_lines, b_lines } => {
+            same = false;
+            println!("body     differs; {a_lines} and {b_lines} lines are too many to compare by line");
+        }
+    }
+    if same {
+        println!("the same{}", if d.ignored.is_empty() { "" } else { ", noise aside" });
+    }
+    if !d.ignored.is_empty() {
+        println!("ignored  {}", d.ignored.join(", "));
+    }
+    Ok(if same { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+fn num(n: Option<u64>) -> String {
+    n.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// `~ $.a: 1 → 2`, `+ $.b: true`, `- $.c: null`.
+fn change_line(c: &Change) -> String {
+    match c.kind {
+        ChangeKind::Changed => format!(
+            "~ {}: {} → {}",
+            c.at,
+            c.before.as_deref().unwrap_or_default(),
+            c.after.as_deref().unwrap_or_default()
+        ),
+        ChangeKind::Added => format!("+ {}: {}", c.at, c.after.as_deref().unwrap_or_default()),
+        ChangeKind::Removed => format!("- {}: {}", c.at, c.before.as_deref().unwrap_or_default()),
+    }
 }
 
 /// `<METHOD> <URL> [-H 'Name: value']... [-d <body>]`.

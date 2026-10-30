@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, Command, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+    Access, Actor, Command, DiffSide, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::{envs, guard, http};
+use crate::{diff, envs, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -156,6 +156,24 @@ pub fn serve(
             }
             (Some((_, actor)), Command::SetAgents { allowed }) => {
                 hub.set_agents(actor.clone(), allowed).map(|_| ReplyBody::AgentsSwitched)
+            }
+            (Some(_), Command::Diff { a, b, ignore, no_defaults }) => {
+                let side = |id: u64| match hub.response(id) {
+                    Some((entry, Some(response))) => Ok((
+                        DiffSide {
+                            request_id: id,
+                            method: entry.request.method,
+                            url: entry.request.url,
+                            status: response.status,
+                        },
+                        response,
+                    )),
+                    Some(_) => Err(format!("request #{id} has no response to compare")),
+                    None => Err(format!("there is no request #{id} in the history")),
+                };
+                side(a).and_then(|a| side(b).map(|b| (a, b))).map(|((sa, ra), (sb, rb))| ReplyBody::Diff {
+                    diff: diff::compare((sa, &ra), (sb, &rb), &ignore, !no_defaults),
+                })
             }
             (Some((_, actor)), Command::Policy) => {
                 let (rules, error) = hub.policy(actor);

@@ -282,6 +282,21 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             };
             Ok(json!({ "path": path, "file": format!("requests/{path}.http") }))
         }
+        "diff_responses" => {
+            let id = |name: &str| {
+                args.get(name).and_then(Value::as_u64).ok_or_else(|| format!("`{name}` (a request number) is required"))
+            };
+            let ignore: Vec<String> = match args.get("ignore") {
+                Some(Value::Array(list)) => list.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                Some(Value::String(one)) => vec![one.clone()],
+                _ => Vec::new(),
+            };
+            let no_defaults = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+            let ReplyBody::Diff { diff } = call(core, Command::Diff { a: id("a")?, b: id("b")?, ignore, no_defaults })? else {
+                return Err(unexpected());
+            };
+            serde_json::to_value(diff).map_err(|e| e.to_string())
+        }
         "read_policy" => {
             let ReplyBody::Policy { rules, error } = call(core, Command::Policy)? else {
                 return Err(unexpected());
@@ -633,6 +648,21 @@ fn tools() -> Value {
                 },
                 "required": ["path", "url"],
             },
+        },
+        {
+            "name": "diff_responses",
+            "description": "How two past responses differ: status, headers, and the body (JSON compared as values and named by path, such as $.data[3].name; anything else line by line). Headers and keys that change on every call (Date, ETag, request ids, timestamp, …) are ignored by default, and every difference ignored is listed in `ignored`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": id,
+                    "b": id,
+                    "ignore": { "type": "array", "items": { "type": "string" }, "description": "More to ignore: a path ($.meta.time, $.items[*].id), a bare key anywhere (updatedAt), or header:name (a trailing * matches any ending)." },
+                    "all": { "type": "boolean", "description": "Don't ignore the default noisy headers and keys." },
+                },
+                "required": ["a", "b"],
+            },
+            "annotations": { "readOnlyHint": true },
         },
         {
             "name": "read_policy",

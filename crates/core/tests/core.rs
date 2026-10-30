@@ -1175,3 +1175,29 @@ fn a_finished_request_says_where_its_time_went() {
     assert!(dns + connect <= t.ttfb_ms && t.ttfb_ms <= t.total_ms, "{t:?}");
     core.stop();
 }
+
+#[test]
+fn two_responses_are_compared_by_value_and_an_agent_may_ask() {
+    use tracer_protocol::{BodyDiff, ChangeKind};
+    let ws = workspace("diff");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "test").unwrap();
+    cli.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut ids = Vec::new();
+    for path in ["a", "b"] {
+        let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("{base}/{path}"))).unwrap() else { panic!() };
+        end_of(&mut cli, request_id);
+        ids.push(request_id);
+    }
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    let ask = |a, b, ignore: &[&str]| Command::Diff { a, b, ignore: ignore.iter().map(|s| s.to_string()).collect(), no_defaults: false };
+    let Ok(ReplyBody::Diff { diff }) = agent.call(ask(ids[0], ids[1], &[])).unwrap() else { panic!() };
+    let BodyDiff::Json { changes, .. } = diff.body else { panic!("{:?}", diff.body) };
+    assert_eq!((changes[0].at.as_str(), changes[0].kind), ("$.path", ChangeKind::Changed));
+    assert_eq!(changes[0].after.as_deref(), Some("\"/b\""));
+    let Ok(ReplyBody::Diff { diff }) = agent.call(ask(ids[0], ids[1], &["path"])).unwrap() else { panic!() };
+    assert_eq!((diff.body, diff.ignored), (BodyDiff::Same, vec!["$.path".to_string()]));
+    assert!(agent.call(ask(ids[0], 999, &[])).unwrap().unwrap_err().contains("no request #999"));
+    core.stop();
+}

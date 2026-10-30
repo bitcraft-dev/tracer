@@ -315,13 +315,24 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   44 tests, three runs clean. Driven: https://example.com spent 15,205 ms
   of 16,646 in connect, which is this network's lost SYNs in one line.
 
+- **Phase 4: response diff** (`crates/core/src/diff.rs`). `Command::Diff
+  { a, b, ignore, no_defaults }`: status, headers by name, and the body,
+  JSON as values (key order and spacing don't count; arrays by position;
+  each change by path, `$.items[2]`), anything else by line (LCS, two
+  lines of context, `gap` between hunks; past 4M line pairs, "too large").
+  Ignore patterns: `$.path[*].key` (and what's under it), a bare key
+  anywhere, `header:name*`; defaults for Date, ETag, request/trace ids,
+  `timestamp`, `requestId` and the like; every difference ignored is
+  listed. CLI `tracer diff A B [--ignore P]... [--all]` (exit 1 when they
+  differ, for CI); MCP `diff_responses`. 48 tests. The window's view of it
+  waits for the viewer branch (AW-037).
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Phase 4, what doesn't need the viewer first: response diff (ignoring
-   noisy fields, core side), assertions and flows, then benchmarking (with
+2. Phase 4, what doesn't need the viewer first: assertions and flows, then benchmarking (with
    bench-size caps in the policy), then realtime and GraphQL.
 3. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
