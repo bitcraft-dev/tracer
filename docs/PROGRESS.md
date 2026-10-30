@@ -107,24 +107,35 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
     `Send` takes an env; the core fills `{{name}}` just before sending and
     fails the request naming any variable that's missing. Events keep the
     request as written plus the env's name. CLI `env`, `--env`.
-  - **Window, written and `rux check`-clean but not yet driven** (uncommitted
-    `app/`): Collections section with open/save/save-as/new/delete, unsaved
-    dot, live follow of others' saves (dev's edits win on conflict); the
+  - **Disk watching** (36f0640): the core rescans `requests/` and
+    `environments/` every second and publishes changes as actor kind `disk`;
+    its own writes aren't echoed; half-written files wait until they parse.
+  - **Window** (c2b710c), driven against Rux a2c986b: Collections with
+    open/save (Ctrl+S, save-as prompt)/new/delete and an unsaved dot;
     environment picker heading the sidebar, env on send, env tags in history,
-    env in the status bar. **Blocked on building**: the Rux checkout has
-    half-done work (`interp/json.rs`, 9 files) that doesn't compile, and
-    `rux run` builds Rux from it.
+    env in the status bar; an outside save to the open request is followed
+    with no local edits ("updated by disk · disk") and kept out with a notice
+    when there are (dev wins). Hot reload re-subscribes from 0; events at or
+    below the last seq are dropped. `color-scheme: dark` on the root.
+  - Findings: **AW-027** (an effect that empties a signal it reads is never
+    woken by it again: only the first outside change reaches the editor per
+    page load), **AW-028** (a reloaded page re-reads the channel's last
+    list). **AW-019 and AW-020 verified fixed at runtime** (800250d,
+    a2c986b); the installed `rux check` is older and still refuses the
+    AW-019 `computed`.
 
 ### Next
 
-1. When the Rux checkout is clean: rebuild the window, drive saved requests
-   and environments, commit `app/`. Re-check AW-019 against Rux 800250d ("A
-   computed can read a native signal on the first run"): if fixed, move
-   `connected()` back to a `computed` and close the finding.
-2. Watching files: an agent or `git pull` changing `requests/` or
-   `environments/` behind the core isn't seen until a list is asked for.
-3. Secrets: a git-ignored vault for values agents must never see.
-4. Variable preview under the URL bar (needs `replaceAll`, AW-020).
+1. When the user installs the new Rux build: move `connected()` back to a
+   `computed` and close AW-019; go through AW-020's list under `rux check`;
+   re-test AW-027 when they say it's fixed (the window's live follow).
+2. Variable preview under the URL bar (`replaceAll` now exists, a2c986b).
+3. Secrets: a git-ignored vault for values agents must never see; agents see
+   `{{token}}`, never the value.
+4. Editing environments in the window (the core has Save/DeleteEnvironment).
+5. Small: the Collections `+` doesn't sit at the right edge
+   (`margin-left: auto` on a `<view>` in the header); the title row's notice
+   is cut short in a narrow window.
 3. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
    Open leads for them: a frame that loads or clears 1k rows still costs up to
    2 s in debug, clear costs more than load, and a list's scroll cost is
@@ -191,6 +202,9 @@ Things that cost a round trip once. Check here before debugging them again.
   `Get-Process rux` when done.
 - `rux run` sometimes exits with code 127 and no message while its window
   keeps running; hot reload still works (the window watches the files).
+- **`rux run` launches the window even after a failed build**: it waits for
+  a change under `native/`, rebuilds, and launches. If Rux's checkout is
+  mid-edit the first build fails; check `git status` there first.
 - **A dev build's hot reload runs `unmounted` and then `mounted`.** Rust
   statics survive it. Don't put "the window is closing" work in `unmounted`;
   use `@close`.
