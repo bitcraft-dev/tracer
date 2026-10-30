@@ -1,0 +1,453 @@
+<!-- Tracer's window, Phase 1: a client of the workspace's core, like the CLI.
+     It holds nothing about requests that the core did not tell it: history,
+     responses and who is connected are all built from the core's event
+     stream, so a request sent by `tracer send` shows up here as well. -->
+<template>
+  <screen class="app" @key="onKey(event)" @close="onClose()">
+    <view class="main">
+      <view class="rail">
+        <text class="logo">T</text>
+        <view class="rail-item on"><text class="rail-label">REST</text></view>
+      </view>
+
+      <view class="side">
+        <view class="side-h">
+          <text class="side-title">History</text>
+          <text class="count">{{ requests.length }}</text>
+        </view>
+        <view class="history">
+          <text class="empty" r-if="requests.length == 0">Nothing yet. Send a request, or run tracer send in this workspace.</text>
+          <view
+            class="row"
+            r-for="r in history"
+            r-key="r.id"
+            :class="{ on: r.id == selected }"
+            @tap="selected = r.id">
+            <view class="row-top">
+              <text class="m" :style="`color: ${methodColor(r.method)}`">{{ r.method }}</text>
+              <text class="row-url">{{ r.url }}</text>
+            </view>
+            <view class="row-bottom">
+              <text class="st" :style="`color: ${statusColor(r)}`">{{ statusText(r) }}</text>
+              <text class="who">{{ r.actorKind }} · {{ r.actor }}</text>
+            </view>
+          </view>
+        </view>
+      </view>
+
+      <view class="work">
+        <view class="bar">
+          <view class="method">
+            <input type="select" r-model="method" :options="methods" />
+          </view>
+          <view class="url">
+            <input r-model="url" placeholder="https://…" />
+          </view>
+          <view class="send" :class="{ off: !connected() }" @tap="send()">
+            <text class="send-label">Send</text>
+          </view>
+        </view>
+
+        <view class="tabs">
+          <view class="tab" :class="{ on: reqTab == &quot;body&quot; }" @tap="reqTab = &quot;body&quot;">
+            <text class="tab-label">Body</text>
+          </view>
+          <view class="tab" :class="{ on: reqTab == &quot;headers&quot; }" @tap="reqTab = &quot;headers&quot;">
+            <text class="tab-label">Headers</text>
+            <text class="badge" r-if="sentHeaders().length > 0">{{ sentHeaders().length }}</text>
+          </view>
+        </view>
+        <view class="editor">
+          <input r-if="reqTab == &quot;body&quot;" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
+          <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
+        </view>
+        <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
+
+        <view class="res">
+          <text class="empty" r-if="sel == none">Pick a request in History, or send one.</text>
+          <view class="res-in" r-if="sel != none">
+            <view class="res-h">
+              <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
+              <text class="res-url">{{ sel.url }}</text>
+            </view>
+            <view class="chips">
+              <text class="chip" :style="`color: ${statusColor(sel)}`">{{ statusText(sel) }}</text>
+              <text class="chip" r-if="sel.state == &quot;done&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
+              <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
+              <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
+              <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
+            </view>
+            <view class="tabs">
+              <view class="tab" :class="{ on: resTab == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
+                <text class="tab-label">Body</text>
+              </view>
+              <view class="tab" :class="{ on: resTab == &quot;headers&quot; }" @tap="resTab = &quot;headers&quot;">
+                <text class="tab-label">Headers</text>
+                <text class="badge">{{ sel.resHeaders.length }}</text>
+              </view>
+            </view>
+            <view class="pane">
+              <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
+              <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
+              <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
+              <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
+                <text class="hdr-n">{{ h.name }}</text>
+                <text class="hdr-v">{{ h.value }}</text>
+              </view>
+            </view>
+          </view>
+        </view>
+      </view>
+    </view>
+
+    <view class="status">
+      <text class="dot" :style="`color: ${linkColor()}`">●</text>
+      <text class="status-t">{{ linkText() }}</text>
+      <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
+      <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
+    </view>
+  </screen>
+</template>
+
+<style>
+  * { box-sizing: border-box; }
+
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: #141414;
+    font-family: sans-serif;
+    color: #d4d4d4;
+  }
+
+  .main { flex: 1; display: flex; min-height: 0; }
+
+  .rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    width: 64px;
+    padding: 12px 0;
+    background: #181818;
+    border-right: 1px solid #262626;
+  }
+  .logo { color: #7c6cf0; font-size: 18px; font-weight: 700; padding-bottom: 10px; }
+  .rail-item { padding: 8px 6px; border-radius: 6px; }
+  .rail-item.on { background: #2b2540; }
+  .rail-label { color: #e0e0e0; font-size: 11px; font-weight: 700; }
+
+  .side {
+    display: flex;
+    flex-direction: column;
+    width: 300px;
+    background: #1b1b1b;
+    border-right: 1px solid #262626;
+  }
+  .side-h { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px 14px; }
+  .side-title { color: #f0f0f0; font-size: 13px; font-weight: 700; }
+  .count { color: #8a8a8a; font-size: 11px; padding: 1px 6px; background: #262626; border-radius: 8px; }
+  .history { flex: 1; display: flex; flex-direction: column; gap: 2px; padding: 0 8px 8px 8px; overflow-y: auto; }
+  .empty { color: #6a6a6a; font-size: 12px; padding: 8px; }
+
+  .row { display: flex; flex-direction: column; gap: 3px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+  .row:hover { background: #232323; }
+  .row.on { background: #2b2540; }
+  .row-top { display: flex; gap: 8px; }
+  .row-bottom { display: flex; gap: 8px; }
+  .m { font-size: 11px; font-weight: 700; font-family: monospace; width: 52px; }
+  .row-url { flex: 1; color: #d4d4d4; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .st { font-size: 11px; font-family: monospace; width: 52px; }
+  .who { color: #7a7a7a; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .work { flex: 1; display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; min-width: 0; }
+
+  .bar { display: flex; gap: 8px; align-items: center; }
+  .method, .url {
+    display: flex;
+    align-items: center;
+    height: 38px;
+    padding: 0 10px;
+    background: #1b1b1b;
+    border: 1px solid #2e2e2e;
+    border-radius: 6px;
+  }
+  .method { width: 120px; }
+  .url { flex: 1; min-width: 0; }
+  .send { padding: 9px 26px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+  .send:hover { background: #8f81f5; }
+  .send.off { background: #3a3550; }
+  .send-label { color: #ffffff; font-size: 14px; font-weight: 700; }
+
+  .tabs { display: flex; gap: 18px; border-bottom: 1px solid #262626; }
+  .tab { display: flex; gap: 6px; align-items: center; padding: 6px 0; cursor: pointer; border-bottom: 2px solid #141414; }
+  .tab.on { border-bottom: 2px solid #7c6cf0; }
+  .tab-label { color: #9a9a9a; font-size: 13px; }
+  .tab.on .tab-label { color: #f0f0f0; }
+  .badge { color: #9a9a9a; font-size: 10px; padding: 0 5px; background: #262626; border-radius: 6px; }
+
+  .editor { height: 110px; display: flex; flex-direction: column; padding: 8px 10px; background: #1b1b1b; border: 1px solid #2e2e2e; border-radius: 6px; }
+  .error { color: #f0716c; font-size: 12px; font-family: monospace; }
+
+  .res { flex: 1; display: flex; flex-direction: column; min-height: 0; border-top: 1px solid #262626; padding-top: 10px; }
+  .res-in { flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .res-h { display: flex; gap: 8px; align-items: center; }
+  .res-url { color: #c8c8c8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { padding: 3px 9px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
+
+  .pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    background: #0e0e0e;
+    border: 1px solid #262626;
+    border-radius: 6px;
+    overflow-y: auto;
+  }
+  .mono { color: #d4d4d4; font-size: 12px; font-family: monospace; white-space: pre-wrap; }
+  .mono.err { color: #f0716c; }
+  .dim { color: #6a6a6a; }
+  .hdr { display: flex; gap: 12px; }
+  .hdr-n { color: #9d8ff5; font-size: 12px; font-family: monospace; width: 220px; }
+  .hdr-v { flex: 1; color: #d4d4d4; font-size: 12px; font-family: monospace; }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 26px;
+    padding: 0 12px;
+    background: #181818;
+    border-top: 1px solid #262626;
+  }
+  .dot { font-size: 10px; }
+  .status-t { color: #b0b0b0; font-size: 11px; white-space: nowrap; }
+  .status-t.dim { flex: 1; min-width: 0; color: #6a6a6a; overflow: hidden; text-overflow: ellipsis; }
+</style>
+
+<script>
+  use native::tracer;
+  use type native::tracer::CoreEvent;
+  use type native::tracer::Header;
+
+  // One request as the core described it: started, then finished or failed.
+  type Row = {
+    id: int,
+    method: string,
+    url: string,
+    actor: string,
+    actorKind: string,
+    state: string,
+    status: int,
+    ttfbMs: float,
+    totalMs: float,
+    size: int,
+    body: string,
+    resHeaders: Header[],
+    error: string
+  };
+
+  type Client = { client: int, actor: string, actorKind: string };
+
+  let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+  let method = signal("GET");
+  let url = signal("https://jsonplaceholder.typicode.com/todos/1");
+  let body = signal("");
+  let headerText = signal("Accept: application/json");
+  let reqTab = signal("body");
+  let resTab = signal("body");
+  let error = signal("");
+
+  let requests: Row[] = signal([]);
+  let clients: Client[] = signal([]);
+  let selected = signal(0);
+  let lastSeq = signal(0);
+
+  computed history = requests.sort((a, b) => b.id - a.id);
+  computed sel = requests.find(r => r.id == selected);
+
+  mounted {
+    connect();
+  }
+
+  async fn connect() {
+    error = "";
+    try {
+      await tracer.connect(tracer.defaultWorkspace());
+    } catch e {
+      error = `could not reach the core: ${e.message}`;
+    }
+  }
+
+  // Every event the core publishes arrives here once, in the core's order,
+  // replayed from the start of the journal when the window opens.
+  effect {
+    for e in tracer.events {
+      lastSeq = e.seq;
+      if e.kind == "request_started" {
+        requests.push({
+          id: e.requestId,
+          method: e.method,
+          url: e.url,
+          actor: e.actor,
+          actorKind: e.actorKind,
+          state: "running",
+          status: 0,
+          ttfbMs: 0.0,
+          totalMs: 0.0,
+          size: 0,
+          body: "",
+          resHeaders: [],
+          error: ""
+        });
+      } else if e.kind == "request_finished" || e.kind == "request_failed" {
+        requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
+      } else if e.kind == "client_joined" {
+        clients.push({ client: e.client, actor: e.actor, actorKind: e.actorKind });
+      } else if e.kind == "client_left" {
+        clients = clients.filter(c => c.client != e.client);
+      } else if e.kind == "core_stopping" {
+        clients = [];
+      }
+    }
+  }
+
+  fn settle(r: Row, e: CoreEvent): Row {
+    let out = r;
+    if e.kind == "request_failed" {
+      out.state = "failed";
+      out.error = e.error;
+    } else {
+      out.state = "done";
+      out.status = e.status;
+      out.ttfbMs = e.ttfbMs;
+      out.totalMs = e.totalMs;
+      out.size = e.size;
+      out.body = e.body;
+      out.resHeaders = e.headers;
+    }
+    out
+  }
+
+  fn send() {
+    if !connected() {
+      error = "not connected to a core";
+      return;
+    }
+    error = "";
+    try {
+      selected = tracer.send(method, url, sentHeaders(), body);
+      resTab = "body";
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  // `Name: value` lines; blank lines and lines with no colon are skipped.
+  fn sentHeaders(): Header[] {
+    let out: Header[] = [];
+    for line in headerText.split("\n") {
+      let at = line.indexOf(":");
+      if at > 0 {
+        out.push({ name: line.slice(0, at).trim(), value: line.slice(at + 1).trim() });
+      }
+    }
+    out
+  }
+
+  fn shownBody(r: Row): string {
+    if r.body == "" {
+      "(empty body)"
+    } else if r.body.length < r.size {
+      `${r.body}\n\n… showing the first 64 KiB of ${size(r.size)}`
+    } else {
+      r.body
+    }
+  }
+
+  fn statusText(r: Row): string {
+    if r.state == "running" { "…" } else if r.state == "failed" { "failed" } else { `${r.status}` }
+  }
+
+  fn statusColor(r: Row): string {
+    if r.state == "running" {
+      "#8a8a8a"
+    } else if r.state == "failed" || r.status >= 500 {
+      "#f0716c"
+    } else if r.status >= 400 {
+      "#e8a54b"
+    } else {
+      "#4ec98f"
+    }
+  }
+
+  fn methodColor(m: string): string {
+    if m == "GET" {
+      "#4ec98f"
+    } else if m == "POST" {
+      "#e8a54b"
+    } else if m == "PUT" || m == "PATCH" {
+      "#5aa8f0"
+    } else if m == "DELETE" {
+      "#f0716c"
+    } else {
+      "#b09cf5"
+    }
+  }
+
+  fn size(n: int): string {
+    if n < 1024 {
+      `${n} B`
+    } else if n < 1024 * 1024 {
+      `${n / 1024}.${(n * 10 / 1024) % 10} KB`
+    } else {
+      `${n / (1024 * 1024)}.${(n * 10 / (1024 * 1024)) % 10} MB`
+    }
+  }
+
+  // A function, not a `computed`: a computed can't read a native signal
+  // (FINDINGS.md AW-019).
+  fn connected(): bool {
+    (tracer.link?.state ?? "") == "connected"
+  }
+
+  fn linkText(): string {
+    let l = tracer.link;
+    if l == none {
+      "starting"
+    } else if l.state == "connected" {
+      let who = if l.startedCore { "started by this window" } else { "already running" };
+      `core connected · ${who}`
+    } else if l.detail != "" {
+      `core ${l.state}: ${l.detail}`
+    } else {
+      `core ${l.state}`
+    }
+  }
+
+  fn linkColor(): string {
+    let s = tracer.link?.state ?? "";
+    if s == "connected" { "#4ec98f" } else if s == "connecting" || s == "" { "#e8a54b" } else { "#f0716c" }
+  }
+
+  fn onKey(e: KeyEvent) {
+    if e.primary && e.key == "Enter" {
+      send();
+      return false;
+    }
+  }
+
+  // The window owns the core when it started it: stop it on the way out.
+  fn onClose() {
+    tracer.close("window closed");
+    true
+  }
+
+  unmounted {
+    tracer.close("window closed");
+  }
+</script>

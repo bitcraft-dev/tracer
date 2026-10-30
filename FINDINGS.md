@@ -424,6 +424,159 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   virtualised list). Selector matching has the same per-row shape.
 - **Status:** fixed in Rux 3c28c9d (pushed, installed `rux` is at a27366f). Two causes. A frame that only scrolled laid the whole tree out again; the layout now keeps the last frame's laid-out tree and, when the document's revision, the window size and the `content-visibility` answers are unchanged, only re-places it at the new offsets. And a debug build ran Rux's own proofs on every frame and every list change: each kept layout laid out again whole, each list built alone rebuilt with the whole document. Those were the 414 ms and the ~9 s sync freeze; they are now off in an app's window (`RUX_SELF_CHECK=1` turns them back on). Driven on probe 2 in its debug build: layout **13.4 ms** a scrolled frame (was 414), 40 notches **2.5 s** of CPU (was 29 s), loading 1k lines 2.0 s of CPU with `patch` 0.77 s (was 10.3 s), **1k · sync Rust** never stops responding. A 1,000-row copy in a release build: 16.8 ms to 4.2 ms of layout a frame. Still linear in rows: the walk that places boxes visits every row each frame, so 10,000 rows cost about ten times as much. Found on the way and fixed in 881e8b0: a row scrolled out of a list took taps and hover meant for whatever it lay under. **Re-driven by Tracer on the pushed build (a27366f), 2026-10-29**, debug: 40 one-notch wheel events over 1,002 rows cost **1.8 s** of CPU (about 45 ms each), and the step measured before, 10 events of 10 notches, cost **0.75 s (was 7.8 s, about 10x)**. The window answers throughout and reaches line 1,002. Closed for Tracer at this size; 10k rows, still linear, untested. **Release build:** the 10 x 10-notch step costs **0.34 s** of CPU.
 
+## AW-019 A `computed` or top-level `let` that reads a native signal stops the document from loading
+
+- **Found:** 2026-10-30, the first page of Tracer's window (`app/app.rux`).
+- **Severity:** **blocker** for writing the window the obvious way; friction
+  once you know.
+- **Limit:** `computed connected = tracer.link?.state == "connected";`, where
+  `tracer.link` is a `#[rux::export] pub static LINK: rux::Signal<Link>`, fails
+  both `rux check` and the running app, which opens on nothing but the overlay:
+
+  ```
+  rux: app.rux failed to load
+  `native/tracer::link` is not defined; declare it in <script> as
+  `let native/tracer::link = signal(…)`, or check the spelling
+  ```
+
+  The docs say a native signal "holds `none` until Rust first sets it", and
+  that a check reads it as `none`. Neither happens here. The advice also names
+  the linked name (`native/tracer::link`) rather than what the author wrote
+  (`tracer.link`), and a `let` of that name is not even valid script.
+
+  What fails and what doesn't, all with `use native::tracer;`:
+
+  | read of a native signal | `rux check` and the app |
+  |---|---|
+  | `computed x = tracer.link;` | fails |
+  | `computed x = tracer.events.length;` (a `Channel`) | fails |
+  | `fn f() { tracer.link }` and `computed x = f();` | fails |
+  | `let y = tracer.link;` at the top level | fails |
+  | `effect { … tracer.link … }` | works |
+  | `{{ tracer.link?.workspace }}` in the template, or in a handler | works |
+  | `computed x = tracer.defaultWorkspace();` (a native *function*) | works |
+
+- **Root cause (Rux source, a27366f):** `build_engine_linked` in
+  `crates/rux-runtime/src/lib.rs` calls `builder.build(script)`, which ends in
+  `ir.init()` (`crates/rux-script/src/interp/mod.rs`): the top level runs and
+  every `computed` gets its first value there. Only after `build` returns does
+  it call `engine.provide_native_signals()`, which makes `native/<m>::<name>`
+  a global. So during the first run the name does not exist and rhai says
+  "Variable not found". The router's names don't hit this because they are
+  declared beforehand (`provided: ROUTER_SIGNALS…`); native signals are not.
+- **Reproduction:** any app with a native crate exporting a `rux::Signal` or
+  `rux::Channel`, and `computed x = <module>.<signal>;` in a page. `rux check`,
+  or `rux run`.
+- **Workaround:** read it from a plain `fn` that only the template and
+  handlers call, never a `computed`. Tracer does this for `connected`, which is
+  the same expression moved into a function, so nothing is hidden by it.
+- **Suggested fix:** put the native signals into the state before `ir.init()`
+  runs (their current value, or `none`, as the docs promise), as the router's
+  names are; and phrase the error with the name the author wrote.
+- **Status:** open.
+
+## AW-020 Script lacks everyday helpers, and two it has (`reverse`, `replace`) silently mutate and return nothing
+
+- **Found:** 2026-10-30, writing Tracer's window (history has to list newest
+  first).
+- **Severity:** friction now, and everyone will hit it. The two silent traps
+  are **bugs**: wrong answers with no error from `rux check` or the app.
+- **Limit:** the docs list JavaScript's names on arrays and strings and say
+  they "**return** a value and leave their receiver alone". Each one below was
+  run through `rux check` in a one-line page; the "passes" rows were also run
+  in the app and their results printed.
+
+  **Silent traps (pass the check, wrong at runtime):**
+
+  | written | JavaScript gives | Rux gives |
+  |---|---|---|
+  | `let r = a.reverse();` with `a = [1, 2, 3]` | `r` = `[3, 2, 1]` (and `a` reversed) | `r` = **`none`**, `a` = `[3, 2, 1]` |
+  | `let r = s.replace("a", "b");` with `s = "a-a"` | `r` = `"b-a"`, `s` unchanged | `r` = **`none`**, `s` = **`"b-b"`**: changed in place, and every match replaced |
+
+  These are rhai's in-place methods, the same trap the docs describe for
+  `trim`, which Rux shadowed. `{{ name.replace("-", " ") }}` renders blank.
+  (`reverse` mutating its receiver is JavaScript's behaviour too; returning
+  nothing is not.)
+
+  **Missing (an error in `rux check`):**
+
+  - arrays: `concat`, spread `[...a, x]`, `flat`, `flatMap`, `findLast`,
+    `lastIndexOf`, `at`, `fill`, `toReversed`, `toSorted`, `Array.from`
+  - strings: `padStart`, `padEnd`, `replaceAll`, `trimStart`, `trimEnd`, `at`
+  - numbers: `toFixed` (so `12.5 ms` or `1.4 KB` has to be built from integer
+    division and `%`)
+  - `Math` (`max`, `min`, `floor`, `abs`…), `Object.keys/values/entries`,
+    `JSON.stringify` / `JSON.parse`, `Date` (see also AW-009)
+
+  **Present and right:** `a + [4]` (a new array, `a` unchanged), `some`,
+  `every`, `findIndex`, `indexOf`, `slice(-1)`, `join`, `includes`,
+  `substring`, `m.keys()`, `m.values()`, and `sort((a, b) => …)`, which returns
+  the sorted array.
+
+  An API tool needs most of these on day one: formatting sizes and times
+  (`toFixed`, `padStart`), building header lists (`concat` or spread),
+  newest-first history (`toReversed`), pretty-printing a body
+  (`JSON.stringify(v, none, 2)`), editing `{{var}}` templates (`replaceAll`).
+- **Reproduction:** a page with `<script> let a = [1, 2, 3]; let r =
+  a.reverse(); print(`${r} / ${a}`); </script>` prints ` / 3, 2, 1`.
+- **Workaround:** for now, `sort((x, y) => y.id - x.id)` instead of
+  `reverse`, `a + [x]` instead of spread, and integer division for decimals.
+  `replace` has none that is safe.
+- **Suggested fix:** shadow `reverse` and `replace` as `trim` was, with
+  JavaScript's answers (`replace` replacing the first match and returning the
+  new string), and have `rux check` flag the result of any in-place rhai method
+  being used. Then add the missing helpers under JavaScript's names, plus
+  `Math`, `JSON` and `Object.keys/values/entries`, since authors will reach
+  for them first.
+- **Status:** open.
+
+## AW-021 `&quot;` is decoded in an attribute but not inside `{{ }}` in text
+
+- **Found:** 2026-10-30, Tracer's status bar.
+- **Severity:** papercut.
+- **Limit:** `r-if="x != &quot;&quot;"` works, and so the habit carries over,
+  but `<text>{{ a ?? &quot;&quot; }}</text>` fails: "`&` cannot start an
+  expression". HTML (and Vue's compiler) decode entities in text too. Plain
+  `"` works in text, so it is only the inconsistency.
+- **Suggested fix:** decode entities in text interpolations as in attributes,
+  or have the error say "write `\"` here; `&quot;` is only for attributes".
+- **Status:** open.
+
+## AW-022 Every window holds about 490 MB of GPU memory, whatever it draws
+
+- **Found:** 2026-10-30, after a runaway of Tracer windows (Tracer's own bug)
+  exhausted the machine's commit limit at ~19 windows.
+- **Severity:** friction. On integrated GPUs that memory is system RAM, so a
+  text-and-boxes window costs about half a GB, and several Rux apps open at
+  once add up fast. Mava Studio will feel it more.
+- **Limit:** measured with Windows' per-process GPU counters
+  (`\GPU Process Memory(pid_N*)\Shared Usage`) on an AMD Radeon integrated
+  GPU (512 MB carve-out, 15.3 GB RAM), window 1280×800, idle:
+
+  | window | private | GPU shared | GPU dedicated | the rest |
+  |---|---|---|---|---|
+  | `tracer-probes.exe`, release | 543 MB | **488 MB** | 32 MB | ~55 MB |
+  | Tracer's window, debug | 586 MB | **488 MB** | 32 MB | ~98 MB |
+  | Tracer's core (no window) | 1 MB | — | — | 6 MB in RAM |
+
+  The GPU share is identical on two different pages, so it is fixed up front,
+  not driven by content. The frame buffers are ~4 MB each at this size.
+- **Likely cause (not proven):** vello 0.9's default scratch buffers are fixed
+  element counts (`vello_encoding/src/config.rs`, `BufferSizes::new`):
+  `ptcl` 1<<23, `tiles`/`lines`/`seg_counts`/`segments` 1<<21 each,
+  `blend_spill` 1<<20, `bin_data` 1<<18. That is roughly 170 MB by my
+  estimate of element sizes, and pooled buffers for frames in flight could
+  multiply it. Rux builds its renderer with `RendererOptions` defaults apart
+  from AA (`make_renderer` in `crates/rux-shell/src/lib.rs`).
+- **Reproduction:** start any Rux window, then in PowerShell:
+  `Get-Counter "\GPU Process Memory(pid_<id>*)\Shared Usage"`.
+- **Workaround:** none in an app.
+- **Suggested fix:** confirm where the 488 MB goes (a wgpu memory report, or
+  `RUX_PROFILE` printing GPU allocations); size vello's buffers from the
+  scene, starting small and growing on overflow, as newer vello versions
+  move toward; and say the per-window GPU cost in the docs.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,

@@ -1,0 +1,10 @@
+[app]
+name = "Tracer"
+id = "dev.ruxlang.tracer"
+version = "0.1.0"
+
+[window]
+width = 1280
+height = 800
+min-width = 900
+min-height = 600

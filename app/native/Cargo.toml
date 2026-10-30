@@ -1,0 +1,11 @@
+[package]
+name = "tracer-window-native"
+description = "The Rust half of Tracer's window: a client of the core, as the CLI and agents are."
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Patched in the workspace manifest to the local Rux checkout.
+rux = { package = "rux-native", version = "0.9.0-dev" }
+tracer-protocol = { path = "../../crates/protocol" }

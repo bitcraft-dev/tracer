@@ -5,7 +5,7 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-29, evening)
+## Where it stands (2026-10-30, morning)
 
 Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
 
@@ -46,17 +46,37 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
   Release build: 1k lines draw in 0.33 s of CPU, and 100 scroll notches cost
   0.34 s.
 
+- **Phase 1's window shell** (`app/`, uncommitted on 2026-10-30, along with
+  the core's `Shutdown` command, `tracer stop` and the protocol's `Shared`
+  client from the session before):
+  - `app/native/src/tracer.rs`: finds or starts the workspace's core, follows
+    its events from seq 0 onto a `rux::Channel` (`tracer.events`), the link
+    state on a signal (`tracer.link`), `send`, and `close`, which stops the
+    core if this window started it.
+  - `app/app.rux`: rail, history (newest first, who sent each), request bar
+    with Body/Headers tabs, response pane (status, TTFB, total, size, body,
+    headers), status bar. All of it is built from the core's events.
+  - Driven: a `tracer send` from the CLI appears live in the window; a send
+    from the window shows up as `window · USER`; closing the window stops its
+    core and removes `core.json` (0 processes left). 9 tests pass.
+  - Findings filed: **AW-019** (a `computed` or top-level `let` can't read a
+    native signal; root cause traced), **AW-020** (missing script helpers, and
+    `reverse`/`replace` silently mutate and return nothing), **AW-021**
+    (`&quot;` not decoded inside `{{ }}`).
+
 ### Next
 
-1. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
+1. Commit `app/` and the core changes once the user has looked.
+2. Window, next steps in Phase 1/2: method colours on the select, a
+   draggable split between request and response, Ctrl+K palette, and
+   history surviving a core restart (check whether a new core replays the old
+   journal to the window).
+3. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
    Open leads for them: a frame that loads or clears 1k rows still costs up to
    2 s in debug, clear costs more than load, and a list's scroll cost is
    linear in its rows (10k rows untested). Re-measure when they say something
    landed.
-2. **The window shell as a client of the core** (the rest of Phase 1). Its
-   native crate uses `tracer-protocol`'s blocking client, and core events
-   reach the page through a `rux::Channel` (now possible: AW-011).
-3. Phase 2 and after, on the non-Rux side, in this order:
+4. Phase 2 and after, on the non-Rux side, in this order:
    - requests and collections saved as plain files in the workspace;
    - an MCP bridge (`tracer mcp`) so an agent can drive Tracer;
    - a per-request timing breakdown (DNS, connect, TLS).
@@ -97,7 +117,26 @@ Things that cost a round trip once. Check here before debugging them again.
   own output, so redirect that to a file and read it there. An idle window
   paints nothing, so it prints nothing.
 
+- **The window's exe is `tracer.exe` too** (named after `rux.toml`'s app
+  name), the same as the CLI. On 2026-10-30 `tracer_bin()` found the window
+  itself "beside this program" and started it as the core, which did the
+  same: ~19 copies at 600 MB each before it was caught. Fixed: `tracer_bin()`
+  skips the running exe, and a core the window starts carries
+  `TRACER_STARTED_BY_WINDOW`, which refuses to start another. When launching
+  the window, set `TRACER_BIN` to `target/debug/tracer.exe` and run a
+  watchdog that kills `tracer` past 3 processes.
+- A `rux run` started with `( … &)` inside a Bash call dies when the call
+  ends. Use the tool's background mode.
+- An app with no `native/` crate runs inside `rux.exe`, so its process is
+  named `rux`, not after the app.
+
 ### Driving the window
+
+- **When the display is asleep, `drive.ps1 -Do shot` gives a black image**
+  (it copies the screen). `PrintWindow` with flag 3 asks the window for its
+  own pixels and works; a script for it was in the 2026-10-30 session's
+  scratchpad (`pw.ps1`). Worth folding into `drive.ps1` as `-Do print`.
+  Clicks still work with the display asleep.
 
 - Drive it yourself with `tools/drive.ps1` (`move`, `shot`, `click`, `drag`,
   `keys`, `rect`); don't hand the user a checklist. Process name:
@@ -136,6 +175,14 @@ Things that cost a round trip once. Check here before debugging them again.
   don't bind to it and expect history. See `docs/07-script.md`, "Channels from
   Rust", in the Rux checkout.
 - An exported signal's `T` needs `#[derive(Clone)]`.
+- **Don't read a native signal in a `computed` or a top-level `let`**
+  (AW-019); read it in a `fn` called from the template or a handler, or in an
+  `effect`.
+- `reverse()` and `replace()` return nothing and change their receiver
+  (AW-020). Use `sort((a, b) => b.id - a.id)` for newest first, and `a + [x]`
+  for spread.
+- In text, write `{{ x ?? "" }}` with plain quotes; `&quot;` is only for
+  attributes (AW-021).
 - Annotate event handler parameters (`fn onKey(e: KeyEvent)`,
   `DragEvent`, `TapEvent`, `SwipeEvent`; no `use` needed) or `rux check` warns.
 - Ruled out in Phase 0 as Tracer's own mistakes, not Rux's: a flex item grows
