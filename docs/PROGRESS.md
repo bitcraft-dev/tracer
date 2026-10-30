@@ -124,27 +124,32 @@ Branch `phase-1-core`, on top of `main`'s two commits. Nothing is pushed.
     a2c986b); the installed `rux check` is older and still refuses the
     AW-019 `computed`.
 
+  - **Secrets vault** (e7e4473): values in `.tracer/secrets/<env>.env`;
+    `.tracer/.gitignore` (`*`) keeps them, the journal and the token out of
+    git. Clients get secret names only; `SetSecret` is write-only. Values of
+    4+ characters that come back in a response are replaced by `{{name}}`
+    before publishing. CLI `secret set` (stdin) / `secret rm`.
+  - **Environments panel** (3934571): ⚙ beside the picker; edit variables,
+    set/remove secrets by name, create, delete. Lists afresh on open and
+    after its own changes. **URL preview** under the URL bar: filled from the
+    chosen env, secrets as dots, a warning for undefined variables.
+  - Findings: **AW-029** (an `async fn` an effect starts when a channel woke
+    it never returns from its `await`: an open panel misses changes made
+    elsewhere), **AW-030** (no fallback to Segoe UI Symbol: ✕ ▾ ▸ ⧉ ⌫ draw as
+    boxes; Tracer uses ×). The Rux team fixed AW-021 meanwhile (73ff9a7),
+    unverified.
+
 ### Next
 
 1. When the user installs the new Rux build: move `connected()` back to a
    `computed` and close AW-019; go through AW-020's list under `rux check`;
-   re-test AW-027 when they say it's fixed (the window's live follow).
-2. Variable preview under the URL bar (`replaceAll` now exists, a2c986b).
-3. Secrets: a git-ignored vault for values agents must never see; agents see
-   `{{token}}`, never the value.
-4. Editing environments in the window (the core has Save/DeleteEnvironment).
-5. Small: the Collections `+` doesn't sit at the right edge
-   (`margin-left: auto` on a `<view>` in the header); the title row's notice
-   is cut short in a narrow window.
-3. **Nothing blocks Phase 1's window now.** The Rux team is still optimising.
-   Open leads for them: a frame that loads or clears 1k rows still costs up to
-   2 s in debug, clear costs more than load, and a list's scroll cost is
-   linear in its rows (10k rows untested). Re-measure when they say something
-   landed.
-4. Phase 2 and after, on the non-Rux side, in this order:
-   - requests and collections saved as plain files in the workspace;
-   - an MCP bridge (`tracer mcp`) so an agent can drive Tracer;
-   - a per-request timing breakdown (DNS, connect, TLS).
+   verify AW-021; re-test AW-027 and AW-029 when they're fixed.
+2. Phase 2 remainder: history worth keeping (search, filter by actor or
+   status, re-run a past request into the editor).
+3. Phase 3: the local API and MCP bridge (`tracer mcp`), so an agent drives
+   Tracer; guardrails (approval prompt in the window for non-GET or `prod`).
+4. Small: the Collections `+` doesn't sit at the right edge; the title row's
+   notice is cut short; the preview cuts long URLs.
 
 ## Gotchas and how they were solved
 
