@@ -108,6 +108,25 @@
       <text class="status-t">{{ linkText() }}</text>
       <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
       <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
+      <text class="status-t key">Ctrl+K</text>
+    </view>
+
+    <view class="scrim" r-if="palette" @tap="closePalette()">
+      <view class="palette" @tap="noop()">
+        <view class="pal-field">
+          <input r-model="search" placeholder="Type a command…" autofocus @key="paletteKey(event)" />
+        </view>
+        <view
+          class="cmd"
+          r-for="(c, i) in hits"
+          r-key="c.id"
+          :class="{ on: i == pick }"
+          @tap="run(c.id)">
+          <text class="cmd-label">{{ c.label }}</text>
+          <text class="cmd-hint">{{ c.hint }}</text>
+        </view>
+        <text class="empty" r-if="hits.length == 0">No command matches</text>
+      </view>
     </view>
   </screen>
 </template>
@@ -235,6 +254,36 @@
     border-top: 1px solid #262626;
   }
   .dot { font-size: 10px; }
+  .status-t.key { color: #8a8a8a; padding: 1px 6px; background: #262626; border-radius: 4px; }
+
+  .scrim {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 90px;
+    background: rgba(0, 0, 0, 0.5);
+  }
+  .palette {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 540px;
+    padding: 10px;
+    background: #1e1e1e;
+    border: 1px solid #333333;
+    border-radius: 10px;
+  }
+  .pal-field { display: flex; align-items: center; height: 38px; padding: 0 10px; margin-bottom: 6px; background: #141414; border: 1px solid #2e2e2e; border-radius: 6px; }
+  .cmd { display: flex; align-items: center; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+  .cmd:hover { background: #262626; }
+  .cmd.on { background: #2b2540; }
+  .cmd-label { flex: 1; color: #d4d4d4; font-size: 13px; }
+  .cmd-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; }
   .status-t { color: #b0b0b0; font-size: 11px; white-space: nowrap; }
   .status-t.dim { flex: 1; min-width: 0; color: #6a6a6a; overflow: hidden; text-overflow: ellipsis; }
 </style>
@@ -277,6 +326,23 @@
   let reqHeight: float = signal(settings.get("reqHeight") ?? 110.0);
   let dragFrom: float = signal(0.0);
 
+  type Cmd = { id: string, label: string, hint: string };
+
+  let commands: Cmd[] = [
+    { id: "send", label: "Send the request", hint: "Ctrl+Enter" },
+    { id: "newest", label: "Open the newest request", hint: "" },
+    { id: "req:body", label: "Edit the request body", hint: "" },
+    { id: "req:headers", label: "Edit the request headers", hint: "" },
+    { id: "res:body", label: "Show the response body", hint: "" },
+    { id: "res:headers", label: "Show the response headers", hint: "" },
+    { id: "layout", label: "Reset the layout", hint: "" },
+    { id: "reconnect", label: "Reconnect to the core", hint: "" }
+  ] + methods.map(m => { id: `method:${m}`, label: `Set the method to ${m}`, hint: "" });
+
+  let palette = signal(false);
+  let search = signal("");
+  let pick = signal(0);
+
   let requests: Row[] = signal([]);
   let clients: Client[] = signal([]);
   let selected = signal(0);
@@ -284,6 +350,13 @@
 
   computed history = requests.sort((a, b) => b.id - a.id);
   computed sel = requests.find(r => r.id == selected);
+  computed hits = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
+
+  // A new filter starts at its first match.
+  effect {
+    let q = search;
+    pick = 0;
+  }
 
   mounted {
     connect();
@@ -466,7 +539,70 @@
     if v < lo { lo } else if v > hi { hi } else { v }
   }
 
+  fn openPalette() {
+    // Drop the caret first, so the palette's autofocus field takes it.
+    blur();
+    search = "";
+    pick = 0;
+    palette = true;
+  }
+
+  fn closePalette() {
+    palette = false;
+  }
+
+  // The palette's own taps stop here instead of reaching the scrim's close.
+  fn noop() {}
+
+  // On the palette's field, before its own editing: the arrows choose and
+  // Enter runs, rather than moving the caret.
+  fn paletteKey(e: KeyEvent) {
+    let n = hits.length;
+    if e.key == "ArrowDown" {
+      pick = if n == 0 { 0 } else { (pick + 1) % n };
+      return false;
+    }
+    if e.key == "ArrowUp" {
+      pick = if n == 0 { 0 } else { (pick + n - 1) % n };
+      return false;
+    }
+    if e.key == "Enter" {
+      if pick < n { run(hits[pick].id); }
+      return false;
+    }
+  }
+
+  fn run(id: string) {
+    closePalette();
+    if id == "send" {
+      send();
+    } else if id == "newest" {
+      if history.length > 0 { selected = history[0].id; }
+    } else if id.startsWith("req:") {
+      reqTab = id.slice(4);
+    } else if id.startsWith("res:") {
+      resTab = id.slice(4);
+    } else if id.startsWith("method:") {
+      method = id.slice(7);
+    } else if id == "layout" {
+      sideWidth = 300.0;
+      reqHeight = 110.0;
+      settings.set("sideWidth", sideWidth);
+      settings.set("reqHeight", reqHeight);
+    } else if id == "reconnect" {
+      connect();
+    }
+  }
+
   fn onKey(e: KeyEvent) {
+    if e.primary && e.key == "k" {
+      if palette { closePalette(); } else { openPalette(); }
+      return false;
+    }
+    if e.key == "Escape" && palette {
+      closePalette();
+      return false;
+    }
     if e.primary && e.key == "Enter" {
       send();
       return false;

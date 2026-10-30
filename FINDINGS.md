@@ -594,6 +594,81 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   (`dx` → `totalX`/`moveX`), suggest those.
 - **Status:** open.
 
+## AW-024 An `effect` runs again with its signal unchanged, right after a key handler, and undoes it
+
+- **Found:** 2026-10-30, Tracer's Ctrl+K palette: type a filter, press
+  ArrowDown, and the highlight doesn't move; the second press does.
+- **Severity:** **bug**. Silent, timing-dependent, and it turns "reset X when
+  Y changes" (the most ordinary use of an `effect`) into "sometimes undo the
+  user's last action".
+- **Limit:** with an `effect` that reads only `search` and writes `pick`, and
+  an `@key` on the field that changes only `pick`, the effect runs once more,
+  with `search` exactly as before, straight after the key handler. Minimal
+  page, `rux run` with no native crate, driven with `tools/drive.ps1` (one
+  `SendKeys` call per key), effect runs counted with `print`:
+
+  ```rux
+  <template>
+    <screen>
+      <view class="f"><input r-model="search" autofocus @key="onKey(event)" /></view>
+      <text>pick {{ pick }} · search "{{ search }}"</text>
+    </screen>
+  </template>
+  <script>
+    let search = signal("");
+    let pick = signal(0);
+    effect {
+      let q = search;
+      pick = 0;
+      print(`effect ran: search "${q}"`);
+    }
+    fn onKey(e: KeyEvent) {
+      if e.key == "ArrowDown" { pick += 1; print(`down: pick ${pick}`); return false; }
+    }
+  </script>
+  ```
+
+  | driven | log | right? |
+  |---|---|---|
+  | type `r`, `e`, `q` 0.4 s apart | `effect ran` for "r", "re", "req" | yes |
+  | 0.4 s later, ArrowDown | `down: pick 1`, then **`effect ran: search "req"`** | **no**: `search` didn't change; `pick` back to 0 |
+  | 3 s later, ArrowDown | `down: pick 1` | yes |
+  | type `x`, wait 3 s, ArrowDown | `effect ran: "reqx"`, `down: pick 1` | yes |
+
+  In Tracer the same shows after a Backspace with 1.5 s of wait, so the
+  window is at least that long. An ArrowDown with no typing before it is never
+  undone.
+- **Guess at the cause (not traced):** the timing matches the text field's
+  undo grouping ("a pause of a second starts a new one"). Perhaps a key event
+  arriving while the field's typing group is still open makes the field write
+  its value into its `r-model` signal again, and a write of the *same* value
+  counts as a change for effects. Either half would be worth fixing: a field
+  shouldn't write its model on a key it didn't edit (this one was taken by
+  `@key` returning `false`), and an unchanged value shouldn't wake effects.
+- **Reproduction:** the page above. Type three letters quickly, then
+  ArrowDown within about a second.
+- **Workaround:** none taken. Tracer's palette keeps the plain `effect`, so
+  the first ArrowDown after typing is sometimes lost until this is fixed.
+- **Suggested fix:** compare before notifying in signal writes (or in the
+  field's model write); and a test with an `effect` on a field's model plus a
+  key handler on that field, keys sent within the undo-group window.
+- **Status:** open.
+
+## AW-025 Script can't write to the clipboard
+
+- **Found:** 2026-10-30, planning "Copy as cURL" for Tracer's palette.
+- **Severity:** friction; copy buttons are in every tool of this kind
+  (cURL, a response body, a header value).
+- **Limit:** Rux has a real system clipboard inside text fields (`arboard`,
+  Ctrl+C/X/V; `docs/05-as-built.md`, "Selection & clipboard"), but nothing a
+  script can call to put text on it or read it. Each app would have to add its
+  own clipboard crate to its `native/` code.
+- **Workaround:** none taken; Tracer leaves "Copy as cURL" out until it exists.
+- **Suggested fix:** a built-in like `settings`: `clipboard.writeText(s)` and
+  `clipboard.readText(): string?`, under the browser's names, desktop and web
+  (`navigator.clipboard`), Android through its clipboard manager.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,
