@@ -132,10 +132,15 @@
             <text class="tab-label">Headers</text>
             <text class="badge" r-if="sentHeaders().length > 0">{{ sentHeaders().length }}</text>
           </view>
+          <view class="tab" :class="{ on: reqTab == &quot;checks&quot; }" @tap="reqTab = &quot;checks&quot;">
+            <text class="tab-label">Checks</text>
+            <text class="badge" r-if="checkLines() > 0">{{ checkLines() }}</text>
+          </view>
         </view>
         <view class="editor" :style="`height: ${reqHeight}px`">
           <input r-if="reqTab == &quot;body&quot;" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
           <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
+          <input r-if="reqTab == &quot;checks&quot;" type="textarea" r-model="checksText" placeholder="one per line: status 2xx · $.id == 1 · header Content-Type contains json · time &lt; 500 · len($.items) &gt;= 3" />
         </view>
         <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
         <view class="split-h" @drag="resizeReq(event)"><view class="grip-h"></view></view>
@@ -182,6 +187,10 @@
                 <text class="tab-label">Headers</text>
                 <text class="badge">{{ sel.resHeaders.length }}</text>
               </view>
+              <view class="tab" r-if="sel.results.length > 0" :class="{ on: resTab == &quot;checks&quot; }" @tap="resTab = &quot;checks&quot;">
+                <text class="tab-label">Checks</text>
+                <text class="badge" :class="{ bad: failedChecks(sel) > 0 }">{{ sel.results.length - failedChecks(sel) }}/{{ sel.results.length }}</text>
+              </view>
             </view>
             <view class="pane">
               <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
@@ -189,6 +198,11 @@
               <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
               <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
               <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
+              <view class="check" r-if="resTab == &quot;checks&quot;" r-for="c in sel.results">
+                <text class="check-mark" :class="{ bad: !c.pass }">{{ if c.pass { "✓" } else { "✗" } }}</text>
+                <text class="check-e">{{ c.expect }}</text>
+                <text class="check-a">found {{ c.actual }}</text>
+              </view>
               <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
                 <text class="hdr-n">{{ h.name }}</text>
                 <text class="hdr-v">{{ h.value }}</text>
@@ -468,6 +482,12 @@
   .again { color: #7a7a7a; font-size: 10px; font-family: monospace; }
   .when { margin-left: auto; color: #6a6a6a; font-size: 10px; font-family: monospace; white-space: nowrap; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .check { display: flex; gap: 10px; align-items: baseline; }
+  .check-mark { width: 14px; color: #4ec98f; font-size: 12px; font-family: monospace; }
+  .check-mark.bad { color: #f0716c; }
+  .check-e { color: #d4d4d4; font-size: 12px; font-family: monospace; }
+  .check-a { flex: 1; min-width: 0; color: #7a7a7a; font-size: 12px; font-family: monospace; }
+  .badge.bad { color: #f0716c; }
 
   .fall { display: flex; flex-direction: column; gap: 6px; }
   .fall-bar { display: flex; gap: 1px; height: 8px; border-radius: 2px; overflow: hidden; }
@@ -567,6 +587,7 @@
   use type native::tracer::Saved;
   use type native::tracer::Env;
   use type native::tracer::Var;
+  use type native::tracer::Check;
 
   // One request as the core described it: started, then finished or failed.
   type Row = {
@@ -597,7 +618,10 @@
     // Why it waits for a person, while `state` is "approval".
     reason: string,
     // When it was sent, in milliseconds since 1970.
-    atMs: int
+    atMs: int,
+    // Its expectations as written, and how they came out once checked.
+    reqChecks: string,
+    results: Check[]
   };
 
   type Client = { client: int, actor: string, actorKind: string };
@@ -610,6 +634,8 @@
   let url = signal("https://jsonplaceholder.typicode.com/todos/1");
   let body = signal("");
   let headerText = signal("Accept: application/json");
+  // Expectations, one a line; saved as `# @expect` lines.
+  let checksText = signal("");
   let reqTab = signal("body");
   let resTab = signal("body");
   let error = signal("");
@@ -748,6 +774,11 @@
       let list = await tracer.listEnvironments();
       envs = list.environments;
       envSkipped = list.skipped;
+      // The remembered pick is from the last workspace opened, which may
+      // not have it: then nothing is picked, rather than a send failing.
+      if envPick != NO_ENV && !envs.some(e => e.name == envPick) {
+        envPick = NO_ENV;
+      }
     } catch e {
       error = `could not list the environments: ${e.message}`;
     }
@@ -800,7 +831,9 @@
           reqBody: e.body,
           rerunOf: e.rerunOf,
           atMs: e.atMs,
-          reason: ""
+          reason: "",
+          reqChecks: e.checks,
+          results: []
         });
       } else if e.kind == "approval_asked" {
         requests = requests.map(r => if r.id == e.requestId { asked(r, e.reason) } else { r });
@@ -809,6 +842,8 @@
         if e.allow {
           requests = requests.map(r => if r.id == e.requestId { asked(r, "") } else { r });
         }
+      } else if e.kind == "request_checked" {
+        requests = requests.map(r => if r.id == e.requestId { withResults(r, e.results) } else { r });
       } else if e.kind == "agents_switched" {
         agentsOn = e.allow;
       } else if e.kind == "policy_changed" {
@@ -854,7 +889,7 @@
       }
       return;
     }
-    let s = { path: e.path, method: e.method, url: e.url, headers: e.headers, body: e.body };
+    let s = { path: e.path, method: e.method, url: e.url, headers: e.headers, body: e.body, checks: e.checks };
     let before = saved.find(x => x.path == e.path);
     if e.path == openPath && !sameAs(s) {
       if before == none || sameAs(before) {
@@ -876,6 +911,7 @@
   // Whether the editor holds exactly `s`.
   fn sameAs(s: Saved): bool {
     method == s.method && url.trim() == s.url && body == s.body && headerLines(sentHeaders()) == headerLines(s.headers)
+      && checksText.trim() == s.checks.trim()
   }
 
   fn load(s: Saved) {
@@ -883,6 +919,7 @@
     url = s.url;
     body = s.body;
     headerText = headerLines(s.headers);
+    checksText = s.checks;
   }
 
   fn fillVars(text: string): string {
@@ -991,6 +1028,7 @@
     url = "";
     body = "";
     headerText = "";
+    checksText = "";
     notice = "";
   }
 
@@ -1010,7 +1048,7 @@
 
   fn saveAs(path: string) {
     try {
-      openPath = tracer.saveRequest(path, method, url, sentHeaders(), body);
+      openPath = tracer.saveRequest(path, method, url, sentHeaders(), body, checksText);
       naming = false;
       notice = "";
       error = "";
@@ -1137,6 +1175,20 @@
     }
   }
 
+  fn withResults(r: Row, results: Check[]): Row {
+    let out = r;
+    out.results = results;
+    out
+  }
+
+  fn failedChecks(r: Row): int {
+    r.results.filter(c => !c.pass).length
+  }
+
+  fn checkLines(): int {
+    checksText.split("\n").filter(l => l.trim() != "").length
+  }
+
   type Phase = { name: string, ms: float, color: string };
 
   // Where a finished request's time went, in order: each phase's own
@@ -1190,7 +1242,7 @@
     error = "";
     try {
       let env = if envPick == NO_ENV { "" } else { envPick };
-      selected = tracer.send(method, url, sentHeaders(), body, env);
+      selected = tracer.send(method, url, sentHeaders(), body, env, checksText);
       resTab = "body";
     } catch e {
       error = e.message;
@@ -1239,6 +1291,7 @@
     url = r.url;
     body = r.reqBody;
     headerText = headerLines(r.reqHeaders);
+    checksText = r.reqChecks;
     notice = `from #${r.id}`;
     if r.env == "" {
       envPick = NO_ENV;

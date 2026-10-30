@@ -67,7 +67,7 @@ fn answer(mut stream: TcpStream) {
 }
 
 fn get(url: String) -> Command {
-    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None }, env: None }
+    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None, expect: Vec::new() }, env: None }
 }
 
 #[test]
@@ -453,6 +453,7 @@ fn saved_requests_are_plain_files_and_every_client_sees_them_change() {
         url: "https://x.test/albums".into(),
         headers: vec![("Accept".into(), "application/json".into())],
         body: Some("{\"title\": \"t\"}".into()),
+        expect: Vec::new(),
     };
     let saved = agent.call(Command::SaveRequest { path: r"requests\albums\new album.http".into(), request: request.clone() });
     assert_eq!(saved.unwrap(), Ok(ReplyBody::Saved { path: "albums/new album".into() }));
@@ -542,7 +543,7 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
     assert_eq!(text, format!("baseUrl={base}\nid=7\n"));
 
     let send = |url: &str| Command::Send {
-        request: HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], body: None },
+        request: HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], body: None, expect: Vec::new() },
         env: Some("local".into()),
     };
     let Ok(ReplyBody::Accepted { request_id: ok_id }) = agent.call(send("{{baseUrl}}/albums/{{ id }}")).unwrap() else { panic!() };
@@ -610,6 +611,7 @@ fn a_rerun_sends_the_request_as_written_with_its_environment_unless_told_otherwi
         url: "{{base}}/items/{{id}}".into(),
         headers: vec![("X-Id".into(), "{{id}}".into())],
         body: Some("abc".into()),
+        expect: Vec::new(),
     };
     let Ok(ReplyBody::Accepted { request_id: first }) =
         cli.call(Command::Send { request: request.clone(), env: Some("a".into()) }).unwrap()
@@ -725,7 +727,7 @@ fn files_changed_behind_the_core_are_published_once_and_its_own_saves_are_not_ec
     };
 
     // The core's own save: one event, from the window, none from disk.
-    let request = HttpRequest { method: "GET".into(), url: "http://x.test/a".into(), headers: vec![], body: None };
+    let request = HttpRequest { method: "GET".into(), url: "http://x.test/a".into(), headers: vec![], body: None, expect: Vec::new() };
     window.call(Command::SaveRequest { path: "a".into(), request }).unwrap().unwrap();
     let got = collect(3);
     let saves: Vec<&Event> = got.iter().filter(|e| matches!(e.kind, EventKind::RequestSaved { .. })).collect();
@@ -774,7 +776,7 @@ fn a_secret_fills_in_but_its_value_never_reaches_a_client_or_the_journal() {
     // Sent with it: the stub echoes the path, so the value comes back in the
     // body, and is replaced by its name before anyone sees it.
     let send = Command::Send {
-        request: HttpRequest { method: "GET".into(), url: "{{baseUrl}}/me?key={{token}}".into(), headers: vec![], body: None },
+        request: HttpRequest { method: "GET".into(), url: "{{baseUrl}}/me?key={{token}}".into(), headers: vec![], body: None, expect: Vec::new() },
         env: Some("prod".into()),
     };
     let Ok(ReplyBody::Accepted { request_id }) = agent.call(send).unwrap() else { panic!() };
@@ -830,7 +832,7 @@ fn wait_for<T>(client: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -
 }
 
 fn post(url: String) -> Command {
-    Command::Send { request: HttpRequest { method: "POST".into(), url, headers: vec![], body: Some("x".into()) }, env: None }
+    Command::Send { request: HttpRequest { method: "POST".into(), url, headers: vec![], body: Some("x".into()), expect: Vec::new() }, env: None }
 }
 
 #[test]
@@ -854,7 +856,7 @@ fn an_agents_post_waits_for_a_person_who_allows_or_refuses_it() {
         _ => None,
     });
     assert_eq!(reason, "POST from an agent");
-    let Ok(ReplyBody::Response { entry, response }) = window.call(Command::Response { request_id: first }).unwrap() else {
+    let Ok(ReplyBody::Response { entry, response, .. }) = window.call(Command::Response { request_id: first }).unwrap() else {
         panic!()
     };
     assert_eq!((entry.ended, response), (Ended::AwaitingApproval { reason }, None));
@@ -969,7 +971,7 @@ fn the_workspace_policy_holds_each_agent_to_its_rules_and_is_followed_as_it_chan
 
     // Claude, by name whatever its case: a POST with nothing to approve.
     let send = |client: &mut Client, method: &str, url: String, body: &str| {
-        let request = HttpRequest { method: method.into(), url, headers: vec![], body: Some(body.into()) };
+        let request = HttpRequest { method: method.into(), url, headers: vec![], body: Some(body.into()), expect: Vec::new() };
         let Ok(ReplyBody::Accepted { request_id }) = client.call(Command::Send { request, env: None }).unwrap() else {
             panic!("not accepted")
         };
@@ -1199,5 +1201,49 @@ fn two_responses_are_compared_by_value_and_an_agent_may_ask() {
     let Ok(ReplyBody::Diff { diff }) = agent.call(ask(ids[0], ids[1], &["path"])).unwrap() else { panic!() };
     assert_eq!((diff.body, diff.ignored), (BodyDiff::Same, vec!["$.path".to_string()]));
     assert!(agent.call(ask(ids[0], 999, &[])).unwrap().unwrap_err().contains("no request #999"));
+    core.stop();
+}
+
+#[test]
+fn expectations_are_checked_when_the_answer_comes_and_kept_with_the_request() {
+    let ws = workspace("expect");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "test").unwrap();
+    cli.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let expect = vec!["status 2xx".to_string(), "$.path == /x".to_string(), "$.got == 3".to_string()];
+    let request = HttpRequest { method: "GET".into(), url: format!("{base}/x"), expect: expect.clone(), ..Default::default() };
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(Command::Send { request, env: None }).unwrap() else { panic!() };
+    // The end, then its checks next, nothing between.
+    let end_seq = wait_for(&mut cli, |e| matches!(e.kind, EventKind::RequestFinished { request_id: id, .. } if id == request_id).then_some(e.seq));
+    let e = cli.next_event().unwrap();
+    assert_eq!(e.seq, end_seq + 1);
+    let EventKind::RequestChecked { results, .. } = e.kind else { panic!("{:?}", e.kind) };
+    let passes: Vec<bool> = results.iter().map(|r| r.pass).collect();
+    assert_eq!(passes, [true, true, false]);
+    assert_eq!(results[2].actual, "0");
+    let Ok(ReplyBody::History { entries, .. }) = cli.call(Command::History { filter: Default::default() }).unwrap() else { panic!() };
+    assert_eq!(entries[0].checks, Some((2, 1)));
+    let Ok(ReplyBody::Response { checks, .. }) = cli.call(Command::Response { request_id }).unwrap() else { panic!() };
+    assert_eq!(checks.len(), 3);
+
+    // Written by hand, `# @expect` lines read as the request's own.
+    let dir = ws.join("requests");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("x.http"), format!("# @expect status 2xx
+# a note
+# @expect $.path exists
+GET {base}/x
+")).unwrap();
+    let saved = wait_for(&mut cli, |e| match &e.kind {
+        EventKind::RequestSaved { path, request } if path == "x" => Some(request.clone()),
+        _ => None,
+    });
+    assert_eq!(saved.expect, ["status 2xx", "$.path exists"]);
+    // And a request without any is checked by nobody.
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("{base}/y"))).unwrap() else { panic!() };
+    end_of(&mut cli, request_id);
+    let Ok(ReplyBody::Response { checks, entry, .. }) = cli.call(Command::Response { request_id }).unwrap() else { panic!() };
+    assert_eq!((checks.len(), entry.checks), (0, None));
     core.stop();
 }

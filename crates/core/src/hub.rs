@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
-    Actor, AgentRules, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
+    Actor, AgentRules, CheckResult, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
     HttpResponse, SavedRequest, ServerMessage, HISTORY_LIMIT, JOURNAL_PATH, POLICY_PATH,
 };
 
@@ -273,22 +273,36 @@ impl Hub {
 
     /// Request `request_id` as history has it, and its whole response once
     /// it has finished.
-    pub fn response(&self, request_id: u64) -> Option<(HistoryEntry, Option<HttpResponse>)> {
+    pub fn response(&self, request_id: u64) -> Option<(HistoryEntry, Option<HttpResponse>, Vec<CheckResult>)> {
         let inner = self.inner.lock().unwrap();
         let entry = entries(&inner.events).into_iter().find(|e| e.request_id == request_id)?;
         let response = inner.events.iter().rev().find_map(|e| match &e.kind {
             EventKind::RequestFinished { request_id: id, response } if *id == request_id => Some(response.clone()),
             _ => None,
         });
-        Some((entry, response))
+        let checks = inner.events.iter().rev().find_map(|e| match &e.kind {
+            EventKind::RequestChecked { request_id: id, results } if *id == request_id => Some(results.clone()),
+            _ => None,
+        });
+        Some((entry, response, checks.unwrap_or_default()))
     }
 
     /// Publish how a request ended, unless it was cancelled first.
     pub fn end_request(&self, actor: Actor, request_id: u64, kind: EventKind) {
+        self.end_checked(actor, request_id, kind, Vec::new());
+    }
+
+    /// Publish how a request ended and, right after it under the same lock,
+    /// how its expectations came out (if it had any), unless it was
+    /// cancelled first.
+    pub fn end_checked(&self, actor: Actor, request_id: u64, kind: EventKind, results: Vec<CheckResult>) {
         let mut inner = self.inner.lock().unwrap();
         if inner.running.remove(&request_id).is_some() {
             inner.awaiting.remove(&request_id);
-            publish_locked(&mut inner, actor, kind);
+            publish_locked(&mut inner, actor.clone(), kind);
+            if !results.is_empty() {
+                publish_locked(&mut inner, actor, EventKind::RequestChecked { request_id, results });
+            }
         }
     }
 
@@ -599,7 +613,15 @@ fn entries(events: &[Event]) -> Vec<HistoryEntry> {
                     env: env.clone(),
                     rerun_of: *rerun_of,
                     ended: Ended::Running,
+                    checks: None,
                 });
+                continue;
+            }
+            EventKind::RequestChecked { request_id, results } => {
+                let passed = results.iter().filter(|r| r.pass).count() as u32;
+                if let Some(entry) = entries.iter_mut().rev().find(|x| x.request_id == *request_id) {
+                    entry.checks = Some((passed, results.len() as u32 - passed));
+                }
                 continue;
             }
             EventKind::ApprovalAsked { request_id, reason } => {

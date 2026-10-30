@@ -327,12 +327,25 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   differ, for CI); MCP `diff_responses`. 48 tests. The window's view of it
   waits for the viewer branch (AW-037).
 
+- **Phase 4: checks (assertions)** (`crates/core/src/expect.rs`).
+  `HttpRequest.expect` (optional on the wire): a request's expectations
+  as written, saved as `# @expect` lines above its request line,
+  journalled with it, kept on re-run. The core checks them on what
+  clients see (secrets out) and publishes `request_checked` right after
+  the end under the same lock; history carries passed/failed; `Response`
+  carries the results. CLI `--expect`, a ✓/✗ list and exit 1; history
+  `✓2` / `✗1/5`. MCP `expect` on send and save, `checks` back. Window: a
+  Checks tab in the editor (one per line, saved with the request) and in
+  the response (✓/✗, what was found). 52 tests. Also fixed: a remembered
+  environment the workspace doesn't have is dropped when the list loads
+  (it made a send fail).
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Phase 4, what doesn't need the viewer first: assertions and flows, then benchmarking (with
+2. Phase 4, what doesn't need the viewer first: flows, then benchmarking (with
    bench-size caps in the policy), then realtime and GraphQL.
 3. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
@@ -340,8 +353,7 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    wants it.
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
-   remembered env the open workspace doesn't have (seen: "typicode" in a
-   fresh workspace), and Send would use it; the remembered sidebar width
+   remembered sidebar width
    isn't capped by the window, so at 1000 px wide a 400 px sidebar
    collapses the URL field; the response header name column is a fixed
    220 px, which squeezes values in a narrow pane.

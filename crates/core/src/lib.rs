@@ -14,6 +14,7 @@ mod api;
 mod conn;
 mod diff;
 mod envs;
+mod expect;
 mod files;
 mod guard;
 mod http;

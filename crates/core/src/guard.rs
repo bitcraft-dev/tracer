@@ -121,7 +121,7 @@ mod tests {
     }
 
     fn request(method: &str) -> HttpRequest {
-        HttpRequest { method: method.into(), url: "http://x/".into(), headers: vec![], body: None }
+        HttpRequest { method: method.into(), url: "http://x/".into(), headers: vec![], body: None, expect: Vec::new() }
     }
 
     fn rules(policy: &str) -> AgentRules {

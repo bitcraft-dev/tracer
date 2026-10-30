@@ -46,10 +46,15 @@ usage:
   tracer core                         run the core for the workspace
   tracer status                       who is connected, how far the journal goes
   tracer send <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--env <NAME>]
-                                      send a request and print its answer
+             [--expect '<EXPECTATION>']...
+                                      send a request and print its answer; with
+                                      --expect, check it (status 2xx, $.id == 1,
+                                      header Content-Type contains json, time < 500)
+                                      and fail if a check does
   tracer ls                           list the saved requests
-  tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>]
-                                      save a request as requests/<PATH>.http
+  tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--expect '…']...
+                                      save a request as requests/<PATH>.http, its
+                                      expectations as `# @expect` lines
   tracer run <PATH> [--env <NAME>]    send a saved request and print its answer
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
@@ -303,8 +308,13 @@ fn history(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
         let who = format!("{:?}:{}", e.actor.kind, e.actor.name).to_lowercase();
         let env = e.env.as_ref().map(|n| format!(" [{n}]")).unwrap_or_default();
         let again = e.rerun_of.map(|id| format!(" (re-run of #{id})")).unwrap_or_default();
+        let checks = match e.checks {
+            Some((passed, 0)) => format!("✓{passed}"),
+            Some((passed, failed)) => format!("✗{failed}/{}", passed + failed),
+            None => String::new(),
+        };
         println!(
-            "{:>6}  {outcome:<11}  {who:<20}  {:<7} {}{env}{again}",
+            "{:>6}  {outcome:<11} {checks:<5}  {who:<20}  {:<7} {}{env}{again}",
             format!("#{}", e.request_id),
             e.request.method,
             e.request.url
@@ -438,8 +448,12 @@ fn request_from(mut args: Vec<String>) -> io::Result<HttpRequest> {
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
     let body = take_value(&mut args, "-d");
+    let mut expect = Vec::new();
+    while let Some(e) = take_value(&mut args, "--expect") {
+        expect.push(e);
+    }
     let [method, url] = <[String; 2]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
-    Ok(HttpRequest { method: method.to_uppercase(), url, headers, body })
+    Ok(HttpRequest { method: method.to_uppercase(), url, headers, body, expect })
 }
 
 fn ls(workspace: PathBuf) -> io::Result<ExitCode> {
@@ -574,8 +588,31 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Resul
         Err(e) => return Err(io::Error::other(e)),
     };
     eprintln!("#{request_id} sent; `tracer cancel {request_id}` stops it");
+    // Known from its start: whether a `request_checked` follows its end.
+    let mut checked = false;
+    // How it ended, kept while its checks are awaited.
+    let mut ended: Option<io::Result<ExitCode>> = None;
     loop {
         let event = client.next_event()?;
+        if let EventKind::RequestStarted { request_id: id, request, .. } = &event.kind {
+            if *id == request_id {
+                checked = !request.expect.is_empty();
+            }
+            continue;
+        }
+        if let EventKind::RequestChecked { request_id: id, results } = &event.kind {
+            if *id == request_id {
+                let failed = results.iter().filter(|r| !r.pass).count();
+                for r in results {
+                    let mark = if r.pass { "✓" } else { "✗" };
+                    eprintln!("{mark} {}   (found {})", r.expect, r.actual);
+                }
+                eprintln!("checks: {} passed, {failed} failed", results.len() - failed);
+                let outcome = ended.take().unwrap_or(Ok(ExitCode::SUCCESS));
+                return if failed > 0 { outcome.and(Ok(ExitCode::FAILURE)) } else { outcome };
+            }
+            continue;
+        }
         if let EventKind::RequestCancelled { request_id: id } = event.kind {
             if id == request_id {
                 return Err(io::Error::other(format!("cancelled by {}", event.actor.name)));
@@ -594,10 +631,18 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Resul
                     response.size
                 );
                 println!("{}", response.body);
-                return Ok(if response.status < 400 { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+                let outcome = Ok(if response.status < 400 { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+                if !checked {
+                    return outcome;
+                }
+                ended = Some(outcome);
             }
             EventKind::RequestFailed { request_id: id, error } if id == request_id => {
-                return Err(io::Error::other(error));
+                if !checked {
+                    return Err(io::Error::other(error));
+                }
+                eprintln!("tracer: {error}");
+                ended = Some(Ok(ExitCode::FAILURE));
             }
             _ => {}
         }
@@ -664,6 +709,13 @@ fn describe(event: &Event) -> String {
         }
         EventKind::ApprovalGiven { request_id, allow } => {
             format!("#{request_id} {}", if *allow { "allowed" } else { "refused" })
+        }
+        EventKind::RequestChecked { request_id, results } => {
+            let failed: Vec<&str> = results.iter().filter(|r| !r.pass).map(|r| r.expect.as_str()).collect();
+            match failed.as_slice() {
+                [] => format!("#{request_id} checks: all {} passed", results.len()),
+                _ => format!("#{request_id} checks: {} of {} failed: {}", failed.len(), results.len(), failed.join("; ")),
+            }
         }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
         EventKind::PolicyChanged { rules, error: Some(error) } => {

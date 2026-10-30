@@ -182,7 +182,7 @@ pub enum Command {
     Shutdown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -190,6 +190,21 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub body: Option<String>,
+    /// What its answer should be, one expectation a line (`status 2xx`,
+    /// `$.id == 1`; see the core's `expect.rs`), checked when it arrives
+    /// and published as `request_checked`. Saved in its `.http` file as
+    /// `# @expect …` lines above the request line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expect: Vec<String>,
+}
+
+/// One expectation, checked: whether it held, and what was found.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckResult {
+    pub expect: String,
+    pub pass: bool,
+    /// The value found, as JSON, `missing`, or why it couldn't be checked.
+    pub actual: String,
 }
 
 /// A named set of variables, filling `{{name}}` in requests sent with it.
@@ -466,6 +481,9 @@ pub struct HistoryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerun_of: Option<u64>,
     pub ended: Ended,
+    /// How its expectations came out, once checked: passed and failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<(u32, u32)>,
 }
 
 impl HistoryEntry {
@@ -537,6 +555,9 @@ pub enum ReplyBody {
         entry: HistoryEntry,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response: Option<HttpResponse>,
+        /// Its expectations, once checked.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<CheckResult>,
     },
     Decided,
     AgentsSwitched,
@@ -610,6 +631,9 @@ pub enum EventKind {
     /// A person allowed or refused it; this event's actor is who. A refused
     /// request then fails, naming them.
     ApprovalGiven { request_id: u64, allow: bool },
+    /// A request's expectations, checked once it ended (after its
+    /// `request_finished` or `request_failed`), in the sender's name.
+    RequestChecked { request_id: u64, results: Vec<CheckResult> },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The policy file changed. `rules` are what agents get from now on;
@@ -649,6 +673,7 @@ mod tests {
                     url: "http://x/".into(),
                     headers: vec![],
                     body: None,
+                    expect: Vec::new(),
                 },
                 env: None,
             }
@@ -694,10 +719,11 @@ mod tests {
             request_id: 12,
             at_ms: 0,
             actor: Actor { kind: ClientKind::Agent, name: "claude-code".into() },
-            request: HttpRequest { method: "POST".into(), url: "{{base}}/albums".into(), headers: vec![], body: None },
+            request: HttpRequest { method: "POST".into(), url: "{{base}}/albums".into(), headers: vec![], body: None, expect: Vec::new() },
             env: Some("staging".into()),
             rerun_of: None,
             ended: Ended::Done { status: 404, total_ms: 3.0, size: 2 },
+            checks: None,
         };
         let with = |text: &str| HistoryFilter { text: Some(text.into()), ..HistoryFilter::default() };
         for hit in ["ALBUMS", "post", "{{base}}", "stag", "claude", "404", "#12", "  "] {

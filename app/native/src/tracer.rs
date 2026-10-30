@@ -89,6 +89,20 @@ pub struct CoreEvent {
     pub reason: String,
     /// Allowed, for `approval_given`; agents on, for `agents_switched`.
     pub allow: bool,
+    /// A started or saved request's expectations, one a line.
+    pub checks: String,
+    /// How they came out, for `request_checked`.
+    pub results: Vec<Check>,
+}
+
+/// One expectation, checked.
+#[rux::export]
+#[derive(Clone)]
+pub struct Check {
+    pub expect: String,
+    pub pass: bool,
+    /// What was found, or why it couldn't be checked.
+    pub actual: String,
 }
 
 /// A request saved in the workspace.
@@ -101,6 +115,8 @@ pub struct Saved {
     pub url: String,
     pub headers: Vec<Header>,
     pub body: String,
+    /// Its expectations, one a line.
+    pub checks: String,
 }
 
 /// Every saved request, as of event `as_of`: saves and deletes numbered from
@@ -245,8 +261,8 @@ pub async fn connect(workspace: String) -> Result<Link, CoreError> {
 /// arrives on `events`, to this window and to every other client alike.
 /// `env` names the environment that fills its `{{name}}`s; "" for none.
 #[rux::export]
-pub fn send(method: String, url: String, headers: Vec<Header>, body: String, env: String) -> Result<u64, CoreError> {
-    let request = request_of(method, url, headers, body);
+pub fn send(method: String, url: String, headers: Vec<Header>, body: String, env: String, checks: String) -> Result<u64, CoreError> {
+    let request = request_of(method, url, headers, body, checks);
     let env = if env.is_empty() { None } else { Some(env) };
     match shared()?.call(Command::Send { request, env }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
@@ -373,8 +389,15 @@ pub fn set_secret(env: String, name: String, value: String) -> Result<(), CoreEr
 /// Save a request at `path`, over any there. Gives the path as the core
 /// wrote it; every client hears `request_saved`.
 #[rux::export]
-pub fn save_request(path: String, method: String, url: String, headers: Vec<Header>, body: String) -> Result<String, CoreError> {
-    let request = request_of(method, url, headers, body);
+pub fn save_request(
+    path: String,
+    method: String,
+    url: String,
+    headers: Vec<Header>,
+    body: String,
+    checks: String,
+) -> Result<String, CoreError> {
+    let request = request_of(method, url, headers, body, checks);
     match shared()?.call(Command::SaveRequest { path, request }) {
         Ok(Ok(ReplyBody::Saved { path })) => Ok(path),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
@@ -515,12 +538,14 @@ fn shared() -> Result<Arc<Shared>, CoreError> {
     }
 }
 
-fn request_of(method: String, url: String, headers: Vec<Header>, body: String) -> HttpRequest {
+/// `checks` is the page's text: an expectation a line, blank lines aside.
+fn request_of(method: String, url: String, headers: Vec<Header>, body: String, checks: String) -> HttpRequest {
     HttpRequest {
         method: method.to_uppercase(),
         url: url.trim().to_string(),
         headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
         body: if body.is_empty() { None } else { Some(body) },
+        expect: checks.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect(),
     }
 }
 
@@ -530,7 +555,14 @@ fn headers_of(list: Vec<(String, String)>) -> Vec<Header> {
 
 fn saved_of(saved: SavedRequest) -> Saved {
     let r = saved.request;
-    Saved { path: saved.path, method: r.method, url: r.url, headers: headers_of(r.headers), body: r.body.unwrap_or_default() }
+    Saved {
+        path: saved.path,
+        method: r.method,
+        url: r.url,
+        headers: headers_of(r.headers),
+        body: r.body.unwrap_or_default(),
+        checks: r.expect.join("\n"),
+    }
 }
 
 fn set_link(state: &str, detail: &str, workspace: &str, started_core: bool) -> Link {
@@ -570,6 +602,8 @@ fn to_page(event: Event) -> CoreEvent {
         error: String::new(),
         reason: String::new(),
         allow: false,
+        checks: String::new(),
+        results: Vec::new(),
     };
     let headers = headers_of;
     match event.kind {
@@ -584,6 +618,7 @@ fn to_page(event: Event) -> CoreEvent {
             out.url = request.url;
             out.headers = headers(request.headers);
             out.body = request.body.unwrap_or_default();
+            out.checks = request.expect.join("\n");
         }
         EventKind::RequestFinished { request_id, response } => {
             out.kind = "request_finished".into();
@@ -614,6 +649,12 @@ fn to_page(event: Event) -> CoreEvent {
             out.url = request.url;
             out.headers = headers(request.headers);
             out.body = request.body.unwrap_or_default();
+            out.checks = request.expect.join("\n");
+        }
+        EventKind::RequestChecked { request_id, results } => {
+            out.kind = "request_checked".into();
+            out.request_id = request_id;
+            out.results = results.into_iter().map(|r| Check { expect: r.expect, pass: r.pass, actual: r.actual }).collect();
         }
         EventKind::RequestDeleted { path } => {
             out.kind = "request_deleted".into();

@@ -215,6 +215,7 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 url: str_arg(args, "url").ok_or("`url` is required")?.to_string(),
                 headers: headers_arg(args)?,
                 body: str_arg(args, "body").map(String::from),
+                expect: list_arg(args, "expect"),
             };
             let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
             send_and_wait(core, Command::Send { request, env }, args)
@@ -260,12 +261,15 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
         "get_response" => {
             let request_id = id_arg(args)?;
             let max = args.get("max_bytes").and_then(Value::as_u64).map_or(BODY_SHOWN, |n| (n as usize).min(BODY_MAX));
-            let ReplyBody::Response { entry, response } = call(core, Command::Response { request_id })? else {
+            let ReplyBody::Response { entry, response, checks } = call(core, Command::Response { request_id })? else {
                 return Err(unexpected());
             };
             let mut out = entry_json(&entry);
             if let Some(response) = response {
                 add_response(&mut out, &response, max);
+            }
+            if !checks.is_empty() {
+                out["checks"] = serde_json::to_value(&checks).unwrap_or_default();
             }
             Ok(out)
         }
@@ -275,6 +279,7 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 url: str_arg(args, "url").ok_or("`url` is required")?.to_string(),
                 headers: headers_arg(args)?,
                 body: str_arg(args, "body").map(String::from),
+                expect: list_arg(args, "expect"),
             };
             let path = str_arg(args, "path").ok_or("`path` is required")?.to_string();
             let ReplyBody::Saved { path } = call(core, Command::SaveRequest { path, request })? else {
@@ -286,11 +291,7 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             let id = |name: &str| {
                 args.get(name).and_then(Value::as_u64).ok_or_else(|| format!("`{name}` (a request number) is required"))
             };
-            let ignore: Vec<String> = match args.get("ignore") {
-                Some(Value::Array(list)) => list.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-                Some(Value::String(one)) => vec![one.clone()],
-                _ => Vec::new(),
-            };
+            let ignore = list_arg(args, "ignore");
             let no_defaults = args.get("all").and_then(Value::as_bool).unwrap_or(false);
             let ReplyBody::Diff { diff } = call(core, Command::Diff { a: id("a")?, b: id("b")?, ignore, no_defaults })? else {
                 return Err(unexpected());
@@ -326,6 +327,8 @@ fn send_and_wait(core: &Core, sending: Command, args: &Value) -> Result<Value, S
     };
     let deadline = Instant::now() + Duration::from_secs(wait);
     let mut state = json!({ "request_id": request_id, "state": "running" });
+    // Known from its start: whether a `request_checked` follows its end.
+    let mut checked = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let event = match core.events.recv_timeout(left) {
@@ -340,6 +343,7 @@ fn send_and_wait(core: &Core, sending: Command, args: &Value) -> Result<Value, S
         };
         match event.kind {
             EventKind::RequestStarted { request_id: id, request, env, rerun_of } if id == request_id => {
+                checked = !request.expect.is_empty();
                 state["request"] = request_json(&request);
                 if let Some(env) = env {
                     state["env"] = json!(env);
@@ -360,11 +364,22 @@ fn send_and_wait(core: &Core, sending: Command, args: &Value) -> Result<Value, S
             EventKind::RequestFinished { request_id: id, response } if id == request_id => {
                 state["state"] = json!("done");
                 add_response(&mut state, &response, BODY_SHOWN);
-                return Ok(state);
+                if !checked {
+                    return Ok(state);
+                }
             }
             EventKind::RequestFailed { request_id: id, error } if id == request_id => {
                 state["state"] = json!("failed");
                 state["error"] = json!(error);
+                if !checked {
+                    return Ok(state);
+                }
+            }
+            // Published right after the end, under the same lock.
+            EventKind::RequestChecked { request_id: id, results } if id == request_id => {
+                let failed = results.iter().filter(|r| !r.pass).count();
+                state["checks"] = serde_json::to_value(&results).unwrap_or_default();
+                state["checks_failed"] = json!(failed);
                 return Ok(state);
             }
             EventKind::RequestCancelled { request_id: id } if id == request_id => {
@@ -446,6 +461,9 @@ fn request_json(r: &HttpRequest) -> Value {
     if let Some(body) = &r.body {
         v["body"] = json!(body);
     }
+    if !r.expect.is_empty() {
+        v["expect"] = json!(r.expect);
+    }
     v
 }
 
@@ -461,6 +479,10 @@ fn entry_json(e: &HistoryEntry) -> Value {
     }
     if let Some(of) = e.rerun_of {
         v["rerun_of"] = json!(of);
+    }
+    if let Some((passed, failed)) = e.checks {
+        v["checks_passed"] = json!(passed);
+        v["checks_failed"] = json!(failed);
     }
     match &e.ended {
         Ended::Running => v["state"] = json!("running"),
@@ -515,6 +537,15 @@ fn add_response(v: &mut Value, r: &HttpResponse, max: usize) {
     }
 }
 
+/// A list of strings, or one string as a list of one.
+fn list_arg(args: &Value, name: &str) -> Vec<String> {
+    match args.get(name) {
+        Some(Value::Array(list)) => list.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(Value::String(one)) if !one.trim().is_empty() => vec![one.clone()],
+        _ => Vec::new(),
+    }
+}
+
 fn str_arg<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
     args.get(name).and_then(Value::as_str)
 }
@@ -563,6 +594,7 @@ fn tools() -> Value {
     let env = json!({ "type": "string", "description": "The environment whose variables fill `{{name}}`, as list_environments names them." });
     let headers = json!({ "type": "object", "additionalProperties": { "type": "string" }, "description": "Header name to value." });
     let id = json!({ "type": "integer", "description": "The request's number, as history and send results give it." });
+    let expect = json!({ "type": "array", "items": { "type": "string" }, "description": "What the answer should be, one each, checked when it arrives: `status 2xx`, `status == 201`, `time < 500` (ms), `header Content-Type contains json`, `$.user.id == 1`, `$.items[0].name contains Kam`, `len($.items) >= 3`, `$.token exists`, `body contains ok`. The result lists each with pass and what was found." });
     json!([
         {
             "name": "list_requests",
@@ -587,6 +619,7 @@ fn tools() -> Value {
                     "headers": headers,
                     "body": { "type": "string" },
                     "env": env,
+                    "expect": expect,
                     "wait_seconds": wait,
                 },
                 "required": ["url"],
@@ -645,6 +678,7 @@ fn tools() -> Value {
                     "url": { "type": "string" },
                     "headers": headers,
                     "body": { "type": "string" },
+                    "expect": expect,
                 },
                 "required": ["path", "url"],
             },

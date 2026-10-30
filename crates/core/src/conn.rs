@@ -15,7 +15,7 @@ use tracer_protocol::{
     Access, Actor, Command, DiffSide, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::{diff, envs, guard, http};
+use crate::{diff, envs, expect, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -148,7 +148,7 @@ pub fn serve(
                 hub.set_secret(actor.clone(), &env, &name, value).map(|_| ReplyBody::SecretSet)
             }
             (Some(_), Command::Response { request_id }) => match hub.response(request_id) {
-                Some((entry, response)) => Ok(ReplyBody::Response { entry, response }),
+                Some((entry, response, checks)) => Ok(ReplyBody::Response { entry, response, checks }),
                 None => Err(format!("there is no request #{request_id} in the history")),
             },
             (Some((_, actor)), Command::Decide { request_id, allow }) => {
@@ -159,7 +159,7 @@ pub fn serve(
             }
             (Some(_), Command::Diff { a, b, ignore, no_defaults }) => {
                 let side = |id: u64| match hub.response(id) {
-                    Some((entry, Some(response))) => Ok((
+                    Some((entry, Some(response), _)) => Ok((
                         DiffSide {
                             request_id: id,
                             method: entry.request.method,
@@ -249,12 +249,18 @@ fn send(
         let redirects = rules.is_none_or(|r| r.access != Access::Local);
         // Secret values that come back are replaced by their names before
         // anything is published or journalled.
-        let kind = match resolved.and_then(|request| http::execute(&request, redirects, &cancelled)) {
-            Ok(response) => EventKind::RequestFinished { request_id, response: envs::redact_response(response, &secrets) },
-            Err(error) => EventKind::RequestFailed { request_id, error: envs::redact(&error, &secrets) },
+        let outcome = resolved
+            .and_then(|request| http::execute(&request, redirects, &cancelled))
+            .map(|response| envs::redact_response(response, &secrets))
+            .map_err(|error| envs::redact(&error, &secrets));
+        // Checked on what clients see, secrets already taken out.
+        let results = expect::check(&request.expect, outcome.as_ref().map_err(String::as_str));
+        let kind = match outcome {
+            Ok(response) => EventKind::RequestFinished { request_id, response },
+            Err(error) => EventKind::RequestFailed { request_id, error },
         };
         // Dropped if the request was cancelled meanwhile.
-        hub.end_request(actor, request_id, kind);
+        hub.end_checked(actor, request_id, kind, results);
     });
 }
 

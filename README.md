@@ -35,6 +35,28 @@ tracer status -w <dir>               # who is connected
 - `crates/core`: the core (`cargo test -p tracer-core`)
 - `crates/cli`: the `tracer` command
 
+## Checks
+
+A request can say what its answer should be, one expectation a line. In a
+saved request they're `# @expect` comments above the request line, which
+REST Client and JetBrains skip:
+
+```http
+# @expect status 2xx
+# @expect $.items[0].name == Kampala
+# @expect len($.items) >= 3
+# @expect header Content-Type contains json
+# @expect time < 500
+GET {{base}}/cities
+```
+
+The core checks them when the answer arrives (`status`, `time`, `ttfb`,
+`size`, `header <name>`, `body`, `$.path`, `len($.path)`; `==`, `!=`, `<`,
+`<=`, `>`, `>=`, `contains`, `exists`, `missing`, and `status 2xx`). `tracer
+run`, `tracer send --expect '…'` and `tracer rerun` print each and exit 1
+if one fails; the window has a Checks tab on both sides; agents pass
+`expect` and get `checks` back.
+
 ## The local API
 
 Anything else (a script, a web page on this machine, another tool) talks

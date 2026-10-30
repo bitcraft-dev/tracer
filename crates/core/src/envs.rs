@@ -196,6 +196,7 @@ pub fn resolve(request: &HttpRequest, env: Option<&Environment>) -> Result<HttpR
         url: f(&request.url),
         headers: request.headers.iter().map(|(k, v)| (k.clone(), f(v))).collect(),
         body: request.body.as_deref().map(&mut f),
+        expect: request.expect.clone(),
     };
     if missing.is_empty() {
         return Ok(resolved);
@@ -246,7 +247,7 @@ mod tests {
     fn secrets_fill_in_win_over_variables_and_are_redacted_longest_first() {
         let secrets = vec![("token".to_string(), "s3cr3t-value".to_string()), ("short".to_string(), "abc".to_string()), ("inner".to_string(), "cr3t".to_string())];
         let env = with_secrets(local(), &secrets);
-        let request = HttpRequest { method: "GET".into(), url: "{{baseUrl}}/?t={{token}}".into(), headers: vec![], body: None };
+        let request = HttpRequest { method: "GET".into(), url: "{{baseUrl}}/?t={{token}}".into(), headers: vec![], body: None, expect: Vec::new() };
         assert_eq!(resolve(&request, Some(&env)).unwrap().url, "http://localhost:8080/?t=s3cr3t-value");
         assert_eq!(redact("got s3cr3t-value and abc", &secrets), "got {{token}} and abc");
         assert_eq!(redact("cr3t alone", &secrets), "{{inner}} alone");
@@ -259,6 +260,7 @@ mod tests {
             url: "{{baseUrl}}/albums?t={{ token }}".into(),
             headers: vec![("Authorization".into(), "Bearer {{token}}".into())],
             body: Some("{\"url\": \"{{baseUrl}}\"}".into()),
+            expect: Vec::new(),
         };
         let r = resolve(&request, Some(&local())).unwrap();
         assert_eq!(r.url, "http://localhost:8080/albums?t=a=b");
@@ -268,10 +270,10 @@ mod tests {
 
     #[test]
     fn a_missing_variable_is_named_not_sent() {
-        let request = HttpRequest { method: "GET".into(), url: "{{host}}/{{baseUrl}}/{{host}}".into(), headers: vec![], body: None };
+        let request = HttpRequest { method: "GET".into(), url: "{{host}}/{{baseUrl}}/{{host}}".into(), headers: vec![], body: None, expect: Vec::new() };
         assert_eq!(resolve(&request, Some(&local())).unwrap_err(), "{{host}} not defined in environment `local`");
         assert_eq!(resolve(&request, None).unwrap_err(), "uses {{host}}, {{baseUrl}}; choose an environment");
-        let plain = HttpRequest { method: "GET".into(), url: "http://x/{{".into(), headers: vec![], body: None };
+        let plain = HttpRequest { method: "GET".into(), url: "http://x/{{".into(), headers: vec![], body: None, expect: Vec::new() };
         assert_eq!(resolve(&plain, None).unwrap().url, "http://x/{{");
     }
 
