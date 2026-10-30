@@ -1,7 +1,8 @@
-<!-- Tracer's window, Phase 1: a client of the workspace's core, like the CLI.
-     It holds nothing about requests that the core did not tell it: history,
-     responses and who is connected are all built from the core's event
-     stream, so a request sent by `tracer send` shows up here as well. -->
+<!-- Tracer's window: a client of the workspace's core, like the CLI.
+     It holds nothing about requests that the core did not tell it: saved
+     requests, history, responses and who is connected all come from the
+     core, its list and its event stream, so what `tracer save` or an agent
+     does shows up here as well. -->
 <template>
   <screen class="app" @key="onKey(event)" @close="onClose()">
     <view class="main">
@@ -11,11 +12,40 @@
       </view>
 
       <view class="side" :style="`width: ${sideWidth}px`">
+        <view class="env">
+          <input type="select" r-model="envPick" :options="envOptions" />
+        </view>
+        <text class="empty warn" r-for="w in envSkipped">skipped {{ w }}</text>
         <view class="side-h">
+          <text class="side-title">Collections</text>
+          <text class="count">{{ saved.length }}</text>
+          <view class="side-add" @tap="newRequest()"><text class="side-add-t">+</text></view>
+        </view>
+        <view class="list">
+          <text class="empty" r-if="saved.length == 0">No saved requests yet. Ctrl+S saves the one you're editing.</text>
+          <view
+            class="row"
+            r-for="s in saved"
+            r-key="s.path"
+            :class="{ on: s.path == openPath }"
+            @tap="openSaved(s.path)">
+            <view class="row-top">
+              <text class="m" :style="`color: ${methodColor(s.method)}`">{{ s.method }}</text>
+              <text class="row-url">{{ nameOf(s.path) }}</text>
+            </view>
+            <view class="row-bottom" r-if="folderOf(s.path) != &quot;&quot;">
+              <text class="st"></text>
+              <text class="who">{{ folderOf(s.path) }}</text>
+            </view>
+          </view>
+          <text class="empty warn" r-for="w in skipped">skipped {{ w }}</text>
+        </view>
+
+        <view class="side-h second">
           <text class="side-title">History</text>
           <text class="count">{{ requests.length }}</text>
         </view>
-        <view class="history">
+        <view class="list">
           <text class="empty" r-if="requests.length == 0">Nothing yet. Send a request, or run tracer send in this workspace.</text>
           <view
             class="row"
@@ -30,6 +60,7 @@
             <view class="row-bottom">
               <text class="st" :style="`color: ${statusColor(r)}`">{{ statusText(r) }}</text>
               <text class="who">{{ r.actorKind }} · {{ r.actor }}</text>
+              <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
             </view>
           </view>
         </view>
@@ -38,6 +69,12 @@
       <view class="split-v" @drag="resizeSide(event)"><view class="grip-v"></view></view>
 
       <view class="work">
+        <view class="title">
+          <text class="title-t" :class="{ unsaved: openPath == &quot;&quot; }">{{ if openPath == "" { "Unsaved request" } else { openPath } }}</text>
+          <text class="dirty" r-if="dirty">●</text>
+          <text class="notice" r-if="notice != &quot;&quot;">{{ notice }}</text>
+          <view class="save" @tap="save()"><text class="save-t">Save</text></view>
+        </view>
         <view class="bar">
           <view class="method">
             <input type="select" r-model="method" :options="methods" />
@@ -110,9 +147,20 @@
     <view class="status">
       <text class="dot" :style="`color: ${linkColor()}`">●</text>
       <text class="status-t">{{ linkText() }}</text>
+      <text class="status-t">env: {{ if envPick == NO_ENV { "none" } else { envPick } }}</text>
       <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
       <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
       <text class="status-t key">Ctrl+K</text>
+    </view>
+
+    <view class="scrim" r-if="naming" @tap="naming = false">
+      <view class="palette" @tap="noop()">
+        <text class="prompt-h">Save as</text>
+        <view class="pal-field">
+          <input r-model="saveName" placeholder="folder/name, such as albums/get album" autofocus @key="nameKey(event)" />
+        </view>
+        <text class="prompt-hint">requests/{{ saveName }}.http · Enter saves · Esc cancels</text>
+      </view>
     </view>
 
     <view class="scrim" r-if="palette" @tap="closePalette()">
@@ -139,6 +187,8 @@
   * { box-sizing: border-box; }
 
   .app {
+    /* Rux's own dropdown and selection toolbar follow the root's scheme. */
+    color-scheme: dark;
     display: flex;
     flex-direction: column;
     height: 100vh;
@@ -181,8 +231,24 @@
   .side-h { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px 14px; }
   .side-title { color: #f0f0f0; font-size: 13px; font-weight: 700; }
   .count { color: #8a8a8a; font-size: 11px; padding: 1px 6px; background: #262626; border-radius: 8px; }
-  .history { flex: 1; display: flex; flex-direction: column; gap: 2px; padding: 0 8px 8px 8px; overflow-y: auto; }
+  .side-h.second { border-top: 1px solid #262626; }
+  .env {
+    display: flex;
+    align-items: center;
+    height: 34px;
+    margin: 12px 10px 2px 10px;
+    padding: 0 10px;
+    background: #141414;
+    border: 1px solid #2e2e2e;
+    border-radius: 6px;
+  }
+  .env-tag { color: #9d8ff5; font-size: 10px; padding: 0 5px; border: 1px solid #3a3550; border-radius: 4px; }
+  .side-add { margin-left: auto; padding: 0 8px; border-radius: 4px; cursor: pointer; }
+  .side-add:hover { background: #2b2540; }
+  .side-add-t { color: #9d8ff5; font-size: 16px; font-weight: 700; }
+  .list { flex: 1; display: flex; flex-direction: column; gap: 2px; padding: 0 8px 8px 8px; overflow-y: auto; }
   .empty { color: #6a6a6a; font-size: 12px; padding: 8px; }
+  .empty.warn { color: #e8a54b; font-family: monospace; font-size: 11px; }
 
   .row { display: flex; flex-direction: column; gap: 3px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
   .row:hover { background: #232323; }
@@ -196,6 +262,14 @@
 
   .work { flex: 1; display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; min-width: 0; }
 
+  .title { display: flex; gap: 8px; align-items: center; min-height: 26px; }
+  .title-t { color: #e0e0e0; font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .title-t.unsaved { color: #8a8a8a; font-weight: 400; }
+  .dirty { color: #e8a54b; font-size: 10px; }
+  .notice { flex: 1; min-width: 0; color: #e8a54b; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .save { margin-left: auto; padding: 4px 14px; border: 1px solid #3a3550; border-radius: 6px; cursor: pointer; }
+  .save:hover { background: #2b2540; }
+  .save-t { color: #c8c0f8; font-size: 12px; font-weight: 700; }
   .bar { display: flex; gap: 8px; align-items: center; }
   .method, .url {
     display: flex;
@@ -290,6 +364,8 @@
   .cmd.on { background: #2b2540; }
   .cmd-label { flex: 1; color: #d4d4d4; font-size: 13px; }
   .cmd-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; }
+  .prompt-h { color: #f0f0f0; font-size: 13px; font-weight: 700; padding: 2px 4px 8px 4px; }
+  .prompt-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; padding: 2px 4px; }
   .status-t { color: #b0b0b0; font-size: 11px; white-space: nowrap; }
   .status-t.dim { flex: 1; min-width: 0; color: #6a6a6a; overflow: hidden; text-overflow: ellipsis; }
 </style>
@@ -298,6 +374,8 @@
   use native::tracer;
   use type native::tracer::CoreEvent;
   use type native::tracer::Header;
+  use type native::tracer::Saved;
+  use type native::tracer::Env;
 
   // One request as the core described it: started, then finished or failed.
   type Row = {
@@ -314,10 +392,14 @@
     body: string,
     resHeaders: Header[],
     error: string,
-    cancelledBy: string
+    cancelledBy: string,
+    env: string
   };
 
   type Client = { client: int, actor: string, actorKind: string };
+
+  // The picker's entry for sending with no environment.
+  let NO_ENV = "No environment";
 
   let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
   let method = signal("GET");
@@ -337,6 +419,11 @@
 
   let commands: Cmd[] = [
     { id: "send", label: "Send the request", hint: "Ctrl+Enter" },
+    { id: "save", label: "Save the request", hint: "Ctrl+S" },
+    { id: "save-as", label: "Save the request as…", hint: "" },
+    { id: "new", label: "New request", hint: "" },
+    { id: "delete", label: "Delete the open request", hint: "" },
+    { id: "reload-saved", label: "Reload the saved requests", hint: "" },
     { id: "cancel", label: "Cancel the request on show", hint: "" },
     { id: "newest", label: "Open the newest request", hint: "" },
     { id: "req:body", label: "Edit the request body", hint: "" },
@@ -346,6 +433,27 @@
     { id: "layout", label: "Reset the layout", hint: "" },
     { id: "reconnect", label: "Reconnect to the core", hint: "" }
   ] + methods.map(m => { id: `method:${m}`, label: `Set the method to ${m}`, hint: "" });
+
+  // Saved requests, as the core's list and its events say. `asOf` is the
+  // event number the list was true at; 0 until it has come.
+  let saved: Saved[] = signal([]);
+  let skipped: string[] = signal([]);
+  let asOf = signal(0);
+  // Saves and deletes waiting to be applied; see the effect below.
+  let inbox: CoreEvent[] = signal([]);
+
+  // The saved request in the editor, by path; "" for one not saved yet.
+  let openPath = signal("");
+  let notice = signal("");
+  // A request clicked while there were unsaved edits: a second click opens it.
+  let pendingOpen = signal("");
+  let naming = signal(false);
+  let saveName = signal("");
+
+  let envs: Env[] = signal([]);
+  let envSkipped: string[] = signal([]);
+  // The environment requests are sent with, remembered across launches.
+  let envPick = signal(settings.get("env") ?? NO_ENV);
 
   let palette = signal(false);
   let search = signal("");
@@ -358,6 +466,10 @@
 
   computed history = requests.sort((a, b) => b.id - a.id);
   computed sel = requests.find(r => r.id == selected);
+  computed current = saved.find(s => s.path == openPath);
+  // Unsaved edits to a saved request. A request never saved is a scratch pad.
+  computed dirty = if openPath == "" { false } else if current == none { true } else { !sameAs(current) };
+  computed envOptions = [NO_ENV] + envs.map(e => e.name);
   computed hits = commands.filter(c => c.label.toLowerCase().includes(search.toLowerCase()));
 
   // A new filter starts at its first match.
@@ -376,6 +488,34 @@
       await tracer.connect(tracer.defaultWorkspace());
     } catch e {
       error = `could not reach the core: ${e.message}`;
+      return;
+    }
+    await loadSaved();
+    await loadEnvs();
+  }
+
+  async fn loadEnvs() {
+    try {
+      let list = await tracer.listEnvironments();
+      envs = list.environments;
+      envSkipped = list.skipped;
+    } catch e {
+      error = `could not list the environments: ${e.message}`;
+    }
+  }
+
+  effect {
+    settings.set("env", envPick);
+  }
+
+  async fn loadSaved() {
+    try {
+      let c = await tracer.listRequests();
+      saved = c.requests;
+      skipped = c.skipped;
+      asOf = c.asOf;
+    } catch e {
+      error = `could not list the saved requests: ${e.message}`;
     }
   }
 
@@ -383,6 +523,9 @@
   // replayed from the start of the journal when the window opens.
   effect {
     for e in tracer.events {
+      // Numbered with no gaps, so anything at or below the last one seen has
+      // been handled: a replay asked for again, or a list seen twice.
+      if e.seq <= lastSeq { continue; }
       lastSeq = e.seq;
       if e.kind == "request_started" {
         requests.push({
@@ -399,7 +542,8 @@
           body: "",
           resHeaders: [],
           error: "",
-          cancelledBy: ""
+          cancelledBy: "",
+          env: e.env
         });
       } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {
         requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
@@ -407,9 +551,156 @@
         clients.push({ client: e.client, actor: e.actor, actorKind: e.actorKind });
       } else if e.kind == "client_left" {
         clients = clients.filter(c => c.client != e.client);
+      } else if e.kind == "request_saved" || e.kind == "request_deleted" {
+        // The list covers everything numbered before `asOf`.
+        if asOf > 0 && e.seq >= asOf {
+          inbox.push(e);
+        }
+      } else if e.kind == "environment_changed" {
+        loadEnvs();
       } else if e.kind == "core_stopping" {
         clients = [];
       }
+    }
+  }
+
+  // Saves and deletes are applied here rather than in the effect above, which
+  // reads the channel: deciding what to do compares them with the editor's
+  // fields, and that effect shouldn't depend on what's typed.
+  effect {
+    if inbox.length > 0 {
+      let batch = inbox;
+      inbox = [];
+      for e in batch {
+        applySaved(e);
+      }
+    }
+  }
+
+  fn applySaved(e: CoreEvent) {
+    let who = `${e.actorKind} · ${e.actor}`;
+    if e.kind == "request_deleted" {
+      saved = saved.filter(s => s.path != e.path);
+      if e.path == openPath && e.actorKind != "window" {
+        notice = `${who} deleted it; Save puts it back`;
+      }
+      return;
+    }
+    let s = { path: e.path, method: e.method, url: e.url, headers: e.headers, body: e.body };
+    let before = saved.find(x => x.path == e.path);
+    if e.path == openPath && !sameAs(s) {
+      if before == none || sameAs(before) {
+        // No edits of our own: follow theirs.
+        load(s);
+        notice = `updated by ${who}`;
+      } else {
+        // The dev's edit wins; say what happened.
+        notice = `${who} saved this; your unsaved edits are kept`;
+      }
+    }
+    if before == none {
+      saved = (saved + [s]).sort((a, b) => if a.path < b.path { -1 } else if a.path > b.path { 1 } else { 0 });
+    } else {
+      saved = saved.map(x => if x.path == e.path { s } else { x });
+    }
+  }
+
+  // Whether the editor holds exactly `s`.
+  fn sameAs(s: Saved): bool {
+    method == s.method && url.trim() == s.url && body == s.body && headerLines(sentHeaders()) == headerLines(s.headers)
+  }
+
+  fn load(s: Saved) {
+    method = s.method;
+    url = s.url;
+    body = s.body;
+    headerText = headerLines(s.headers);
+  }
+
+  fn headerLines(list: Header[]): string {
+    list.map(h => `${h.name}: ${h.value}`).join("\n")
+  }
+
+  fn nameOf(path: string): string {
+    let parts = path.split("/");
+    parts[parts.length - 1]
+  }
+
+  fn folderOf(path: string): string {
+    let parts = path.split("/");
+    parts.slice(0, parts.length - 1).join("/")
+  }
+
+  // Opening another request over unsaved edits takes a second click.
+  fn guardEdits(target: string): bool {
+    if dirty && pendingOpen != target {
+      pendingOpen = target;
+      notice = `unsaved edits to ${openPath}: Save keeps them, or click again to drop them`;
+      return false;
+    }
+    pendingOpen = "";
+    true
+  }
+
+  fn openSaved(path: string) {
+    if path == openPath || !guardEdits(path) { return; }
+    let s = saved.find(x => x.path == path);
+    if s == none { return; }
+    load(s);
+    openPath = path;
+    notice = "";
+  }
+
+  fn newRequest() {
+    if !guardEdits("(new)") { return; }
+    openPath = "";
+    method = "GET";
+    url = "";
+    body = "";
+    headerText = "";
+    notice = "";
+  }
+
+  fn save() {
+    if openPath == "" {
+      askName();
+    } else {
+      saveAs(openPath);
+    }
+  }
+
+  fn askName() {
+    blur();
+    saveName = openPath;
+    naming = true;
+  }
+
+  fn saveAs(path: string) {
+    try {
+      openPath = tracer.saveRequest(path, method, url, sentHeaders(), body);
+      naming = false;
+      notice = "";
+      error = "";
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  fn deleteOpen() {
+    if openPath == "" { return; }
+    try {
+      tracer.deleteRequest(openPath);
+      openPath = "";
+      notice = "deleted; what's in the editor is unsaved now";
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  fn nameKey(e: KeyEvent) {
+    if e.key == "Enter" {
+      saveAs(saveName);
+      return false;
     }
   }
 
@@ -440,7 +731,8 @@
     }
     error = "";
     try {
-      selected = tracer.send(method, url, sentHeaders(), body);
+      let env = if envPick == NO_ENV { "" } else { envPick };
+      selected = tracer.send(method, url, sentHeaders(), body, env);
       resTab = "body";
     } catch e {
       error = e.message;
@@ -608,6 +900,16 @@
     closePalette();
     if id == "send" {
       send();
+    } else if id == "save" {
+      save();
+    } else if id == "save-as" {
+      askName();
+    } else if id == "new" {
+      newRequest();
+    } else if id == "delete" {
+      deleteOpen();
+    } else if id == "reload-saved" {
+      loadSaved();
     } else if id == "cancel" {
       cancel();
     } else if id == "newest" {
@@ -624,7 +926,9 @@
       settings.set("sideWidth", sideWidth);
       settings.set("reqHeight", reqHeight);
     } else if id == "reconnect" {
-      connect();
+      // Connected already, `connect` replays the journal, which this page
+      // has; only a lost or closed link is worth it.
+      if !connected() { connect(); }
     }
   }
 
@@ -635,6 +939,14 @@
     }
     if e.key == "Escape" && palette {
       closePalette();
+      return false;
+    }
+    if e.key == "Escape" && naming {
+      naming = false;
+      return false;
+    }
+    if e.primary && e.key == "s" {
+      save();
       return false;
     }
     if e.primary && e.key == "Enter" {

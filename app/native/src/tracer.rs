@@ -58,6 +58,8 @@ pub struct CoreEvent {
     pub kind: String,
     /// A saved request's path, for `request_saved` and `request_deleted`.
     pub path: String,
+    /// The environment a started request was sent with, or "".
+    pub env: String,
     pub client: u64,
     pub request_id: u64,
     pub method: String,
@@ -93,6 +95,29 @@ pub struct Collection {
     pub requests: Vec<Saved>,
     pub as_of: u64,
     /// Files under `requests/` that don't parse, and why.
+    pub skipped: Vec<String>,
+}
+
+/// One `KEY=value` of an environment.
+#[rux::export]
+#[derive(Clone)]
+pub struct Var {
+    pub name: String,
+    pub value: String,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct Env {
+    pub name: String,
+    pub vars: Vec<Var>,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct EnvList {
+    pub environments: Vec<Env>,
+    /// Files under `environments/` that don't parse, and why.
     pub skipped: Vec<String>,
 }
 
@@ -147,13 +172,20 @@ pub fn default_workspace() -> String {
 
 /// Connect to `workspace`'s core, starting one if none answers, and follow its
 /// events from the beginning of its journal. Connecting again while connected
-/// answers at once.
+/// keeps the connection and has the journal sent again from the start: the
+/// page asking is a fresh one (a dev build's hot reload keeps the Rust side
+/// and resets the page), and has none of it.
 #[rux::export]
 pub async fn connect(workspace: String) -> Result<Link, CoreError> {
     let _one_at_a_time = CONNECTING.lock().unwrap();
-    if let (Some(link), Some(_)) = (LINK.get(), SESSION.lock().unwrap().as_ref()) {
+    let live = SESSION.lock().unwrap().as_ref().map(|s| s.shared.clone());
+    if let (Some(link), Some(shared)) = (LINK.get(), live) {
         if link.state == "connected" {
-            return Ok(link);
+            return match shared.call(Command::Subscribe { since: Some(0) }) {
+                Ok(Ok(_)) => Ok(link),
+                Ok(Err(refused)) => Err(CoreError(refused)),
+                Err(e) => Err(CoreError(e.to_string())),
+            };
         }
     }
     let ws = PathBuf::from(&workspace);
@@ -193,10 +225,12 @@ pub async fn connect(workspace: String) -> Result<Link, CoreError> {
 
 /// Send a request through the core. Gives its id at once; what happens to it
 /// arrives on `events`, to this window and to every other client alike.
+/// `env` names the environment that fills its `{{name}}`s; "" for none.
 #[rux::export]
-pub fn send(method: String, url: String, headers: Vec<Header>, body: String) -> Result<u64, CoreError> {
+pub fn send(method: String, url: String, headers: Vec<Header>, body: String, env: String) -> Result<u64, CoreError> {
     let request = request_of(method, url, headers, body);
-    match shared()?.call(Command::Send { request, env: None }) {
+    let env = if env.is_empty() { None } else { Some(env) };
+    match shared()?.call(Command::Send { request, env }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
@@ -222,6 +256,23 @@ pub async fn list_requests() -> Result<Collection, CoreError> {
         Ok(Ok(ReplyBody::Requests { requests, as_of, skipped })) => {
             Ok(Collection { requests: requests.into_iter().map(saved_of).collect(), as_of, skipped })
         }
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// The workspace's environments, read from their files by the core.
+#[rux::export]
+pub async fn list_environments() -> Result<EnvList, CoreError> {
+    match shared()?.call(Command::ListEnvironments) {
+        Ok(Ok(ReplyBody::Environments { environments, skipped, .. })) => Ok(EnvList {
+            environments: environments
+                .into_iter()
+                .map(|e| Env { name: e.name, vars: e.vars.into_iter().map(|(name, value)| Var { name, value }).collect() })
+                .collect(),
+            skipped,
+        }),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
@@ -410,6 +461,7 @@ fn to_page(event: Event) -> CoreEvent {
         actor: event.actor.name,
         kind: String::new(),
         path: String::new(),
+        env: String::new(),
         client: 0,
         request_id: 0,
         method: String::new(),
@@ -426,8 +478,9 @@ fn to_page(event: Event) -> CoreEvent {
     match event.kind {
         EventKind::ClientJoined { client } => (out.kind, out.client) = ("client_joined".into(), client),
         EventKind::ClientLeft { client } => (out.kind, out.client) = ("client_left".into(), client),
-        EventKind::RequestStarted { request_id, request, .. } => {
+        EventKind::RequestStarted { request_id, request, env } => {
             out.kind = "request_started".into();
+            out.env = env.unwrap_or_default();
             out.request_id = request_id;
             out.method = request.method;
             out.url = request.url;
@@ -465,7 +518,7 @@ fn to_page(event: Event) -> CoreEvent {
             out.kind = "request_deleted".into();
             out.path = path;
         }
-        // Environments reach the window in the next step.
+        // The window lists them again: they're few and small.
         EventKind::EnvironmentSaved { .. } | EventKind::EnvironmentDeleted { .. } => out.kind = "environment_changed".into(),
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }

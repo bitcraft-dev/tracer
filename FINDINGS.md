@@ -473,7 +473,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** put the native signals into the state before `ir.init()`
   runs (their current value, or `none`, as the docs promise), as the router's
   names are; and phrase the error with the name the author wrote.
-- **Status:** open.
+- **Status:** fixed in Rux 800250d ("A computed can read a native signal on the first run"). **Runtime verified by Tracer, 2026-10-30**, in its window built against Rux a2c986b: `computed linkState = tracer.link?.state ?? "none"` loads and reads `connected`. The installed `rux check` (from a27366f) still refuses it, so Tracer keeps its `fn connected()` until the new build is installed, then moves it back to a `computed` and closes this.
 
 ## AW-020 Script lacks everyday helpers, and two it has (`reverse`, `replace`) silently mutate and return nothing
 
@@ -528,7 +528,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   being used. Then add the missing helpers under JavaScript's names, plus
   `Math`, `JSON` and `Object.keys/values/entries`, since authors will reach
   for them first.
-- **Status:** open.
+- **Status:** fixed in Rux a2c986b ("JavaScript's everyday helpers, and reverse and replace answer as it does"). **Runtime verified by Tracer, 2026-10-30**, in its window built against a2c986b: `[1, 2, 3].reverse()` gives `3, 2, 1`, `"a-a".replace("a", "b")` gives `b-a`, and `"7".padStart(3, "0")` gives `007`. The rest of the list, and `rux check` agreeing, are to be gone through once the new build is installed.
 
 ## AW-021 `&quot;` is decoded in an attribute but not inside `{{ }}` in text
 
@@ -692,6 +692,78 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   being dropped); and drop the future when its owner goes, saying so in the
   docs. A timeout falls out of the same handle once script has a clock
   (AW-009).
+- **Status:** open.
+
+## AW-027 An `effect` that empties a signal it reads is never woken by that signal again
+
+- **Found:** 2026-10-30, Tracer's live sync of saved requests: the first
+  change from an agent or from disk reached the open editor, and no later one
+  did.
+- **Severity:** **bug**, silent. A queue drained by an effect (`read it, act,
+  set it to []`) is an ordinary pattern, and the docs promise it works.
+- **Limit:** `docs/07-script.md`: an effect "subscribes to what it actually
+  read on its last run, and is never woken by its own writes". This one
+  reads `inbox` on every run, so it should stay subscribed to it. After the
+  first run in which it also *assigns* `inbox`, pushes from elsewhere no
+  longer wake it:
+
+  ```rux
+  <template>
+    <screen>
+      <view @tap="add()"><text>push</text></view>
+      <text>pushed {{ pushed }} · drained {{ drained }} · inbox {{ inbox.length }}</text>
+    </screen>
+  </template>
+  <script>
+    let inbox: int[] = signal([]);
+    let pushed = signal(0);
+    let drained = signal(0);
+    fn add() { pushed += 1; inbox.push(pushed); }
+    effect {
+      if inbox.length > 0 {
+        let batch = inbox;
+        inbox = [];
+        drained += batch.length;
+      }
+    }
+  </script>
+  ```
+
+  Three taps: **pushed 3 · drained 1 · inbox 2**. In Tracer the push comes
+  from another effect (the one reading the core's `rux::Channel`), with the
+  same result: three changes on disk, events 43 to 45 all reached the page,
+  **inbox 2, applied 1**, and a hover or a click doesn't wake it either.
+- **Where it reproduces:** the page above on the installed `rux` (built from
+  a27366f), and Tracer's window built against Rux a2c986b (clean checkout).
+- **Guess (not traced):** "never woken by its own writes" may be done by
+  leaving out of the effect's subscriptions every signal it wrote, rather
+  than by ignoring the wake its own write causes. The two differ exactly when
+  the effect both reads and writes a signal.
+- **Workaround:** none taken. Tracer's window follows the first outside
+  change to the open request after a load, and not the ones after it, until
+  this is fixed.
+- **Suggested fix:** keep a signal the effect read among its subscriptions
+  even if it also wrote it, and swallow only the wake caused by its own
+  write; a test with the page above.
+- **Status:** open.
+
+## AW-028 A page that loads again re-reads the channel's last list
+
+- **Found:** 2026-10-30, Tracer's window across a dev build's hot reload.
+- **Severity:** friction (dev builds); a value arriving twice breaks code that
+  counts or appends, which is what a channel is for.
+- **Limit:** a `rux::Channel` "still holds the last list" between arrivals,
+  and an `effect` "runs once on load". A hot reload resets the page but keeps
+  the Rust side, so the new page's effect runs on load and reads the list the
+  *old* page already handled: every value in it reaches the app twice, against
+  "every value reaches it exactly once". In Tracer: history showed 4 rows for
+  2 requests after a reload (the old page's last list was the journal's
+  replay, which the new page then asked for again).
+- **Workaround:** Tracer's events are numbered, so it drops any at or below
+  the last number seen. That is ordinary for a numbered stream; a channel of
+  unnumbered values has nothing to go on.
+- **Suggested fix:** a page that loads starts with an empty channel list; or
+  document that a reload replays the last list.
 - **Status:** open.
 
 ## Phase 0 results
