@@ -215,13 +215,35 @@ pub struct HttpResponse {
     pub timing: Timing,
 }
 
-/// Where a request's time went, in milliseconds since it was sent.
+/// Where a request's time went, in milliseconds.
+///
+/// `ttfb_ms` and `total_ms` count from when it was sent. The phases before
+/// the answer are each its own length: looking the host up, opening the
+/// connection, and the TLS handshake (none for `http:`). What's left of
+/// TTFB after them is the server's time, and `total_ms - ttfb_ms` the
+/// body's download. Requests journalled before the phases were measured
+/// have none.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Timing {
     /// Until the status line and headers had arrived.
     pub ttfb_ms: f64,
     /// Until the whole body had arrived.
     pub total_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ms: Option<f64>,
+}
+
+impl Timing {
+    /// TTFB less the phases before it: the server's time, and the request's
+    /// way there and back.
+    pub fn wait_ms(&self) -> f64 {
+        let before = self.dns_ms.unwrap_or(0.0) + self.connect_ms.unwrap_or(0.0) + self.tls_ms.unwrap_or(0.0);
+        (self.ttfb_ms - before).max(0.0)
+    }
 }
 
 /// What an agent may do, from [`POLICY_PATH`]: the rules for every agent
@@ -565,6 +587,13 @@ mod tests {
         let line = r#"{"seq":1,"at_ms":0,"actor":{"kind":"cli","name":"x"},"event":"request_started","request_id":1,"request":{"method":"GET","url":"http://x/"}}"#;
         let event: Event = serde_json::from_str(line).unwrap();
         assert!(matches!(event.kind, EventKind::RequestStarted { rerun_of: None, env: None, .. }));
+    }
+
+    #[test]
+    fn a_response_journalled_before_its_phases_were_timed_still_reads() {
+        let line = r#"{"status":200,"headers":[],"body":"","size":0,"timing":{"ttfb_ms":30.0,"total_ms":31.0}}"#;
+        let response: HttpResponse = serde_json::from_str(line).unwrap();
+        assert_eq!((response.timing.dns_ms, response.timing.wait_ms()), (None, 30.0));
     }
 
     #[test]

@@ -33,7 +33,7 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, ClientKind, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    Discovery, SavedRequest, StatusClass, DISCOVERY_PATH,
+    Discovery, SavedRequest, StatusClass, Timing, DISCOVERY_PATH,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -486,8 +486,12 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Resul
         match event.kind {
             EventKind::RequestFinished { request_id: id, response } if id == request_id => {
                 eprintln!(
-                    "{} · TTFB {:.0} ms · total {:.0} ms · {} B",
-                    response.status, response.timing.ttfb_ms, response.timing.total_ms, response.size
+                    "{} · TTFB {:.0} ms{} · total {:.0} ms · {} B",
+                    response.status,
+                    response.timing.ttfb_ms,
+                    phases(&response.timing),
+                    response.timing.total_ms,
+                    response.size
                 );
                 println!("{}", response.body);
                 return Ok(if response.status < 400 { ExitCode::SUCCESS } else { ExitCode::FAILURE });
@@ -513,6 +517,22 @@ fn watch(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     loop {
         println!("{}", describe(&client.next_event()?));
     }
+}
+
+/// ` (DNS 3 · connect 41 · TLS 80 · wait 120)`: where TTFB went, or ""
+/// for a request journalled before the phases were measured.
+fn phases(t: &Timing) -> String {
+    let mut parts = Vec::new();
+    for (name, ms) in [("DNS", t.dns_ms), ("connect", t.connect_ms), ("TLS", t.tls_ms)] {
+        if let Some(ms) = ms {
+            parts.push(format!("{name} {ms:.0}"));
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    parts.push(format!("wait {:.0}", t.wait_ms()));
+    format!(" ({})", parts.join(" · "))
 }
 
 /// One line per event, for a person reading a terminal.

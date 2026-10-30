@@ -23,7 +23,10 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 - **Phase 4's response viewer is on branch `phase-4-response-tools`**, not
   on `phase-1-core`: written and unit-tested, but opening any finished
   request's body panics the window (AW-037). Merge it once AW-037 is fixed
-  and the viewer is driven.
+  and the viewer is driven. `app/app.rux` has changed on both since (the
+  waterfall is on `phase-1-core`), so expect to merge by hand there.
+- **Telling the Rux team about AW-037 is for 2026-10-31**, not before: the
+  user's call on 2026-10-30. Draft it and ask, as always.
 - **Other Claude sessions:** the Rux team works in sessions on
   `C:\Users\USER\Mobile\UI Research` (named ui-research-97 and
   ui-research-eb on 2026-10-30), and they message Tracer's session when a
@@ -300,16 +303,26 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   numbered lines, ▾/▸ per foldable line, colours by kind. 4 unit tests.
   Driving it found **AW-037** (the window panics on the first body shown).
 
+- **Phase 4: the timing waterfall** (on `phase-1-core`, not blocked by
+  AW-037). `crates/core/src/http.rs` builds `ureq`'s default connector
+  chain itself with marks after TCP and TLS, and wraps its resolver, so
+  each request reports `dns_ms`, `connect_ms`, `tls_ms` (none for `http:`)
+  beside TTFB and total; `Timing::wait_ms` is what's left of TTFB. Old
+  journals read (the fields are optional). With redirects, the phases are
+  the first connection's. CLI: `200 · TTFB 1649 ms (DNS 1079 · connect
+  186 · TLS 191 · wait 193) · total …`; MCP: `phases_ms`; window: a
+  segmented bar and its key under the chips, none for older requests.
+  44 tests, three runs clean. Driven: https://example.com spent 15,205 ms
+  of 16,646 in connect, which is this network's lost SYNs in one line.
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Phase 4: the rest of the response tools, then assertions and flows, then benchmarking
-   (with bench-size caps in the policy), then realtime and GraphQL. The
-   timing waterfall (DNS, connect, TLS, TTFB) comes early: it would have
-   told the network's faults from Tracer's in a minute (see the gotcha).
-   It's in the core, not the window, so it isn't blocked by AW-037.
+2. Phase 4, what doesn't need the viewer first: response diff (ignoring
+   noisy fields, core side), assertions and flows, then benchmarking (with
+   bench-size caps in the policy), then realtime and GraphQL.
 3. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
 4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client

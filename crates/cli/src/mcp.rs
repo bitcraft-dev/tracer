@@ -475,6 +475,17 @@ fn add_response(v: &mut Value, r: &HttpResponse, max: usize) {
     v["status"] = json!(r.status);
     v["ttfb_ms"] = json!(r.timing.ttfb_ms.round());
     v["total_ms"] = json!(r.timing.total_ms.round());
+    // Where the time went, each phase its own length, when it was measured.
+    if r.timing.dns_ms.is_some() {
+        let ms = |x: Option<f64>| x.map(|x| (x * 10.0).round() / 10.0);
+        v["phases_ms"] = json!({
+            "dns": ms(r.timing.dns_ms),
+            "connect": ms(r.timing.connect_ms),
+            "tls": ms(r.timing.tls_ms),
+            "wait": ms(Some(r.timing.wait_ms())),
+            "download": ms(Some(r.timing.total_ms - r.timing.ttfb_ms)),
+        });
+    }
     v["size"] = json!(r.size);
     let headers: Vec<String> = r.headers.iter().map(|(k, val)| format!("{k}: {val}")).collect();
     v["headers"] = json!(headers);

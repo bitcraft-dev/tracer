@@ -76,6 +76,12 @@ pub struct CoreEvent {
     pub status: u32,
     pub ttfb_ms: f64,
     pub total_ms: f64,
+    /// How long looking the host up, connecting and the TLS handshake took,
+    /// for `request_finished`; -1 where it wasn't measured (no TLS for
+    /// `http:`, or a request journalled before phases were timed).
+    pub dns_ms: f64,
+    pub connect_ms: f64,
+    pub tls_ms: f64,
     /// Why a request failed; for `policy_changed`, why the policy file was
     /// not taken, or "" if it was.
     pub error: String,
@@ -558,6 +564,9 @@ fn to_page(event: Event) -> CoreEvent {
         status: 0,
         ttfb_ms: 0.0,
         total_ms: 0.0,
+        dns_ms: -1.0,
+        connect_ms: -1.0,
+        tls_ms: -1.0,
         error: String::new(),
         reason: String::new(),
         allow: false,
@@ -584,6 +593,9 @@ fn to_page(event: Event) -> CoreEvent {
             out.size = response.size;
             out.ttfb_ms = response.timing.ttfb_ms;
             out.total_ms = response.timing.total_ms;
+            out.dns_ms = response.timing.dns_ms.unwrap_or(-1.0);
+            out.connect_ms = response.timing.connect_ms.unwrap_or(-1.0);
+            out.tls_ms = response.timing.tls_ms.unwrap_or(-1.0);
             out.body = shown(response.body);
         }
         EventKind::RequestFailed { request_id, error } => {

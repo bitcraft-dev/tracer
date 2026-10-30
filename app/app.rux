@@ -163,6 +163,17 @@
               <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
               <text class="chip">sent {{ when(sel.atMs) }}</text>
             </view>
+            <view class="fall" r-if="sel.state == &quot;done&quot; && sel.dnsMs >= 0.0">
+              <view class="fall-bar">
+                <view class="fall-seg" r-for="p in phases(sel)" :style="`flex-grow: ${p.ms}; background: ${p.color}`"></view>
+              </view>
+              <view class="fall-keys">
+                <view class="fall-key" r-for="p in phases(sel)">
+                  <view class="fall-dot" :style="`background: ${p.color}`"></view>
+                  <text class="fall-t">{{ p.name }} {{ ms(p.ms) }}</text>
+                </view>
+              </view>
+            </view>
             <view class="tabs">
               <view class="tab" :class="{ on: resTab == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
                 <text class="tab-label">Body</text>
@@ -457,6 +468,14 @@
   .again { color: #7a7a7a; font-size: 10px; font-family: monospace; }
   .when { margin-left: auto; color: #6a6a6a; font-size: 10px; font-family: monospace; white-space: nowrap; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .fall { display: flex; flex-direction: column; gap: 6px; }
+  .fall-bar { display: flex; gap: 1px; height: 8px; border-radius: 2px; overflow: hidden; }
+  .fall-seg { flex-basis: 0; flex-shrink: 1; min-width: 2px; }
+  .fall-keys { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .fall-key { display: flex; align-items: center; gap: 5px; }
+  .fall-dot { width: 8px; height: 8px; border-radius: 2px; }
+  .fall-t { color: #9a9a9a; font-size: 11px; font-family: monospace; }
   .chip { padding: 3px 9px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
 
   .pane {
@@ -560,6 +579,10 @@
     status: int,
     ttfbMs: float,
     totalMs: float,
+    // Each phase's own length, or -1 where it wasn't measured.
+    dnsMs: float,
+    connectMs: float,
+    tlsMs: float,
     size: int,
     body: string,
     resHeaders: Header[],
@@ -764,6 +787,9 @@
           status: 0,
           ttfbMs: 0.0,
           totalMs: 0.0,
+          dnsMs: -1.0,
+          connectMs: -1.0,
+          tlsMs: -1.0,
           size: 0,
           body: "",
           resHeaders: [],
@@ -1111,6 +1137,28 @@
     }
   }
 
+  type Phase = { name: string, ms: float, color: string };
+
+  // Where a finished request's time went, in order: each phase's own
+  // length, together the whole of it.
+  fn phases(r: Row): Phase[] {
+    let out: Phase[] = [
+      { name: "DNS", ms: r.dnsMs, color: "#5b8def" },
+      { name: "connect", ms: r.connectMs, color: "#e8a54b" }
+    ];
+    if r.tlsMs >= 0.0 {
+      out.push({ name: "TLS", ms: r.tlsMs, color: "#c586c0" });
+    }
+    let before = r.dnsMs + r.connectMs + Math.max(r.tlsMs, 0.0);
+    out.push({ name: "wait", ms: Math.max(r.ttfbMs - before, 0.0), color: "#4ec98f" });
+    out.push({ name: "download", ms: Math.max(r.totalMs - r.ttfbMs, 0.0), color: "#9d8ff5" });
+    out
+  }
+
+  fn ms(v: float): string {
+    if v < 10.0 { `${(v * 10.0).round() / 10.0} ms` } else { `${v.round()} ms` }
+  }
+
   fn settle(r: Row, e: CoreEvent): Row {
     let out = r;
     if e.kind == "request_failed" {
@@ -1124,6 +1172,9 @@
       out.status = e.status;
       out.ttfbMs = e.ttfbMs;
       out.totalMs = e.totalMs;
+      out.dnsMs = e.dnsMs;
+      out.connectMs = e.connectMs;
+      out.tlsMs = e.tlsMs;
       out.size = e.size;
       out.body = e.body;
       out.resHeaders = e.headers;

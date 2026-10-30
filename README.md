@@ -25,7 +25,8 @@ journalled stream of events that every client sees in the same order.
 cargo build -p tracer-cli
 tracer core -w <dir>                 # run the core for a workspace
 tracer watch -w <dir> [--all]        # follow what every client does, live
-tracer send GET https://… -w <dir>   # send a request, print its answer
+tracer send GET https://… -w <dir>   # send a request, print its answer and
+                                     # where its time went (DNS, connect, TLS, wait)
 tracer status -w <dir>               # who is connected
 ```
 

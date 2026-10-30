@@ -1158,3 +1158,20 @@ fn the_local_api_runs_a_command_over_http_and_the_protocol_over_a_websocket() {
     }
     core.stop();
 }
+
+#[test]
+fn a_finished_request_says_where_its_time_went() {
+    let ws = workspace("timing");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "test").unwrap();
+    cli.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("{base}/t"))).unwrap() else { panic!() };
+    let EventKind::RequestFinished { response, .. } = end_of(&mut cli, request_id) else { panic!() };
+    let t = response.timing;
+    let (dns, connect) = (t.dns_ms.expect("looked up"), t.connect_ms.expect("connected"));
+    assert_eq!(t.tls_ms, None, "plain http has no handshake");
+    assert!(dns >= 0.0 && connect >= 0.0 && t.wait_ms() >= 0.0);
+    assert!(dns + connect <= t.ttfb_ms && t.ttfb_ms <= t.total_ms, "{t:?}");
+    core.stop();
+}
