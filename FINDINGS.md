@@ -528,7 +528,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   being used. Then add the missing helpers under JavaScript's names, plus
   `Math`, `JSON` and `Object.keys/values/entries`, since authors will reach
   for them first.
-- **Status:** fixed in Rux a2c986b ("JavaScript's everyday helpers, and reverse and replace answer as it does"). **Runtime verified by Tracer, 2026-10-30**, in its window built against a2c986b: `[1, 2, 3].reverse()` gives `3, 2, 1`, `"a-a".replace("a", "b")` gives `b-a`, and `"7".padStart(3, "0")` gives `007`. The rest of the list, and `rux check` agreeing, are to be gone through once the new build is installed. **Verified by Tracer on Rux 4deca46 (installed `rux` 17:17), 2026-10-30:** every helper on the list above passes `rux check` and gives JavaScript's answer at runtime in a scratch page (`concat`, `flat`, `flatMap`, `findLast`, `lastIndexOf`, `at`, `toReversed`/`toSorted` leaving the array alone, `Array.from`, `padEnd`, `replaceAll`, `trimStart`/`trimEnd`, string `at`, `toFixed(1)` → `12.3`, `Math.max/min/floor/abs`, `Object.keys`, `JSON.stringify`/`parse`, `reverse`, `replace`). Tracer's `clamp` now uses `Math`. **Still missing: spread** (`[...a, 9]` is "`...` cannot start an expression"), which the docs list as not there yet; `concat` covers it. Closed apart from spread.
+- **Status:** fixed in Rux a2c986b ("JavaScript's everyday helpers, and reverse and replace answer as it does"). **Runtime verified by Tracer, 2026-10-30**, in its window built against a2c986b: `[1, 2, 3].reverse()` gives `3, 2, 1`, `"a-a".replace("a", "b")` gives `b-a`, and `"7".padStart(3, "0")` gives `007`. The rest of the list, and `rux check` agreeing, are to be gone through once the new build is installed. **Verified by Tracer on Rux 4deca46 (installed `rux` 17:17), 2026-10-30:** every helper on the list above passes `rux check` and gives JavaScript's answer at runtime in a scratch page (`concat`, `flat`, `flatMap`, `findLast`, `lastIndexOf`, `at`, `toReversed`/`toSorted` leaving the array alone, `Array.from`, `padEnd`, `replaceAll`, `trimStart`/`trimEnd`, string `at`, `toFixed(1)` → `12.3`, `Math.max/min/floor/abs`, `Object.keys`, `JSON.stringify`/`parse`, `reverse`, `replace`). Tracer's `clamp` now uses `Math`. **Still missing: spread** (`[...a, 9]` is "`...` cannot start an expression"), which the docs list as not there yet; `concat` covers it. Closed apart from spread. **Spread re-driven by Tracer on Rux 08c314f (installed `rux` 17:52), 2026-10-30:** `[...a, 9]`, `[...a, ...[7, 8]]` and `[..."hi"]` pass `rux check` and give `3, 1, 2, 9`, `3, 1, 2, 7, 8` and `h, i` at runtime, `a` unchanged; `[...n, 1]` with `n` an `int` is refused with "`...` spreads an array or a string, and this is an `int`". Map and call spread are not built, as the docs say. **Closed.**
 
 ## AW-021 `&quot;` is decoded in an attribute but not inside `{{ }}` in text
 
@@ -934,6 +934,46 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   bump buffer, or fall back to vello's fixed sizes when a count is still
   over after one regrow; a test that renders a tall scene and compares the
   bottom rows.
+- **Status:** fixed in Rux b604acc (pushed), by the Rux team: two vello buffers had a part per tile and per draw object the sized lengths left out; the first held 2,048 tiles' words, so tiles past it drew nothing (26 rows of 79 tiles = 415 px, 19 rows of 108 = 303 px: both measurements above). **Re-driven by Tracer on Rux 08c314f (installed `rux` 17:52), 2026-10-30**, debug, checkout clean: probe 1 and probe 6 draw to the bottom edge at 1728×972; probe 2 with 1,002 coloured lines (the busiest page) draws to the bottom at 1728×972, at 1280×800 after scrolling, and at 978×984. **Closed.**
+
+## AW-035 A flex row whose text wraps after it shrinks keeps its one-line height, and the second line paints over the next row
+
+- **Found:** 2026-10-30, re-driving probe 2 (AW-034) on Rux 08c314f, at a
+  window 978×984 (150%).
+- **Severity:** bug: wrapped lines overlap the line below, unreadable. A
+  response viewer in a narrow pane hits it on every long line.
+- **Limit:** each line of probe 2 is `<view class="ln">` (`display: flex;
+  gap: 14px`) holding `<text class="no">` (`width: 48px; text-align:
+  right`) and `<text class="code" :style="padding-left: …">` with two
+  inline `<text>` spans. When a line is too long for the pane (the `"url"`
+  lines), the code text wraps onto a second line, but the row stays one
+  line tall, so the second line is painted over the next row ("url" line
+  16 over "score" line 17, and every tenth line after). On exactly those
+  rows the line number moves left, so the number column has shrunk: the
+  row is in flex shrinking, and the code text's height looks measured at
+  its one-line width, not at the narrower width it ends up with, where it
+  wraps. In CSS the row would be two lines tall. The page also shows a
+  horizontal scrollbar under the stage at this size.
+- **Seen:** on a fresh load at the narrow size (clear, then **1k lines**)
+  as well as after narrowing a window already showing the lines, and
+  after scrolling (a fresh layout), so not a stale layout.
+- **Not reproduced** in three minimal pages built to match it (same CSS,
+  nested spans, `r-for` over 600 rows with `:style` padding, inside an
+  `overflow-y: auto` box, at a fixed 260 px and at 60% narrowed from a
+  wide window): their rows grew to two lines correctly, and their number
+  column did not shrink. So the trigger is probably the shrink, which those
+  pages didn't reach; probe 2's rows come from Rust through `await` into a
+  routed page as well.
+- **Reproduction:** `cd probes && rux run`, size the window to about
+  1000×1040, open **2 · Large response body**, press **1k lines**, look at
+  lines 6, 16, 26.
+- **Workaround:** none taken. (`flex-shrink: 0` on `.no`, or
+  `min-width: 0` on `.code`, might sidestep it; untried, so the finding
+  stays as seen.)
+- **Suggested fix:** when a flex item with text is shrunk below the width
+  it was measured at, measure its height again at the final width, as CSS
+  does (the second pass of flex layout); a test with a row whose basis
+  is its one-line width inside a narrower container.
 - **Status:** open.
 
 ## Phase 0 results

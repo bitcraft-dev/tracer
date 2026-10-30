@@ -215,10 +215,16 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     and hit-testing are fine below the line). Suspected: the AW-022 vello
     buffer sizing. Tracer's window is not affected.
 
+  - **Rux 08c314f (installed 17:52):** AW-034 fixed (b604acc) and re-driven
+    (probes 1, 2 with 1k lines, 6, at three sizes); AW-020's spread works.
+    Both closed. New: **AW-035**, probe 2's wrapped lines overlap the next
+    row at a narrow window (a flex row shrunk below its text's width keeps
+    one line's height); minimal pages didn't reproduce it.
+
 ### Next
 
-1. When AW-034 is fixed: re-drive the probes (all six), and check
-   Tracer's window with a tall scene (1k-row history).
+1. When AW-035 is fixed: re-drive probe 2 at about 1000×1040. Until then,
+   Tracer's response pane is one text, not rows, so it isn't affected.
 2. Phase 3 remainder: try `tracer mcp` from a real client (`claude mcp add`,
    README); the local HTTP/WS API for anything that isn't MCP; per-agent
    permissions (read-only / local env only / anywhere) and rate and size
