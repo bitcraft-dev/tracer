@@ -5,10 +5,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
-use tracer_protocol::client::Client;
-use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody};
+use tracer_protocol::client::{Client, Incoming};
+use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, DISCOVERY_PATH};
 
 /// A fresh workspace under the temp directory, per test.
 fn workspace(name: &str) -> PathBuf {
@@ -227,4 +229,96 @@ fn nothing_is_accepted_before_hello() {
     BufReader::new(raw.try_clone().unwrap()).read_line(&mut line).unwrap();
     assert!(line.contains("say hello first"), "{line}");
     core.stop();
+}
+
+/// The window's way of talking: one connection, calls from several threads
+/// while a reader thread hands over the events, none lost or reordered.
+#[test]
+fn a_shared_client_takes_calls_from_many_threads_and_keeps_its_events_in_order() {
+    const PER_THREAD: usize = 25;
+    let ws = workspace("shared");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+
+    let mut client = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    let Ok(ReplyBody::Subscribed { next_seq: first_seq, .. }) =
+        client.call(Command::Subscribe { since: None }).unwrap()
+    else {
+        panic!("subscribe failed");
+    };
+    let (tx, events) = mpsc::channel();
+    let shared = Arc::new(client.into_shared(move |incoming| {
+        let _ = tx.send(incoming);
+    }).unwrap());
+
+    let callers: Vec<_> = (0..4)
+        .map(|n| {
+            let (shared, base) = (shared.clone(), base.clone());
+            thread::spawn(move || {
+                (0..PER_THREAD)
+                    .map(|i| match shared.call(get(format!("{base}/s/{n}/{i}"))).unwrap() {
+                        Ok(ReplyBody::Accepted { request_id }) => request_id,
+                        other => panic!("send {n}/{i}: {other:?}"),
+                    })
+                    .collect::<Vec<u64>>()
+            })
+        })
+        .collect();
+    let mut accepted: Vec<u64> = callers.into_iter().flat_map(|c| c.join().unwrap()).collect();
+    accepted.sort();
+    accepted.dedup();
+    assert_eq!(accepted.len(), 4 * PER_THREAD, "each call got its own reply");
+
+    let mut finished = 0;
+    let mut expected_seq = first_seq;
+    while finished < 4 * PER_THREAD {
+        match events.recv_timeout(Duration::from_secs(10)).expect("events stopped coming") {
+            Incoming::Event(event) => {
+                assert_eq!(event.seq, expected_seq, "event out of order or missing");
+                expected_seq += 1;
+                if let EventKind::RequestFinished { request_id, .. } = event.kind {
+                    assert!(accepted.binary_search(&request_id).is_ok());
+                    finished += 1;
+                }
+            }
+            Incoming::Closed(why) => panic!("closed early: {why}"),
+        }
+    }
+    core.stop();
+}
+
+#[test]
+fn shutdown_answers_the_asker_tells_every_watcher_and_stops_the_core() {
+    let ws = workspace("shutdown");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut watcher = Client::connect(&ws, ClientKind::Cli, "watcher").unwrap();
+    watcher.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let (tx, events) = mpsc::channel();
+    let _watcher = watcher.into_shared(move |incoming| {
+        let _ = tx.send(incoming);
+    }).unwrap();
+
+    let waiting = thread::spawn(move || core.wait());
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    assert_eq!(window.call(Command::Shutdown).unwrap(), Ok(ReplyBody::Stopping));
+
+    // The watcher hears who stopped it.
+    loop {
+        match events.recv_timeout(Duration::from_secs(5)).expect("no core_stopping") {
+            Incoming::Event(Event { kind: EventKind::CoreStopping, actor, .. }) => {
+                assert_eq!(actor.name, "window");
+                break;
+            }
+            Incoming::Event(_) => continue,
+            Incoming::Closed(why) => panic!("closed before core_stopping: {why}"),
+        }
+    }
+    // `wait` returns, and nothing new can find the core.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !waiting.is_finished() {
+        assert!(std::time::Instant::now() < deadline, "the core did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!ws.join(DISCOVERY_PATH).exists(), "the discovery file was left behind");
+    assert!(Client::connect(&ws, ClientKind::Cli, "late").is_err());
 }

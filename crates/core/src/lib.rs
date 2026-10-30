@@ -29,13 +29,35 @@ use tracer_protocol::{Discovery, DISCOVERY_PATH, PROTOCOL_VERSION};
 use crate::hub::Hub;
 
 /// A core that is listening. Dropping it does not stop it; call
-/// [`Running::stop`].
+/// [`Running::stop`], or send it [`Command::Shutdown`].
+///
+/// [`Command::Shutdown`]: tracer_protocol::Command::Shutdown
 pub struct Running {
     pub port: u16,
     pub token: String,
-    workspace: PathBuf,
-    stopping: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     accept: Option<JoinHandle<()>>,
+}
+
+/// What stopping takes, shared with the connections so a client's `Shutdown`
+/// can do it.
+pub(crate) struct Stop {
+    port: u16,
+    workspace: PathBuf,
+    stopping: AtomicBool,
+}
+
+impl Stop {
+    /// Stop accepting clients and remove the discovery file. Clients already
+    /// connected keep their threads until they hang up.
+    pub(crate) fn stop(&self) {
+        if self.stopping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // The accept loop is blocked in `accept`; a connection wakes it.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        let _ = fs::remove_file(self.workspace.join(DISCOVERY_PATH));
+    }
 }
 
 impl Running {
@@ -48,7 +70,8 @@ impl Running {
         }
     }
 
-    /// Block until the core is stopped from elsewhere.
+    /// Block until the core is stopped from elsewhere: by a client's
+    /// `Shutdown`, or by [`Running::stop`] on another thread.
     pub fn wait(mut self) {
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
@@ -58,13 +81,10 @@ impl Running {
     /// Stop accepting clients and remove the discovery file. Clients already
     /// connected keep their threads until they hang up.
     pub fn stop(mut self) {
-        self.stopping.store(true, Ordering::SeqCst);
-        // The accept loop is blocked in `accept`; a connection wakes it.
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        self.stop.stop();
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
-        let _ = fs::remove_file(self.workspace.join(DISCOVERY_PATH));
     }
 }
 
@@ -80,25 +100,23 @@ pub fn start(workspace: &Path) -> io::Result<Running> {
     let running = Running {
         port,
         token: token.clone(),
-        workspace: workspace.to_path_buf(),
-        stopping: Arc::new(AtomicBool::new(false)),
+        stop: Arc::new(Stop { port, workspace: workspace.to_path_buf(), stopping: AtomicBool::new(false) }),
         accept: None,
     };
     let discovery = serde_json::to_string_pretty(&running.discovery()).map_err(io::Error::other)?;
     fs::write(workspace.join(DISCOVERY_PATH), discovery)?;
 
-    let stopping = running.stopping.clone();
+    let stop = running.stop.clone();
     let accept = thread::Builder::new().name("tracer-accept".into()).spawn(move || {
         for stream in listener.incoming() {
-            if stopping.load(Ordering::SeqCst) {
+            if stop.stopping.load(Ordering::SeqCst) {
                 break;
             }
             let Ok(stream) = stream else { continue };
-            let hub = hub.clone();
-            let token = token.clone();
+            let (hub, token, stop) = (hub.clone(), token.clone(), stop.clone());
             let _ = thread::Builder::new()
                 .name("tracer-client".into())
-                .spawn(move || conn::serve(stream, hub, &token));
+                .spawn(move || conn::serve(stream, hub, &token, &stop));
         }
     })?;
     Ok(Running { accept: Some(accept), ..running })

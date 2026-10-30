@@ -84,6 +84,10 @@ pub enum Command {
     Send { request: HttpRequest },
     /// The core's state, for `tracer status`.
     Status,
+    /// Stop the core: it publishes `core_stopping`, replies, stops taking
+    /// clients and exits. The window sends it on close when it started the
+    /// core itself.
+    Shutdown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +143,7 @@ pub enum ReplyBody {
     Subscribed { replayed: u64, next_seq: u64 },
     Accepted { request_id: u64 },
     Status { clients: Vec<Actor>, next_seq: u64, workspace: String },
+    Stopping,
 }
 
 /// Something that happened, in the one order every client sees.
@@ -161,6 +166,9 @@ pub enum EventKind {
     RequestStarted { request_id: u64, request: HttpRequest },
     RequestFinished { request_id: u64, response: HttpResponse },
     RequestFailed { request_id: u64, error: String },
+    /// The core was asked to stop, by this event's actor. Only the asker's
+    /// own `client_left` can follow it.
+    CoreStopping,
 }
 
 /// Everything the core writes to a client, on one line each.

@@ -1,14 +1,22 @@
-//! A blocking client, for the CLI and for the Rux window's native crate.
+//! Blocking clients, for the CLI and for the Rux window's native crate.
 //!
 //! Replies and events arrive on one connection. [`Client::call`] reads until
 //! the reply it is waiting for and keeps any event that came first, so
 //! [`Client::next_event`] still hands every event over, in order.
+//!
+//! A window cannot wait on events and make calls from one thread, so
+//! [`Client::into_shared`] turns a client into a [`Shared`] one: a reader
+//! thread of its own hands each event to a callback, in order, and routes each
+//! reply to whichever thread is waiting for it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 use crate::{
     ClientKind, Command, Discovery, Event, Outcome, ReplyBody, Request, ServerMessage, DISCOVERY_PATH,
@@ -81,6 +89,46 @@ impl Client {
         }
     }
 
+    /// Hand the connection to a reader thread of its own, which gives `on`
+    /// every event in the core's order (any that arrived during earlier calls
+    /// first) and then [`Incoming::Closed`] once, when the connection ends.
+    /// `on` runs on that thread, so it must not wait on a [`Shared::call`]:
+    /// the reply it would wait for is read by the thread it is blocking.
+    pub fn into_shared(self, mut on: impl FnMut(Incoming) + Send + 'static) -> io::Result<Shared> {
+        let Client { mut reader, writer, next_id, pending, client_id } = self;
+        let waiting = Arc::new(Mutex::new(Waiting { open: true, calls: HashMap::new() }));
+        let routes = waiting.clone();
+        thread::Builder::new().name("tracer-client".into()).spawn(move || {
+            for event in pending {
+                on(Incoming::Event(event));
+            }
+            let why = loop {
+                match read_message(&mut reader) {
+                    Ok(ServerMessage::Reply(reply)) => {
+                        let caller = routes.lock().unwrap().calls.remove(&reply.id);
+                        if let Some(caller) = caller {
+                            let _ = caller.send(match reply.outcome {
+                                Outcome::Ok(body) => Ok(body),
+                                Outcome::Error(e) => Err(e),
+                            });
+                        }
+                    }
+                    Ok(ServerMessage::Event(event)) => on(Incoming::Event(event)),
+                    Err(e) => break e.to_string(),
+                }
+            };
+            // Dropping the senders wakes every caller still waiting, with an
+            // error, rather than leaving it blocked on a reply that will not come.
+            {
+                let mut waiting = routes.lock().unwrap();
+                waiting.open = false;
+                waiting.calls.clear();
+            }
+            on(Incoming::Closed(why));
+        })?;
+        Ok(Shared { writer: Mutex::new(writer), next_id: AtomicU64::new(next_id), waiting, client_id })
+    }
+
     /// The next event, in the core's order.
     pub fn next_event(&mut self) -> io::Result<Event> {
         if let Some(event) = self.pending.pop_front() {
@@ -94,10 +142,73 @@ impl Client {
     }
 
     fn read(&mut self) -> io::Result<ServerMessage> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the core hung up"));
-        }
-        serde_json::from_str(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        read_message(&mut self.reader)
     }
+}
+
+/// What a [`Shared`] client's reader thread hands over.
+#[derive(Debug)]
+pub enum Incoming {
+    Event(Event),
+    /// The connection ended, and why. Nothing follows it.
+    Closed(String),
+}
+
+/// A client any thread may call through; see [`Client::into_shared`].
+pub struct Shared {
+    writer: Mutex<BufWriter<TcpStream>>,
+    next_id: AtomicU64,
+    waiting: Arc<Mutex<Waiting>>,
+    /// The number the core gave this client in `Welcome`.
+    pub client_id: u64,
+}
+
+struct Waiting {
+    /// False once the reader thread has seen the connection end.
+    open: bool,
+    calls: HashMap<u64, mpsc::Sender<Result<ReplyBody, String>>>,
+}
+
+impl Shared {
+    /// Send `command` and wait for its reply, as [`Client::call`] does. Any
+    /// number of threads may call at once.
+    pub fn call(&self, command: Command) -> io::Result<Result<ReplyBody, String>> {
+        let hung_up = || io::Error::new(io::ErrorKind::NotConnected, "the core hung up");
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        {
+            // Registered before the request is written, so a reply that comes
+            // back at once still finds its caller.
+            let mut waiting = self.waiting.lock().unwrap();
+            if !waiting.open {
+                return Err(hung_up());
+            }
+            waiting.calls.insert(id, tx);
+        }
+        let line = serde_json::to_string(&Request { id, command }).map_err(io::Error::other)?;
+        let written = {
+            let mut writer = self.writer.lock().unwrap();
+            writeln!(writer, "{line}").and_then(|_| writer.flush())
+        };
+        if let Err(e) = written {
+            self.waiting.lock().unwrap().calls.remove(&id);
+            return Err(e);
+        }
+        rx.recv().map_err(|_| hung_up())
+    }
+
+    /// Hang up. The reader thread sees the connection end and hands over
+    /// [`Incoming::Closed`]; the core publishes this client's `client_left`.
+    pub fn close(&self) {
+        let writer = self.writer.lock().unwrap();
+        let _ = writer.get_ref().shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn read_message(reader: &mut BufReader<TcpStream>) -> io::Result<ServerMessage> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the core hung up"));
+    }
+    serde_json::from_str(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }

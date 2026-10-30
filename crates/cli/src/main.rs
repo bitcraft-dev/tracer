@@ -5,6 +5,7 @@
 //! tracer status                     who is connected, how far the journal goes
 //! tracer send GET https://…         send a request and print its answer
 //! tracer watch [--all | --since N]  print events as they happen
+//! tracer stop                       stop the workspace's core
 //! ```
 //!
 //! Every command takes `-w <dir>` for the workspace (default: here).
@@ -23,6 +24,7 @@ usage:
   tracer send <METHOD> <URL> [-H 'Name: value']... [-d <body>]
                                       send a request and print its answer
   tracer watch [--all | --since <N>]  print events as they happen
+  tracer stop                         stop the workspace's core
 
 options:
   -w <dir>                            the workspace (default: the current directory)";
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
         Some("status") => status(workspace),
         Some("send") => send(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
+        Some("stop") => stop(workspace),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -74,6 +77,18 @@ fn status(workspace: PathBuf) -> io::Result<ExitCode> {
             for actor in clients {
                 println!("  {:?} {}", actor.kind, actor.name);
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+fn stop(workspace: PathBuf) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer stop")?;
+    match client.call(Command::Shutdown)? {
+        Ok(ReplyBody::Stopping) => {
+            println!("tracer: the core for {} is stopping", workspace.display());
             Ok(ExitCode::SUCCESS)
         }
         Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
@@ -148,6 +163,7 @@ fn describe(event: &Event) -> String {
             response.status, response.timing.total_ms, response.size
         ),
         EventKind::RequestFailed { request_id, error } => format!("#{request_id} failed: {error}"),
+        EventKind::CoreStopping => "stopped the core".to_string(),
     };
     format!("{:>6}  {who:<24}  {what}", event.seq)
 }

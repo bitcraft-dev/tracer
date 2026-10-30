@@ -16,8 +16,9 @@ use tracer_protocol::{
 
 use crate::http;
 use crate::hub::Hub;
+use crate::Stop;
 
-pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str) {
+pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
     let Ok(write_half) = stream.try_clone() else { return };
     let (out, rx) = mpsc::channel::<ServerMessage>();
     let writer = thread::spawn(move || {
@@ -31,6 +32,7 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str) {
     });
 
     let mut session: Option<(u64, Actor)> = None;
+    let mut shutting_down = false;
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -88,6 +90,14 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str) {
                 let (clients, next_seq) = hub.status();
                 Ok(ReplyBody::Status { clients, next_seq, workspace: hub.workspace().to_string() })
             }
+            (Some((_, actor)), Command::Shutdown) => {
+                hub.publish(actor.clone(), EventKind::CoreStopping);
+                let _ = out.send(reply(id, Ok(ReplyBody::Stopping)));
+                // Stopped below, once the writer has flushed the reply, so
+                // the asker always hears that it worked.
+                shutting_down = true;
+                break;
+            }
         };
         if out.send(reply(id, outcome)).is_err() {
             break;
@@ -99,6 +109,9 @@ pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str) {
     }
     drop(out);
     let _ = writer.join();
+    if shutting_down {
+        stop.stop();
+    }
 }
 
 fn reply(id: u64, outcome: Result<ReplyBody, String>) -> ServerMessage {
