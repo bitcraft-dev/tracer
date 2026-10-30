@@ -168,6 +168,38 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
     bottom; the options below can't be reached by wheel or keys),
     **AW-033** (no wall clock or `Date`: history rows can't say when).
 
+- **Phase 3, agents (2026-10-30, evening).** Started without waiting on
+  the Rux fixes, which it doesn't need.
+  - Core and CLI (a3a44d9): `tracer mcp`, an MCP server on stdio (JSON-RPC,
+    a line each; versions 2024-11-05 to 2025-11-25). It connects as an
+    agent named by the client's `clientInfo.name` (or `--name`), and starts
+    a detached core if none runs. Nine tools: `list_requests`,
+    `list_environments`, `send_request`, `run_saved_request`,
+    `rerun_request`, `read_history`, `get_response`, `save_request`,
+    `cancel_request`. A send waits up to `wait_seconds` (60) and returns
+    `awaiting_approval` at once when a person must allow it; bodies are cut
+    at 32 KiB (`get_response` `max_bytes` up to 1 MiB).
+  - Guardrails (`crates/core/src/guard.rs`): an agent's non-GET/HEAD/OPTIONS
+    or `prod…` request publishes `approval_asked` and waits (5 min) for
+    `Decide` from a person; refused, it fails "refused by <person>".
+    `SetAgents` is the kill switch: off, agents may only read and their
+    running requests are cancelled; it is read back from the journal at
+    start. Secrets, deleting environments, approving, the switch and
+    stopping the core are refused to agents. `Response` gives any past
+    request with its whole response. CLI `approve`, `deny`, `agents on|off`;
+    `status` shows the switch. 31 tests pass (2 new core, 2 guard).
+  - Window: an approval card per waiting request at the top of the work area
+    (who, method, URL, env, why; Show, Refuse, Allow), rows marked
+    "approval?", the pane saying nothing was sent, Cancel offered while it
+    waits; **agents on/off** in the status bar; palette commands for both.
+    Driven: an MCP agent's POST waited, Allow sent it (201); a DELETE
+    waiting was cancelled by switching agents off, and the agent's next
+    send was refused while reads still worked.
+  - Fixed on the way: a core started by `tracer mcp` inherited the agent's
+    stdio pipes, so they never closed after the server exited (the agent
+    would hang); the server now marks its standard handles not
+    inheritable before spawning. A BOM at the start of stdin is skipped.
+
 ### Next
 
 1. When the user installs the new Rux build: move `connected()` back to a
@@ -175,9 +207,11 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    (and `clamp` can use `Math.min`/`Math.max`); verify AW-021 and AW-030
    (cf9e563); re-test AW-027 and AW-029 (f7876a4, 59923cf say fixed). Rux
    e0405b8 adds a clipboard for script: try Copy as cURL (AW-025).
-2. Phase 3: the local API and MCP bridge (`tracer mcp`), so an agent drives
-   Tracer, with `History`/`Rerun` as its `read_history` and re-run tools;
-   guardrails (approval prompt in the window for non-GET or `prod`).
+2. Phase 3 remainder: try `tracer mcp` from a real client (`claude mcp add`,
+   README); the local HTTP/WS API for anything that isn't MCP; per-agent
+   permissions (read-only / local env only / anywhere) and rate and size
+   caps, from a workspace policy file rather than the fixed rules in
+   `guard.rs`.
 3. When AW-033 is fixed: a time on each history row ("14:02", "3 min ago").
 4. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the env picker shows a
@@ -268,6 +302,15 @@ Things that cost a round trip once. Check here before debugging them again.
   `tracer stop -w <ws>` at the end.
 - A select's dropdown near the window's bottom is cut off (AW-032): open
   selects high in the window when testing their last options.
+- **Acting as an agent:** the scratchpad's `mcp_once.py TRACER WS TOOL
+  'JSON'` (2026-10-30) makes one MCP tool call through `tracer mcp`. Run
+  Python with `-u` when another process reads its output, or it sits in a
+  buffer. `mkfifo` doesn't work in Git Bash; use a flag file to sequence.
+- The Bash tool breaks a heredoc whose text has an apostrophe ("unexpected
+  EOF while looking for matching `'`"). Write the script to the scratchpad
+  and run it from there.
+- A running core holds `target/debug/tracer.exe`, so `cargo build` fails
+  with "Access is denied" removing it: `tracer stop` first.
 
 - Drive it yourself with `tools/drive.ps1` (`move`, `shot`, `click`, `drag`,
   `keys`, `rect`); don't hand the user a checklist. Process name:

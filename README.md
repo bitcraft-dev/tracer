@@ -33,6 +33,34 @@ tracer status -w <dir>               # who is connected
 - `crates/core`: the core (`cargo test -p tracer-core`)
 - `crates/cli`: the `tracer` command
 
+## Letting an AI agent drive it
+
+`tracer mcp` is an MCP server on stdio. Point any MCP client at it with the
+workspace; it starts the workspace's core if none is running. In Claude
+Code:
+
+```bash
+claude mcp add tracer -- "<repo>/target/debug/tracer.exe" mcp -w <dir>
+```
+
+The agent gets `list_requests`, `list_environments`, `send_request`,
+`run_saved_request`, `rerun_request`, `read_history`, `get_response`,
+`save_request` and `cancel_request`. What it does shows in the window as
+its own, live. The guardrails, held by the core:
+
+- An agent's request other than `GET`, `HEAD` or `OPTIONS`, or one using an
+  environment named `prod…`, waits for a person: **Allow** / **Refuse** in
+  the window, or `tracer approve <id>` / `tracer deny <id>`. Unanswered, it
+  fails after 5 minutes.
+- Agents see secret names, never values; a secret's value that comes back
+  in a response reads `{{name}}`.
+- Setting secrets, deleting environments, approving and stopping the core
+  are for a person only.
+- The kill switch, **agents on/off** in the status bar or `tracer agents
+  off`, stops agents (reading aside) and cancels their running requests. It
+  stays off across restarts until switched back on.
+- Every agent action is in the journal under its name.
+
 ## Running the probes
 
 ```bash

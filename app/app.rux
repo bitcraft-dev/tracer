@@ -84,6 +84,20 @@
       <view class="split-v" @drag="resizeSide(event)"><view class="grip-v"></view></view>
 
       <view class="work">
+        <view class="ask" r-for="r in waiting" r-key="r.id">
+          <view class="ask-top">
+            <text class="ask-who">{{ r.actor }} asks to send</text>
+            <text class="m" :style="`color: ${methodColor(r.method)}`">{{ r.method }}</text>
+            <text class="ask-url">{{ r.url }}</text>
+            <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
+          </view>
+          <view class="ask-bottom">
+            <text class="ask-why">#{{ r.id }} · {{ r.reason }}</text>
+            <view class="link" @tap="selected = r.id"><text class="link-t">Show</text></view>
+            <view class="link danger-l" @tap="decide(r.id, false)"><text class="link-t">Refuse</text></view>
+            <view class="allow" @tap="decide(r.id, true)"><text class="allow-t">Allow</text></view>
+          </view>
+        </view>
         <view class="title">
           <text class="title-t" :class="{ unsaved: openPath == &quot;&quot; }">{{ if openPath == "" { "Unsaved request" } else { openPath } }}</text>
           <text class="dirty" r-if="dirty">●</text>
@@ -158,6 +172,7 @@
             <view class="pane">
               <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
               <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
+              <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
               <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
               <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
               <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
@@ -176,6 +191,9 @@
       <text class="status-t">env: {{ if envPick == NO_ENV { "none" } else { envPick } }}</text>
       <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
       <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
+      <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
+        <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
+      </view>
       <text class="status-t key">Ctrl+K</text>
     </view>
 
@@ -454,6 +472,21 @@
   .hdr-n { color: #9d8ff5; font-size: 12px; font-family: monospace; width: 220px; }
   .hdr-v { flex: 1; color: #d4d4d4; font-size: 12px; font-family: monospace; }
 
+  .ask { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; background: #2a2416; border: 1px solid #6b5426; border-radius: 8px; }
+  .ask-top, .ask-bottom { display: flex; gap: 8px; align-items: center; }
+  .ask-who { color: #f0d9a8; font-size: 12px; font-weight: 700; white-space: nowrap; }
+  .ask-url { flex: 1; min-width: 0; color: #e0e0e0; font-size: 12px; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ask-why { flex: 1; min-width: 0; color: #c8b48a; font-size: 11px; }
+  .danger-l .link-t { color: #f0716c; }
+  .allow { padding: 4px 16px; background: #3d8f63; border-radius: 6px; cursor: pointer; }
+  .allow:hover { background: #47a572; }
+  .allow-t { color: #ffffff; font-size: 12px; font-weight: 700; }
+  .warn-t { color: #e8a54b; }
+  .agents { padding: 1px 8px; border: 1px solid #2e5a43; border-radius: 4px; cursor: pointer; }
+  .agents-t { color: #4ec98f; font-size: 11px; }
+  .agents.off { border: 1px solid #6b2a28; background: #3a1d1c; }
+  .agents.off .agents-t { color: #f0716c; }
+
   .status {
     display: flex;
     align-items: center;
@@ -529,7 +562,9 @@
     reqHeaders: Header[],
     reqBody: string,
     // The request this one sent again, or 0.
-    rerunOf: int
+    rerunOf: int,
+    // Why it waits for a person, while `state` is "approval".
+    reason: string
   };
 
   type Client = { client: int, actor: string, actorKind: string };
@@ -566,6 +601,10 @@
     { id: "rerun", label: "Re-run the request on show, as it was sent", hint: "" },
     { id: "edit-past", label: "Edit the request on show", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
+    { id: "allow", label: "Allow the agent's request on show", hint: "" },
+    { id: "refuse", label: "Refuse the agent's request on show", hint: "" },
+    { id: "agents-off", label: "Stop all agents (kill switch)", hint: "" },
+    { id: "agents-on", label: "Let agents act again", hint: "" },
     { id: "req:body", label: "Edit the request body", hint: "" },
     { id: "req:headers", label: "Edit the request headers", hint: "" },
     { id: "res:body", label: "Show the response body", hint: "" },
@@ -614,6 +653,8 @@
   let clients: Client[] = signal([]);
   let selected = signal(0);
   let lastSeq = signal(0);
+  // The kill switch, as the core's events last left it.
+  let agentsOn = signal(true);
 
   // History's filter: text, who sent it, and how it ended. The same filter
   // as the core's `History` command, applied to what the window already has.
@@ -626,6 +667,8 @@
   let hStatus = signal(ANY_STATUS);
 
   computed history = requests.sort((a, b) => b.id - a.id);
+  // Agents' requests waiting for this person, oldest first.
+  computed waiting = requests.filter(r => r.state == "approval");
   computed shown = history.filter(r => passes(r, hq.trim().toLowerCase(), hActor, hStatus));
   computed filtering = hq.trim() != "" || hActor != ANYONE || hStatus != ANY_STATUS;
   computed sel = requests.find(r => r.id == selected);
@@ -714,8 +757,18 @@
           env: e.env,
           reqHeaders: e.headers,
           reqBody: e.body,
-          rerunOf: e.rerunOf
+          rerunOf: e.rerunOf,
+          reason: ""
         });
+      } else if e.kind == "approval_asked" {
+        requests = requests.map(r => if r.id == e.requestId { asked(r, e.reason) } else { r });
+      } else if e.kind == "approval_given" {
+        // Refused, its `request_failed` follows and settles it.
+        if e.allow {
+          requests = requests.map(r => if r.id == e.requestId { asked(r, "") } else { r });
+        }
+      } else if e.kind == "agents_switched" {
+        agentsOn = e.allow;
       } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {
         requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
       } else if e.kind == "client_joined" {
@@ -1043,7 +1096,7 @@
   }
 
   fn statusClass(r: Row): string {
-    if r.state != "done" { r.state } else { `${intDiv(r.status, 100)}xx` }
+    if r.state == "approval" { "running" } else if r.state != "done" { r.state } else { `${intDiv(r.status, 100)}xx` }
   }
 
   fn clearFilter() {
@@ -1085,9 +1138,33 @@
     }
   }
 
+  // `r` waiting for a person for `reason`, or running again when "".
+  fn asked(r: Row, reason: string): Row {
+    let out = r;
+    out.state = if reason == "" { "running" } else { "approval" };
+    out.reason = reason;
+    out
+  }
+
+  fn decide(id: int, allow: bool) {
+    try {
+      tracer.decide(id, allow);
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  fn setAgents(allowed: bool) {
+    try {
+      tracer.setAgents(allowed);
+    } catch e {
+      error = e.message;
+    }
+  }
+
   // Whether the request on show is still running, whoever sent it.
   fn running(): bool {
-    sel != none && sel.state == "running"
+    sel != none && (sel.state == "running" || sel.state == "approval")
   }
 
   fn cancel() {
@@ -1124,6 +1201,8 @@
   fn statusText(r: Row): string {
     if r.state == "running" {
       "…"
+    } else if r.state == "approval" {
+      "approval?"
     } else if r.state == "failed" || r.state == "cancelled" {
       r.state
     } else {
@@ -1136,7 +1215,7 @@
       "#8a8a8a"
     } else if r.state == "failed" || r.status >= 500 {
       "#f0716c"
-    } else if r.status >= 400 {
+    } else if r.state == "approval" || r.status >= 400 {
       "#e8a54b"
     } else {
       "#4ec98f"
@@ -1268,6 +1347,10 @@
       editPast();
     } else if id == "clear-filter" {
       clearFilter();
+    } else if id == "allow" || id == "refuse" {
+      if sel != none && sel.state == "approval" { decide(sel.id, id == "allow"); }
+    } else if id == "agents-off" || id == "agents-on" {
+      setAgents(id == "agents-on");
     } else if id.startsWith("req:") {
       reqTab = id.slice(4);
     } else if id.startsWith("res:") {
