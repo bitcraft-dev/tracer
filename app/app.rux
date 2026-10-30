@@ -46,13 +46,24 @@
 
         <view class="side-h second">
           <text class="side-title">History</text>
-          <text class="count">{{ requests.length }}</text>
+          <text class="count">{{ if filtering { `${shown.length} of ${requests.length}` } else { `${requests.length}` } }}</text>
+          <view class="side-add" r-if="filtering" @tap="clearFilter()"><text class="clear-t">clear</text></view>
+        </view>
+        <view class="hfilter">
+          <view class="hsearch">
+            <input r-model="hq" placeholder="Search URL, status, who, env, #id" />
+          </view>
+          <view class="hpicks">
+            <view class="hpick"><input type="select" r-model="hActor" :options="actorKinds" /></view>
+            <view class="hpick"><input type="select" r-model="hStatus" :options="statusClasses" /></view>
+          </view>
         </view>
         <view class="list">
           <text class="empty" r-if="requests.length == 0">Nothing yet. Send a request, or run tracer send in this workspace.</text>
+          <text class="empty" r-if="requests.length > 0 && shown.length == 0">No request matches the filter.</text>
           <view
             class="row"
-            r-for="r in history"
+            r-for="r in shown"
             r-key="r.id"
             :class="{ on: r.id == selected }"
             @tap="selected = r.id">
@@ -64,6 +75,7 @@
               <text class="st" :style="`color: ${statusColor(r)}`">{{ statusText(r) }}</text>
               <text class="who">{{ r.actorKind }} · {{ r.actor }}</text>
               <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
+              <text class="again" r-if="r.rerunOf > 0">↻ #{{ r.rerunOf }}</text>
             </view>
           </view>
         </view>
@@ -117,11 +129,18 @@
           <text class="empty" r-if="sel == none">Pick a request in History, or send one.</text>
           <view class="res-in" r-if="sel != none">
             <view class="res-h">
+              <text class="res-id">#{{ sel.id }}</text>
               <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
               <text class="res-url">{{ sel.url }}</text>
+              <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
+              <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
             </view>
             <view class="chips">
               <text class="chip" :style="`color: ${statusColor(sel)}`">{{ statusText(sel) }}</text>
+              <view class="chip link-chip" r-if="sel.rerunOf > 0" @tap="selected = sel.rerunOf">
+                <text class="link-t">re-run of #{{ sel.rerunOf }}</text>
+              </view>
+              <text class="chip" r-if="sel.env != &quot;&quot;">env {{ sel.env }}</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
@@ -395,7 +414,25 @@
   .res { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   .res-in { flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
   .res-h { display: flex; gap: 8px; align-items: center; }
-  .res-url { color: #c8c8c8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .res-url { flex: 1; min-width: 0; color: #c8c8c8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .res-id { color: #7a7a7a; font-size: 11px; font-family: monospace; }
+  .link-chip { cursor: pointer; padding: 2px 9px; }
+  .link-chip:hover { background: #2b2540; }
+
+  .hfilter { display: flex; flex-direction: column; gap: 6px; padding: 0 10px 8px 10px; }
+  .hsearch, .hpick {
+    display: flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 8px;
+    background: #141414;
+    border: 1px solid #2e2e2e;
+    border-radius: 5px;
+  }
+  .hpicks { display: flex; gap: 6px; }
+  .hpick { flex: 1; min-width: 0; }
+  .clear-t { color: #9d8ff5; font-size: 11px; }
+  .again { color: #7a7a7a; font-size: 10px; font-family: monospace; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip { padding: 3px 9px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
 
@@ -487,7 +524,12 @@
     resHeaders: Header[],
     error: string,
     cancelledBy: string,
-    env: string
+    env: string,
+    // The request as it was written, for Edit and Re-run.
+    reqHeaders: Header[],
+    reqBody: string,
+    // The request this one sent again, or 0.
+    rerunOf: int
   };
 
   type Client = { client: int, actor: string, actorKind: string };
@@ -521,6 +563,9 @@
     { id: "envs", label: "Edit environments", hint: "" },
     { id: "cancel", label: "Cancel the request on show", hint: "" },
     { id: "newest", label: "Open the newest request", hint: "" },
+    { id: "rerun", label: "Re-run the request on show, as it was sent", hint: "" },
+    { id: "edit-past", label: "Edit the request on show", hint: "" },
+    { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "req:body", label: "Edit the request body", hint: "" },
     { id: "req:headers", label: "Edit the request headers", hint: "" },
     { id: "res:body", label: "Show the response body", hint: "" },
@@ -570,7 +615,19 @@
   let selected = signal(0);
   let lastSeq = signal(0);
 
+  // History's filter: text, who sent it, and how it ended. The same filter
+  // as the core's `History` command, applied to what the window already has.
+  let ANYONE = "anyone";
+  let ANY_STATUS = "any status";
+  let actorKinds = [ANYONE, "window", "cli", "agent"];
+  let statusClasses = [ANY_STATUS, "2xx", "3xx", "4xx", "5xx", "failed", "cancelled", "running"];
+  let hq = signal("");
+  let hActor = signal(ANYONE);
+  let hStatus = signal(ANY_STATUS);
+
   computed history = requests.sort((a, b) => b.id - a.id);
+  computed shown = history.filter(r => passes(r, hq.trim().toLowerCase(), hActor, hStatus));
+  computed filtering = hq.trim() != "" || hActor != ANYONE || hStatus != ANY_STATUS;
   computed sel = requests.find(r => r.id == selected);
   computed current = saved.find(s => s.path == openPath);
   // Unsaved edits to a saved request. A request never saved is a scratch pad.
@@ -654,7 +711,10 @@
           resHeaders: [],
           error: "",
           cancelledBy: "",
-          env: e.env
+          env: e.env,
+          reqHeaders: e.headers,
+          reqBody: e.body,
+          rerunOf: e.rerunOf
         });
       } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {
         requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
@@ -973,6 +1033,58 @@
     }
   }
 
+  // Whether history's filter lets `r` through. `q` is already lower case.
+  fn passes(r: Row, q: string, actor: string, status: string): bool {
+    if actor != ANYONE && r.actorKind != actor { return false; }
+    if status != ANY_STATUS && statusClass(r) != status { return false; }
+    if q == "" { return true; }
+    let code = if r.state == "done" { `${r.status}` } else { "" };
+    [r.method, r.url, r.env, r.actor, code, `#${r.id}`].some(f => f.toLowerCase().includes(q))
+  }
+
+  fn statusClass(r: Row): string {
+    if r.state != "done" { r.state } else { `${intDiv(r.status, 100)}xx` }
+  }
+
+  fn clearFilter() {
+    hq = "";
+    hActor = ANYONE;
+    hStatus = ANY_STATUS;
+  }
+
+  // Send the request on show again, exactly as it was written and with the
+  // environment it had; the core does it, so it shows as a re-run for all.
+  fn rerun() {
+    if sel == none { return; }
+    error = "";
+    try {
+      selected = tracer.rerun(sel.id);
+      resTab = "body";
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  // Put the request on show into the editor, unsaved, with its environment
+  // chosen when it still exists.
+  fn editPast() {
+    if sel == none || !guardEdits(`#${sel.id}`) { return; }
+    let r = sel;
+    openPath = "";
+    method = r.method;
+    url = r.url;
+    body = r.reqBody;
+    headerText = headerLines(r.reqHeaders);
+    notice = `from #${r.id}`;
+    if r.env == "" {
+      envPick = NO_ENV;
+    } else if envs.some(e => e.name == r.env) {
+      envPick = r.env;
+    } else {
+      notice = `from #${r.id}; its environment ${r.env} is gone`;
+    }
+  }
+
   // Whether the request on show is still running, whoever sent it.
   fn running(): bool {
     sel != none && sel.state == "running"
@@ -1049,9 +1161,9 @@
     if n < 1024 {
       `${n} B`
     } else if n < 1024 * 1024 {
-      `${n / 1024}.${(n * 10 / 1024) % 10} KB`
+      `${intDiv(n, 1024)}.${intDiv(n * 10, 1024) % 10} KB`
     } else {
-      `${n / (1024 * 1024)}.${(n * 10 / (1024 * 1024)) % 10} MB`
+      `${intDiv(n, 1024 * 1024)}.${intDiv(n * 10, 1024 * 1024) % 10} MB`
     }
   }
 
@@ -1150,6 +1262,12 @@
       cancel();
     } else if id == "newest" {
       if history.length > 0 { selected = history[0].id; }
+    } else if id == "rerun" {
+      rerun();
+    } else if id == "edit-past" {
+      editPast();
+    } else if id == "clear-filter" {
+      clearFilter();
     } else if id.startsWith("req:") {
       reqTab = id.slice(4);
     } else if id.startsWith("res:") {

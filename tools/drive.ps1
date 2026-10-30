@@ -4,6 +4,7 @@
 #
 #   tools/drive.ps1 -Proc tracer-probes -Do move  -X 0 -Y 0 -X2 1920 -Y2 1040
 #   tools/drive.ps1 -Proc tracer-probes -Do shot  -Out shot.png
+#   tools/drive.ps1 -Proc tracer-probes -Do print -Out shot.png   (works with the display asleep)
 #   tools/drive.ps1 -Proc tracer-probes -Do click -X 100 -Y 200
 #   tools/drive.ps1 -Proc tracer-probes -Do drag  -X 100 -Y 200 -X2 300 -Y2 200
 #   tools/drive.ps1 -Proc tracer-probes -Do keys  -Text "^k"      (SendKeys syntax)
@@ -29,6 +30,7 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool r);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
 }
@@ -57,6 +59,18 @@ switch ($Do) {
     $bmp = New-Object System.Drawing.Bitmap $w, $hh
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($o.X, $o.Y, 0, 0, $bmp.Size)
+    $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+    $g.Dispose(); $bmp.Dispose()
+    "saved $Out ($w x $hh)"
+  }
+  "print" {
+    # Asks the window for its own pixels (client area, full content), so it
+    # works when `shot` copies a black, sleeping screen.
+    $bmp = New-Object System.Drawing.Bitmap $w, $hh
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $dc = $g.GetHdc()
+    [W]::PrintWindow($h, $dc, 3) | Out-Null
+    $g.ReleaseHdc($dc)
     $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
     $g.Dispose(); $bmp.Dispose()
     "saved $Out ($w x $hh)"
