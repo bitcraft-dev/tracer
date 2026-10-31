@@ -7,15 +7,16 @@
 
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, Command, DiffSide, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+    Access, Actor, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::{diff, envs, expect, guard, http};
+use crate::{diff, envs, expect, flows, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -157,6 +158,12 @@ pub fn serve(
             (Some((_, actor)), Command::SetAgents { allowed }) => {
                 hub.set_agents(actor.clone(), allowed).map(|_| ReplyBody::AgentsSwitched)
             }
+            (Some((_, actor)), Command::RunFlow { path, env, keep_going }) => {
+                match flows::start(&hub, actor, &path, env, keep_going) {
+                    Ok((flow_id, steps)) => Ok(ReplyBody::FlowStarted { flow_id, steps }),
+                    Err(e) => Err(e),
+                }
+            }
             (Some(_), Command::Diff { a, b, ignore, no_defaults }) => {
                 let side = |id: u64| match hub.response(id) {
                     Some((entry, Some(response), _)) => Ok((
@@ -217,51 +224,83 @@ fn send(
     rerun_of: Option<u64>,
     accepted: impl FnOnce(u64),
 ) {
-    // The rules as they stand when it's sent, for the whole of its run.
-    let rules = hub.rules_for(actor);
-    let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of);
+    let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of, None);
     // Before the thread starts, so the sender hears its id before the end.
     accepted(request_id);
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
-        // Resolved here, not before it started, so a missing variable is a
-        // failed request every client sees; and before any approval, so a
-        // person is only asked about what the policy lets through.
-        let resolved = env.as_deref().map(|name| hub.environment_for_sending(name)).transpose();
-        let (resolved, secrets) = match resolved {
-            Ok(Some((env, secrets))) => (envs::resolve(&request, Some(&env)), secrets),
-            Ok(None) => (envs::resolve(&request, None), Vec::new()),
-            Err(e) => (Err(e), Vec::new()),
-        };
-        if let (Some(rules), Ok(sending)) = (&rules, &resolved) {
-            if let Some(why) = guard::outside_rules(rules, sending) {
-                let error = envs::redact(&format!("refused by the workspace's policy: {why}"), &secrets);
-                hub.end_request(actor, request_id, EventKind::RequestFailed { request_id, error });
-                return;
-            }
-            if let Some(reason) = guard::needs_approval(rules, &request, env.as_deref()) {
-                if !approved(&hub, &actor, request_id, reason) {
-                    return;
-                }
+        run_one(&hub, &actor, request_id, &cancelled, &request, env.as_deref(), &[]);
+    });
+}
+
+/// How a request run by [`run_one`] ended.
+pub(crate) enum Ran {
+    /// It ended with this answer, or this error, and these checks, all
+    /// published.
+    Ended(Result<HttpResponse, String>, Vec<CheckResult>),
+    /// It ended some other way, already published: refused, cancelled, or
+    /// not allowed in time. Why, for a flow's step.
+    Stopped(String),
+}
+
+/// Send started request `request_id` and publish how it ends: resolved
+/// with `env` and, over it, `extra` (a flow's captures), held to the
+/// sender's policy, approved if it must be, checked. Blocks until then.
+pub(crate) fn run_one(
+    hub: &Hub,
+    actor: &Actor,
+    request_id: u64,
+    cancelled: &AtomicBool,
+    request: &HttpRequest,
+    env: Option<&str>,
+    extra: &[(String, String)],
+) -> Ran {
+    // The rules as they stand when it's sent, for the whole of its run.
+    let rules = hub.rules_for(actor);
+    let stopped = |why: String| {
+        hub.end_request(actor.clone(), request_id, EventKind::RequestFailed { request_id, error: why.clone() });
+        Ran::Stopped(why)
+    };
+    // Resolved here, not before it started, so a missing variable is a
+    // failed request every client sees; and before any approval, so a
+    // person is only asked about what the policy lets through.
+    let resolved = env.map(|name| hub.environment_for_sending(name)).transpose();
+    let (environment, secrets) = match resolved {
+        Ok(Some((env, secrets))) => (Ok(Some(env)), secrets),
+        Ok(None) => (Ok(None), Vec::new()),
+        Err(e) => (Err(e), Vec::new()),
+    };
+    let resolved = environment.and_then(|e| envs::resolve(request, envs::with_extra(e, extra).as_ref()));
+    if let (Some(rules), Ok(sending)) = (&rules, &resolved) {
+        if let Some(why) = guard::outside_rules(rules, sending) {
+            return stopped(envs::redact(&format!("refused by the workspace's policy: {why}"), &secrets));
+        }
+        if let Some(reason) = guard::needs_approval(rules, request, env) {
+            if !approved(hub, actor, request_id, reason) {
+                return Ran::Stopped("not allowed by a person".into());
             }
         }
-        // A local agent's request mustn't be redirected off the machine.
-        let redirects = rules.is_none_or(|r| r.access != Access::Local);
-        // Secret values that come back are replaced by their names before
-        // anything is published or journalled.
-        let outcome = resolved
-            .and_then(|request| http::execute(&request, redirects, &cancelled))
-            .map(|response| envs::redact_response(response, &secrets))
-            .map_err(|error| envs::redact(&error, &secrets));
-        // Checked on what clients see, secrets already taken out.
-        let results = expect::check(&request.expect, outcome.as_ref().map_err(String::as_str));
-        let kind = match outcome {
-            Ok(response) => EventKind::RequestFinished { request_id, response },
-            Err(error) => EventKind::RequestFailed { request_id, error },
-        };
-        // Dropped if the request was cancelled meanwhile.
-        hub.end_checked(actor, request_id, kind, results);
-    });
+    }
+    // A local agent's request mustn't be redirected off the machine.
+    let redirects = rules.as_ref().is_none_or(|r| r.access != Access::Local);
+    // Secret values that come back are replaced by their names before
+    // anything is published or journalled.
+    let outcome = resolved
+        .and_then(|sending| http::execute(&sending, redirects, cancelled))
+        .map(|response| envs::redact_response(response, &secrets))
+        .map_err(|error| envs::redact(&error, &secrets));
+    // Checked on what clients see, secrets already taken out.
+    let results = expect::check(&request.expect, outcome.as_ref().map_err(String::as_str));
+    let kind = match &outcome {
+        Ok(response) => EventKind::RequestFinished { request_id, response: response.clone() },
+        Err(error) => EventKind::RequestFailed { request_id, error: error.clone() },
+    };
+    // Dropped if the request was cancelled meanwhile.
+    if hub.end_checked(actor.clone(), request_id, kind, results.clone()) {
+        Ran::Ended(outcome, results)
+    } else {
+        Ran::Stopped("cancelled".into())
+    }
 }
 
 /// Ask a person to allow request `request_id` and wait for them. True if

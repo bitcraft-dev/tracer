@@ -162,6 +162,7 @@
                 <text class="link-t">re-run of #{{ sel.rerunOf }}</text>
               </view>
               <text class="chip" r-if="sel.env != &quot;&quot;">env {{ sel.env }}</text>
+              <text class="chip" r-if="sel.flow > 0">flow {{ sel.flow }}</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
               <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
@@ -219,6 +220,7 @@
       <text class="status-t">env: {{ if envPick == NO_ENV { "none" } else { envPick } }}</text>
       <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
       <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
+      <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
       <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
       <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
         <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
@@ -576,6 +578,8 @@
   .prompt-h { color: #f0f0f0; font-size: 13px; font-weight: 700; padding: 2px 4px 8px 4px; }
   .prompt-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; padding: 2px 4px; }
   .status-t { color: #b0b0b0; font-size: 11px; white-space: nowrap; }
+  .status-t.flow-t { min-width: 0; color: #4ec98f; overflow: hidden; text-overflow: ellipsis; }
+  .status-t.flow-t.bad { color: #f0716c; }
   .status-t.policy-bad { min-width: 0; color: #f0716c; overflow: hidden; text-overflow: ellipsis; }
   .status-t.dim { flex: 1; min-width: 0; color: #6a6a6a; overflow: hidden; text-overflow: ellipsis; }
 </style>
@@ -621,7 +625,9 @@
     atMs: int,
     // Its expectations as written, and how they came out once checked.
     reqChecks: string,
-    results: Check[]
+    results: Check[],
+    // The flow it was a step of, or 0.
+    flow: int
   };
 
   type Client = { client: int, actor: string, actorKind: string };
@@ -660,6 +666,7 @@
     { id: "rerun", label: "Re-run the request on show, as it was sent", hint: "" },
     { id: "edit-past", label: "Edit the request on show", hint: "" },
     { id: "curl-sel", label: "Copy the request on show as cURL", hint: "" },
+    { id: "flow", label: "Run the open request's folder as a flow", hint: "" },
     { id: "curl-editor", label: "Copy the request being edited as cURL", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
@@ -718,6 +725,9 @@
   let agentsOn = signal(true);
   // Why agents.policy, as last changed, was not taken; "" when it was.
   let policyError = signal("");
+  // The latest flow, as its events last told it, and whether it's well.
+  let lastFlow = signal("");
+  let flowOk = signal(true);
 
   // History's filter: text, who sent it, and how it ended. The same filter
   // as the core's `History` command, applied to what the window already has.
@@ -833,7 +843,8 @@
           atMs: e.atMs,
           reason: "",
           reqChecks: e.checks,
-          results: []
+          results: [],
+          flow: e.flow
         });
       } else if e.kind == "approval_asked" {
         requests = requests.map(r => if r.id == e.requestId { asked(r, e.reason) } else { r });
@@ -842,6 +853,12 @@
         if e.allow {
           requests = requests.map(r => if r.id == e.requestId { asked(r, "") } else { r });
         }
+      } else if e.kind == "flow_started" {
+        lastFlow = `flow ${e.flow}: ${e.path} running`;
+        flowOk = true;
+      } else if e.kind == "flow_finished" {
+        lastFlow = if e.allow { `flow ${e.flow} passed` } else { `flow ${e.flow} failed: ${e.reason}` };
+        flowOk = e.allow;
       } else if e.kind == "request_checked" {
         requests = requests.map(r => if r.id == e.requestId { withResults(r, e.results) } else { r });
       } else if e.kind == "agents_switched" {
@@ -1175,6 +1192,22 @@
     }
   }
 
+  // The folder of the saved request open in the editor, run as a flow with
+  // the chosen environment.
+  fn runFolder() {
+    let at = openPath.lastIndexOf("/");
+    if at <= 0 {
+      error = "open a saved request in a folder: the folder runs as a flow";
+      return;
+    }
+    error = "";
+    try {
+      tracer.runFlow(openPath.substring(0, at), if envPick == NO_ENV { "" } else { envPick });
+    } catch e {
+      error = `could not run the flow: ${e.message}`;
+    }
+  }
+
   fn withResults(r: Row, results: Check[]): Row {
     let out = r;
     out.results = results;
@@ -1502,6 +1535,8 @@
       rerun();
     } else if id == "curl-sel" {
       copySelCurl();
+    } else if id == "flow" {
+      runFolder();
     } else if id == "curl-editor" {
       copyEditorCurl();
     } else if id == "edit-past" {

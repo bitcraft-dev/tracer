@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    Discovery, SavedRequest, StatusClass, Timing, DISCOVERY_PATH,
+    Discovery, FlowStep, SavedRequest, StatusClass, StepOutcome, Timing, DISCOVERY_PATH,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -55,7 +55,12 @@ usage:
   tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--expect '…']...
                                       save a request as requests/<PATH>.http, its
                                       expectations as `# @expect` lines
-  tracer run <PATH> [--env <NAME>]    send a saved request and print its answer
+  tracer run <PATH> [--env <NAME>] [--keep-going] [--report json]
+                                      send a saved request and print its answer;
+                                      a folder runs as a flow, in path order, each
+                                      step's `# @capture name = $.path` filling
+                                      {{name}} after it; stops at a failed step
+                                      unless --keep-going; exits 1 if it fails
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -453,7 +458,7 @@ fn request_from(mut args: Vec<String>) -> io::Result<HttpRequest> {
         expect.push(e);
     }
     let [method, url] = <[String; 2]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
-    Ok(HttpRequest { method: method.to_uppercase(), url, headers, body, expect })
+    Ok(HttpRequest { method: method.to_uppercase(), url, headers, body, expect, ..Default::default() })
 }
 
 fn ls(workspace: PathBuf) -> io::Result<ExitCode> {
@@ -489,16 +494,118 @@ fn save(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
 
 fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let env = take_value(&mut args, "--env");
+    let report = take_value(&mut args, "--report");
+    if report.as_deref().is_some_and(|r| r != "json") {
+        return Err(io::Error::other("--report takes json"));
+    }
+    let keep_going = match args.iter().position(|a| a == "--keep-going") {
+        Some(at) => {
+            args.remove(at);
+            true
+        }
+        None => false,
+    };
     let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
     // Matched as the core names paths, so `requests/a/b.http` finds `a/b`.
     let wanted = path.trim().replace('\\', "/");
     let wanted = wanted.strip_prefix("requests/").unwrap_or(&wanted);
-    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted);
+    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted).trim_end_matches('/');
     let (requests, _) = saved(&workspace, "tracer run")?;
-    let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
-        return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
+    match requests.into_iter().find(|r| r.path == wanted) {
+        Some(found) if report.is_none() => send_and_wait(&workspace, Command::Send { request: found.request, env }, "tracer run"),
+        // A folder, or one request wanted as a report: a flow.
+        _ => flow(&workspace, wanted, env, keep_going, report.is_some()),
+    }
+}
+
+/// Run a flow, telling its steps as they go on stderr; with `json`, a
+/// report on stdout at the end. Fails when the flow does.
+fn flow(workspace: &PathBuf, path: &str, env: Option<String>, keep_going: bool, json: bool) -> io::Result<ExitCode> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, "tracer run")?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    let started = std::time::Instant::now();
+    let (flow_id, steps) = match client.call(Command::RunFlow { path: path.to_string(), env: env.clone(), keep_going })? {
+        Ok(ReplyBody::FlowStarted { flow_id, steps }) => (flow_id, steps),
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
     };
-    send_and_wait(&workspace, Command::Send { request: found.request, env }, "tracer run")
+    eprintln!("flow {flow_id}: {} step{}", steps.len(), if steps.len() == 1 { "" } else { "s" });
+    // Each step's request, as it starts, by id: its path, status and time.
+    let mut ours: Vec<(u64, String)> = Vec::new();
+    let mut answers: Vec<(u64, u16, f64)> = Vec::new();
+    loop {
+        let event = client.next_event()?;
+        match event.kind {
+            EventKind::RequestStarted { request_id, flow: Some(f), .. } if f == flow_id => {
+                let path = steps.get(ours.len()).cloned().unwrap_or_default();
+                eprintln!("→ {path}  #{request_id}");
+                ours.push((request_id, path));
+            }
+            EventKind::RequestFinished { request_id, response } if ours.iter().any(|(id, _)| *id == request_id) => {
+                eprintln!("  {} · {:.0} ms · {} B", response.status, response.timing.total_ms, response.size);
+                answers.push((request_id, response.status, response.timing.total_ms));
+            }
+            EventKind::RequestFailed { request_id, error } if ours.iter().any(|(id, _)| *id == request_id) => {
+                eprintln!("  failed: {error}");
+            }
+            EventKind::RequestChecked { request_id, results } if ours.iter().any(|(id, _)| *id == request_id) => {
+                for r in &results {
+                    eprintln!("  {} {}   (found {})", if r.pass { "✓" } else { "✗" }, r.expect, r.actual);
+                }
+            }
+            EventKind::FlowFinished { flow_id: f, passed, steps } if f == flow_id => {
+                let failed = steps.iter().filter(|s| s.outcome == StepOutcome::Failed).count();
+                let skipped = steps.iter().filter(|s| s.outcome == StepOutcome::Skipped).count();
+                for s in steps.iter().filter(|s| s.outcome != StepOutcome::Passed) {
+                    eprintln!("{} {}: {}", if s.outcome == StepOutcome::Failed { "✗" } else { "–" }, s.path, s.note);
+                }
+                eprintln!(
+                    "flow {flow_id} {}: {} passed, {failed} failed, {skipped} skipped, in {:.1} s",
+                    if passed { "passed" } else { "failed" },
+                    steps.len() - failed - skipped,
+                    started.elapsed().as_secs_f64()
+                );
+                if json {
+                    println!("{}", report_json(flow_id, path, env.as_deref(), passed, &steps, &answers, started.elapsed()));
+                }
+                return Ok(if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The run as JSON, for CI: each step with its outcome, status and time.
+fn report_json(
+    flow_id: u64,
+    path: &str,
+    env: Option<&str>,
+    passed: bool,
+    steps: &[FlowStep],
+    answers: &[(u64, u16, f64)],
+    took: std::time::Duration,
+) -> String {
+    let steps: Vec<serde_json::Value> = steps
+        .iter()
+        .map(|s| {
+            let answer = s.request_id.and_then(|id| answers.iter().find(|(r, _, _)| *r == id));
+            let mut v = serde_json::to_value(s).unwrap_or_default();
+            if let Some((_, status, ms)) = answer {
+                v["status"] = serde_json::json!(status);
+                v["total_ms"] = serde_json::json!(ms.round());
+            }
+            v
+        })
+        .collect();
+    let report = serde_json::json!({
+        "flow_id": flow_id,
+        "path": path,
+        "env": env,
+        "passed": passed,
+        "took_ms": took.as_millis() as u64,
+        "steps": steps,
+    });
+    serde_json::to_string_pretty(&report).unwrap_or_default()
 }
 
 fn env_list(workspace: PathBuf) -> io::Result<ExitCode> {
@@ -686,10 +793,11 @@ fn describe(event: &Event) -> String {
     let what = match &event.kind {
         EventKind::ClientJoined { client } => format!("joined as client {client}"),
         EventKind::ClientLeft { client } => format!("left (client {client})"),
-        EventKind::RequestStarted { request_id, request, env, rerun_of } => {
+        EventKind::RequestStarted { request_id, request, env, rerun_of, flow } => {
             let with = env.as_ref().map(|e| format!(" (env {e})")).unwrap_or_default();
             let again = rerun_of.map(|id| format!(", re-run of #{id}")).unwrap_or_default();
-            format!("#{request_id} {} {}{with}{again}", request.method, request.url)
+            let step = flow.map(|id| format!(", flow {id}")).unwrap_or_default();
+            format!("#{request_id} {} {}{with}{again}{step}", request.method, request.url)
         }
         EventKind::RequestFinished { request_id, response } => format!(
             "#{request_id} → {} in {:.0} ms ({} B)",
@@ -715,6 +823,15 @@ fn describe(event: &Event) -> String {
             match failed.as_slice() {
                 [] => format!("#{request_id} checks: all {} passed", results.len()),
                 _ => format!("#{request_id} checks: {} of {} failed: {}", failed.len(), results.len(), failed.join("; ")),
+            }
+        }
+        EventKind::FlowStarted { flow_id, path, steps, .. } => format!("flow {flow_id} started: {path} ({} steps)", steps.len()),
+        EventKind::FlowFinished { flow_id, passed, steps } => {
+            let failed = steps.iter().filter(|s| s.outcome == StepOutcome::Failed).count();
+            if *passed {
+                format!("flow {flow_id} passed ({} steps)", steps.len())
+            } else {
+                format!("flow {flow_id} failed: {failed} of {} steps", steps.len())
             }
         }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),

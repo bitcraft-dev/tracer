@@ -5,7 +5,13 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-30, night)
+## Where it stands (2026-10-31, morning)
+
+The previous session hit its usage limit mid-flows with the work
+uncommitted; this one finished and drove it (see Done, "flows"). **Flows
+are uncommitted on `phase-1-core`** until the user asks to commit.
+
+## Where it stood (2026-10-30, night)
 
 Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `master` holds Phase 0, `phase-1-core` everything since, and both track `origin`. Push when the user asks. **`phase-1-core` is 12 commits ahead of `origin`, not pushed** (Phase 2 history, Phase 3 agents, the Rux re-verification, FINDINGS AW-031 to AW-036).
 
@@ -340,19 +346,37 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   environment the workspace doesn't have is dropped when the list loads
   (it made a send fail).
 
+- **Phase 4: flows** (`crates/core/src/flows.rs`, 2026-10-31). A folder
+  of saved requests runs in path order; `# @capture name = $.path |
+  header <name> | status` fills `{{name}}` in later steps. `RunFlow`,
+  `flow_started`/`flow_finished` (each step passed/failed/skipped with a
+  note), a `flow` id on requests and history. A failed step skips the
+  rest unless `keep_going`; each step goes through the same rate limit,
+  policy and approvals as a send (`take_rate`, `run_one`). CLI: `tracer
+  run <folder> [--keep-going] [--report json]`, exit 1 on failure. MCP
+  `run_flow` waits and returns each step. Window: a `flow N` chip on a
+  step, the latest flow's state in the status bar (red when failed), a
+  palette command running the open request's folder; the editor's Checks
+  tab holds `capture …` lines too. 53 tests. Driven: CLI pass, fail,
+  `--keep-going` + JSON report; MCP `run_flow`; the window's palette run
+  and status bar, against jsonplaceholder.
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Phase 4, what doesn't need the viewer first: flows, then benchmarking (with
+2. Phase 4, what doesn't need the viewer first: benchmarking (with
    bench-size caps in the policy), then realtime and GraphQL.
+   Flows follow-up, untried: a flow step keeps its URL as written
+   (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
+   Decide whether a step's re-run gets the flow's captures.
 3. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
    narrow sidebar.
 4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
    wants it.
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
-   notice is cut short; the preview cuts long URLs; the env picker shows a
+   notice is cut short; the preview cuts long URLs; the
    remembered sidebar width
    isn't capped by the window, so at 1000 px wide a 400 px sidebar
    collapses the URL field; the response header name column is a fixed

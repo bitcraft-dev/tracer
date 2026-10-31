@@ -160,6 +160,19 @@ pub enum Command {
     /// The kill switch. Off, every agent is refused anything but reading,
     /// and their running requests are cancelled. Only a person may switch it.
     SetAgents { allowed: bool },
+    /// Run the saved requests under folder `path` (or the one at `path`),
+    /// in the order of their paths, as one flow: each step's captures fill
+    /// `{{name}}` in the steps after it, over `env`'s variables. A step
+    /// fails when it gets no answer, a check fails, or (with no checks) its
+    /// status is 400 or more; the steps after a failed one are skipped
+    /// unless `keep_going`. The reply names the steps; the run is events.
+    RunFlow {
+        path: String,
+        #[serde(default)]
+        env: Option<String>,
+        #[serde(default)]
+        keep_going: bool,
+    },
     /// Compare two finished requests' responses: status, headers, body.
     /// `ignore` adds patterns to the default noisy ones (see
     /// [`ResponseDiff::patterns`]), or replaces them with `no_defaults`.
@@ -196,6 +209,11 @@ pub struct HttpRequest {
     /// `# @expect …` lines above the request line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expect: Vec<String>,
+    /// What a flow takes from its answer for the requests after it, one a
+    /// line: `token = $.access_token`, `next = header Location`, `code =
+    /// status`. Saved as `# @capture` lines above the request line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture: Vec<String>,
 }
 
 /// One expectation, checked: whether it held, and what was found.
@@ -270,6 +288,30 @@ impl Timing {
         let before = self.dns_ms.unwrap_or(0.0) + self.connect_ms.unwrap_or(0.0) + self.tls_ms.unwrap_or(0.0);
         (self.ttfb_ms - before).max(0.0)
     }
+}
+
+/// One step of a flow, as it went.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowStep {
+    /// The saved request's path.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    pub outcome: StepOutcome,
+    /// Why it failed or was skipped, or "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// The names it captured for the steps after it (not their values).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutcome {
+    Passed,
+    Failed,
+    Skipped,
 }
 
 /// How two responses differ, `a` being the earlier one asked about.
@@ -480,6 +522,9 @@ pub struct HistoryEntry {
     pub env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerun_of: Option<u64>,
+    /// The flow it was a step of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<u64>,
     pub ended: Ended,
     /// How its expectations came out, once checked: passed and failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,6 +620,7 @@ pub enum ReplyBody {
     EnvironmentDeleted,
     SecretSet,
     Diff { diff: ResponseDiff },
+    FlowStarted { flow_id: u64, steps: Vec<String> },
     /// The rules for every agent first, then by name; for an agent, only
     /// the rules it gets. `error` says why the policy file was not taken,
     /// in which case the rules are the last ones that were.
@@ -613,6 +659,9 @@ pub enum EventKind {
         env: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rerun_of: Option<u64>,
+        /// The flow it's a step of.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flow: Option<u64>,
     },
     RequestFinished { request_id: u64, response: HttpResponse },
     RequestFailed { request_id: u64, error: String },
@@ -634,6 +683,16 @@ pub enum EventKind {
     /// A request's expectations, checked once it ended (after its
     /// `request_finished` or `request_failed`), in the sender's name.
     RequestChecked { request_id: u64, results: Vec<CheckResult> },
+    /// A flow began: its saved requests, in order.
+    FlowStarted {
+        flow_id: u64,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+        steps: Vec<String>,
+    },
+    /// A flow ended: how each step went.
+    FlowFinished { flow_id: u64, passed: bool, steps: Vec<FlowStep> },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The policy file changed. `rules` are what agents get from now on;
@@ -673,7 +732,7 @@ mod tests {
                     url: "http://x/".into(),
                     headers: vec![],
                     body: None,
-                    expect: Vec::new(),
+                    ..Default::default()
                 },
                 env: None,
             }
@@ -719,9 +778,10 @@ mod tests {
             request_id: 12,
             at_ms: 0,
             actor: Actor { kind: ClientKind::Agent, name: "claude-code".into() },
-            request: HttpRequest { method: "POST".into(), url: "{{base}}/albums".into(), headers: vec![], body: None, expect: Vec::new() },
+            request: HttpRequest { method: "POST".into(), url: "{{base}}/albums".into(), headers: vec![], body: None, ..Default::default() },
             env: Some("staging".into()),
             rerun_of: None,
+            flow: None,
             ended: Ended::Done { status: 404, total_ms: 3.0, size: 2 },
             checks: None,
         };

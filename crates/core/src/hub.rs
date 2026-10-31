@@ -33,6 +33,7 @@ struct Inner {
     next_seq: u64,
     next_client: u64,
     next_request: u64,
+    next_flow: u64,
     journal: File,
     /// Every event so far, for replay. Kept whole for now; a long-lived
     /// workspace will want this paged from the file instead.
@@ -113,6 +114,14 @@ impl Hub {
             })
             .max()
             .map_or(1, |id| id + 1);
+        let next_flow = events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::FlowStarted { flow_id, .. } => Some(flow_id),
+                _ => None,
+            })
+            .max()
+            .map_or(1, |id| id + 1);
         // The kill switch outlives the core: as a person last left it.
         let agents_allowed = events
             .iter()
@@ -152,6 +161,7 @@ impl Hub {
                 next_seq,
                 next_client: 1,
                 next_request,
+                next_flow,
                 journal,
                 events,
                 clients: BTreeMap::new(),
@@ -232,14 +242,24 @@ impl Hub {
         request: HttpRequest,
         env: Option<String>,
         rerun_of: Option<u64>,
+        flow: Option<u64>,
     ) -> (u64, Arc<AtomicBool>) {
         let mut inner = self.inner.lock().unwrap();
         let request_id = inner.next_request;
         inner.next_request += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         inner.running.insert(request_id, Flight { cancelled: cancelled.clone(), kind: actor.kind.clone() });
-        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of });
+        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of, flow });
         (request_id, cancelled)
+    }
+
+    /// Number a new flow and publish that it started.
+    pub fn start_flow(&self, actor: Actor, path: String, env: Option<String>, steps: Vec<String>) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        let flow_id = inner.next_flow;
+        inner.next_flow += 1;
+        publish_locked(&mut inner, actor, EventKind::FlowStarted { flow_id, path, env, steps });
+        flow_id
     }
 
     /// Request `request_id` as it was written, and the environment it was
@@ -292,18 +312,21 @@ impl Hub {
         self.end_checked(actor, request_id, kind, Vec::new());
     }
 
+
     /// Publish how a request ended and, right after it under the same lock,
     /// how its expectations came out (if it had any), unless it was
-    /// cancelled first.
-    pub fn end_checked(&self, actor: Actor, request_id: u64, kind: EventKind, results: Vec<CheckResult>) {
+    /// cancelled first. False if it was.
+    pub fn end_checked(&self, actor: Actor, request_id: u64, kind: EventKind, results: Vec<CheckResult>) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.running.remove(&request_id).is_some() {
-            inner.awaiting.remove(&request_id);
-            publish_locked(&mut inner, actor.clone(), kind);
-            if !results.is_empty() {
-                publish_locked(&mut inner, actor, EventKind::RequestChecked { request_id, results });
-            }
+        if inner.running.remove(&request_id).is_none() {
+            return false;
         }
+        inner.awaiting.remove(&request_id);
+        publish_locked(&mut inner, actor.clone(), kind);
+        if !results.is_empty() {
+            publish_locked(&mut inner, actor, EventKind::RequestChecked { request_id, results });
+        }
+        true
     }
 
     /// Cancel a running request on `actor`'s behalf. False when it is not
@@ -380,25 +403,21 @@ impl Hub {
         if let Some(why) = guard::refused(actor, command, inner.agents_allowed, rules.access) {
             return Some(why);
         }
-        let (Command::Send { .. } | Command::Rerun { .. }, Some(rate)) = (command, rules.rate) else { return None };
-        let window = Duration::from_secs(rate.per_secs);
-        let now = Instant::now();
-        let starts = inner.starts.entry(actor.name.to_ascii_lowercase()).or_default();
-        while starts.front().is_some_and(|at| now.duration_since(*at) >= window) {
-            starts.pop_front();
+        match command {
+            Command::Send { .. } | Command::Rerun { .. } => take_rate_locked(&mut inner, actor, &rules).err(),
+            _ => None,
         }
-        if starts.len() >= rate.count as usize {
-            let wait = window - now.duration_since(starts[0]);
-            return Some(format!(
-                "the workspace's policy lets {} start {} requests every {} s; the next in {} s",
-                actor.name,
-                rate.count,
-                rate.per_secs,
-                wait.as_secs() + 1
-            ));
+    }
+
+    /// Count a request `actor` starts towards its rate, or say why it may
+    /// not start one now. For a flow's steps, which are one command.
+    pub fn take_rate(&self, actor: &Actor) -> Result<(), String> {
+        if actor.kind != ClientKind::Agent {
+            return Ok(());
         }
-        starts.push_back(now);
-        None
+        let mut inner = self.inner.lock().unwrap();
+        let rules = inner.policy.for_agent(&actor.name);
+        take_rate_locked(&mut inner, actor, &rules)
     }
 
     /// The rules `actor` is held to, if it is an agent.
@@ -590,6 +609,28 @@ fn read_policy(root: &Path) -> Result<Option<String>, String> {
     }
 }
 
+fn take_rate_locked(inner: &mut Inner, actor: &Actor, rules: &AgentRules) -> Result<(), String> {
+    let Some(rate) = rules.rate else { return Ok(()) };
+    let window = Duration::from_secs(rate.per_secs);
+    let now = Instant::now();
+    let starts = inner.starts.entry(actor.name.to_ascii_lowercase()).or_default();
+    while starts.front().is_some_and(|at| now.duration_since(*at) >= window) {
+        starts.pop_front();
+    }
+    if starts.len() >= rate.count as usize {
+        let wait = window - now.duration_since(starts[0]);
+        return Err(format!(
+            "the workspace's policy lets {} start {} requests every {} s; the next in {} s",
+            actor.name,
+            rate.count,
+            rate.per_secs,
+            wait.as_secs() + 1
+        ));
+    }
+    starts.push_back(now);
+    Ok(())
+}
+
 fn cancel_locked(inner: &mut Inner, actor: Actor, request_id: u64) -> bool {
     let Some(flight) = inner.running.remove(&request_id) else { return false };
     flight.cancelled.store(true, Ordering::SeqCst);
@@ -604,7 +645,7 @@ fn entries(events: &[Event]) -> Vec<HistoryEntry> {
     let mut entries: Vec<HistoryEntry> = Vec::new();
     for e in events {
         let (request_id, ended) = match &e.kind {
-            EventKind::RequestStarted { request_id, request, env, rerun_of } => {
+            EventKind::RequestStarted { request_id, request, env, rerun_of, flow } => {
                 entries.push(HistoryEntry {
                     request_id: *request_id,
                     at_ms: e.at_ms,
@@ -612,6 +653,7 @@ fn entries(events: &[Event]) -> Vec<HistoryEntry> {
                     request: request.clone(),
                     env: env.clone(),
                     rerun_of: *rerun_of,
+                    flow: *flow,
                     ended: Ended::Running,
                     checks: None,
                 });

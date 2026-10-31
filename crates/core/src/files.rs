@@ -13,9 +13,10 @@
 //! {"optional": "body"}
 //! ```
 //!
-//! Expectations are `# @expect` comments above the request line, in the
-//! place REST Client keeps `# @name`, so the other tools read the file as
-//! before and skip them.
+//! Expectations (`# @expect`) and, for flows, captures (`# @capture token =
+//! $.access_token`) are comments above the request line, in the place REST
+//! Client keeps `# @name`, so the other tools read the file as before and
+//! skip them.
 //!
 //! A request's path is what clients use to name it: relative to `requests/`,
 //! with `/` between folders and no extension, such as `albums/get album`.
@@ -111,6 +112,7 @@ fn walk(root: &Path, dir: &Path, found: &mut Vec<SavedRequest>, skipped: &mut Ve
 
 pub fn to_text(request: &HttpRequest) -> String {
     let mut out: String = request.expect.iter().map(|e| format!("# @expect {e}\n")).collect();
+    out.extend(request.capture.iter().map(|c| format!("# @capture {c}\n")));
     out.push_str(&format!("{} {}\n", request.method, request.url));
     for (name, value) in &request.headers {
         out.push_str(&format!("{name}: {value}\n"));
@@ -130,14 +132,16 @@ pub fn to_text(request: &HttpRequest) -> String {
 /// several to a file and Tracer keeps the first.
 pub fn from_text(text: &str) -> Result<HttpRequest, String> {
     let mut lines = text.lines().peekable();
-    let mut expect = Vec::new();
+    let (mut expect, mut capture) = (Vec::new(), Vec::new());
     while let Some(line) = lines.peek() {
         let t = line.trim();
         if t.is_empty() || (t.starts_with('#') && !t.starts_with("###")) || t.starts_with("//") {
             let meta = t.trim_start_matches(['#', '/']).trim_start();
-            if let Some(e) = meta.strip_prefix("@expect") {
-                if e.starts_with(char::is_whitespace) && !e.trim().is_empty() {
-                    expect.push(e.trim().to_string());
+            for (tag, into) in [("@expect", &mut expect), ("@capture", &mut capture)] {
+                if let Some(e) = meta.strip_prefix(tag) {
+                    if e.starts_with(char::is_whitespace) && !e.trim().is_empty() {
+                        into.push(e.trim().to_string());
+                    }
                 }
             }
             lines.next();
@@ -164,7 +168,7 @@ pub fn from_text(text: &str) -> Result<HttpRequest, String> {
             break;
         }
         if line.trim_start().starts_with("###") {
-            return Ok(HttpRequest { method: method.to_uppercase(), url: url.to_string(), headers, body: None, expect });
+            return Ok(HttpRequest { method: method.to_uppercase(), url: url.to_string(), headers, body: None, expect, capture });
         }
         let (name, value) = line.split_once(':').ok_or_else(|| format!("`{line}` is not a `Name: value` header"))?;
         headers.push((name.trim().to_string(), value.trim().to_string()));
@@ -178,6 +182,7 @@ pub fn from_text(text: &str) -> Result<HttpRequest, String> {
         headers,
         body: if body.is_empty() { None } else { Some(body.to_string()) },
         expect,
+        capture,
     })
 }
 
@@ -193,11 +198,12 @@ mod tests {
             headers: vec![("Accept".into(), "application/json".into()), ("X-Note".into(), "a: b".into())],
             body: Some("{\n  \"title\": \"t\"\n}".into()),
             expect: vec!["status 2xx".into(), "$.id exists".into()],
+            capture: vec!["id = $.id".into()],
         };
         let text = to_text(&request);
         assert_eq!(
             text,
-            "# @expect status 2xx\n# @expect $.id exists\nPOST https://x.test/albums?id=1\nAccept: application/json\nX-Note: a: b\n\n{\n  \"title\": \"t\"\n}\n"
+            "# @expect status 2xx\n# @expect $.id exists\n# @capture id = $.id\nPOST https://x.test/albums?id=1\nAccept: application/json\nX-Note: a: b\n\n{\n  \"title\": \"t\"\n}\n"
         );
         assert_eq!(from_text(&text).unwrap(), request);
     }

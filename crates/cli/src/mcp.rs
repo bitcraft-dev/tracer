@@ -216,6 +216,7 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 headers: headers_arg(args)?,
                 body: str_arg(args, "body").map(String::from),
                 expect: list_arg(args, "expect"),
+                capture: Vec::new(),
             };
             let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
             send_and_wait(core, Command::Send { request, env }, args)
@@ -280,6 +281,7 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 headers: headers_arg(args)?,
                 body: str_arg(args, "body").map(String::from),
                 expect: list_arg(args, "expect"),
+                capture: list_arg(args, "capture"),
             };
             let path = str_arg(args, "path").ok_or("`path` is required")?.to_string();
             let ReplyBody::Saved { path } = call(core, Command::SaveRequest { path, request })? else {
@@ -297,6 +299,53 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 return Err(unexpected());
             };
             serde_json::to_value(diff).map_err(|e| e.to_string())
+        }
+        "run_flow" => {
+            let path = str_arg(args, "path").ok_or("`path` is required")?.to_string();
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            let keep_going = args.get("keep_going").and_then(Value::as_bool).unwrap_or(false);
+            let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT * 2).min(WAIT_MAX);
+            while core.events.try_recv().is_ok() {}
+            let ReplyBody::FlowStarted { flow_id, steps } = call(core, Command::RunFlow { path, env, keep_going })? else {
+                return Err(unexpected());
+            };
+            let deadline = Instant::now() + Duration::from_secs(wait);
+            let mut answers: Vec<(u64, u16, f64)> = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let event = match core.events.recv_timeout(left) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Ok(json!({
+                            "flow_id": flow_id,
+                            "steps": steps,
+                            "state": "running",
+                            "note": format!("not finished after {wait} s; it carries on, and read_history shows its steps"),
+                        }));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Err("the core hung up".into()),
+                };
+                match event.kind {
+                    EventKind::RequestFinished { request_id, response } => {
+                        answers.push((request_id, response.status, response.timing.total_ms))
+                    }
+                    EventKind::FlowFinished { flow_id: f, passed, steps } if f == flow_id => {
+                        let steps: Vec<Value> = steps
+                            .iter()
+                            .map(|s| {
+                                let mut v = serde_json::to_value(s).unwrap_or_default();
+                                if let Some((_, status, ms)) = s.request_id.and_then(|id| answers.iter().find(|(r, _, _)| *r == id)) {
+                                    v["status"] = json!(status);
+                                    v["total_ms"] = json!(ms.round());
+                                }
+                                v
+                            })
+                            .collect();
+                        return Ok(json!({ "flow_id": flow_id, "passed": passed, "steps": steps }));
+                    }
+                    _ => {}
+                }
+            }
         }
         "read_policy" => {
             let ReplyBody::Policy { rules, error } = call(core, Command::Policy)? else {
@@ -342,7 +391,7 @@ fn send_and_wait(core: &Core, sending: Command, args: &Value) -> Result<Value, S
             Err(RecvTimeoutError::Disconnected) => return Err("the core hung up".into()),
         };
         match event.kind {
-            EventKind::RequestStarted { request_id: id, request, env, rerun_of } if id == request_id => {
+            EventKind::RequestStarted { request_id: id, request, env, rerun_of, .. } if id == request_id => {
                 checked = !request.expect.is_empty();
                 state["request"] = request_json(&request);
                 if let Some(env) = env {
@@ -679,8 +728,23 @@ fn tools() -> Value {
                     "headers": headers,
                     "body": { "type": "string" },
                     "expect": expect,
+                    "capture": { "type": "array", "items": { "type": "string" }, "description": "For a flow (run_flow): what to take from the answer for the requests after it, such as `token = $.access_token`, `next = header Location`, `code = status`; later requests use `{{token}}`." },
                 },
                 "required": ["path", "url"],
+            },
+        },
+        {
+            "name": "run_flow",
+            "description": "Run the saved requests under a folder (list_requests shows the paths) in path order, as one flow: each step's captures (`# @capture token = $.access_token` in its file, or save_request's `capture`) fill `{{token}}` in the steps after it. A step fails with no answer, a failed check, or (without checks) a status of 400 or more; the steps after a failure are skipped unless keep_going. Each step is an ordinary request, so approvals and the policy apply to each. Gives each step's outcome, status and what it captured (names only).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A folder under requests/, such as `signup`, or one request's path." },
+                    "env": env,
+                    "keep_going": { "type": "boolean" },
+                    "wait_seconds": { "type": "integer", "description": "How long to wait for the end (default 120, at most 600)." },
+                },
+                "required": ["path"],
             },
         },
         {

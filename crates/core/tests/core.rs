@@ -67,7 +67,7 @@ fn answer(mut stream: TcpStream) {
 }
 
 fn get(url: String) -> Command {
-    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None, expect: Vec::new() }, env: None }
+    Command::Send { request: HttpRequest { method: "GET".into(), url, headers: vec![], body: None, ..Default::default() }, env: None }
 }
 
 #[test]
@@ -453,7 +453,7 @@ fn saved_requests_are_plain_files_and_every_client_sees_them_change() {
         url: "https://x.test/albums".into(),
         headers: vec![("Accept".into(), "application/json".into())],
         body: Some("{\"title\": \"t\"}".into()),
-        expect: Vec::new(),
+        ..Default::default()
     };
     let saved = agent.call(Command::SaveRequest { path: r"requests\albums\new album.http".into(), request: request.clone() });
     assert_eq!(saved.unwrap(), Ok(ReplyBody::Saved { path: "albums/new album".into() }));
@@ -543,7 +543,7 @@ fn a_request_sent_with_an_environment_is_filled_in_and_the_journal_keeps_it_as_w
     assert_eq!(text, format!("baseUrl={base}\nid=7\n"));
 
     let send = |url: &str| Command::Send {
-        request: HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], body: None, expect: Vec::new() },
+        request: HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], body: None, ..Default::default() },
         env: Some("local".into()),
     };
     let Ok(ReplyBody::Accepted { request_id: ok_id }) = agent.call(send("{{baseUrl}}/albums/{{ id }}")).unwrap() else { panic!() };
@@ -611,7 +611,7 @@ fn a_rerun_sends_the_request_as_written_with_its_environment_unless_told_otherwi
         url: "{{base}}/items/{{id}}".into(),
         headers: vec![("X-Id".into(), "{{id}}".into())],
         body: Some("abc".into()),
-        expect: Vec::new(),
+        ..Default::default()
     };
     let Ok(ReplyBody::Accepted { request_id: first }) =
         cli.call(Command::Send { request: request.clone(), env: Some("a".into()) }).unwrap()
@@ -727,7 +727,7 @@ fn files_changed_behind_the_core_are_published_once_and_its_own_saves_are_not_ec
     };
 
     // The core's own save: one event, from the window, none from disk.
-    let request = HttpRequest { method: "GET".into(), url: "http://x.test/a".into(), headers: vec![], body: None, expect: Vec::new() };
+    let request = HttpRequest { method: "GET".into(), url: "http://x.test/a".into(), headers: vec![], body: None, ..Default::default() };
     window.call(Command::SaveRequest { path: "a".into(), request }).unwrap().unwrap();
     let got = collect(3);
     let saves: Vec<&Event> = got.iter().filter(|e| matches!(e.kind, EventKind::RequestSaved { .. })).collect();
@@ -776,7 +776,7 @@ fn a_secret_fills_in_but_its_value_never_reaches_a_client_or_the_journal() {
     // Sent with it: the stub echoes the path, so the value comes back in the
     // body, and is replaced by its name before anyone sees it.
     let send = Command::Send {
-        request: HttpRequest { method: "GET".into(), url: "{{baseUrl}}/me?key={{token}}".into(), headers: vec![], body: None, expect: Vec::new() },
+        request: HttpRequest { method: "GET".into(), url: "{{baseUrl}}/me?key={{token}}".into(), headers: vec![], body: None, ..Default::default() },
         env: Some("prod".into()),
     };
     let Ok(ReplyBody::Accepted { request_id }) = agent.call(send).unwrap() else { panic!() };
@@ -832,7 +832,7 @@ fn wait_for<T>(client: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -
 }
 
 fn post(url: String) -> Command {
-    Command::Send { request: HttpRequest { method: "POST".into(), url, headers: vec![], body: Some("x".into()), expect: Vec::new() }, env: None }
+    Command::Send { request: HttpRequest { method: "POST".into(), url, headers: vec![], body: Some("x".into()), ..Default::default() }, env: None }
 }
 
 #[test]
@@ -971,7 +971,7 @@ fn the_workspace_policy_holds_each_agent_to_its_rules_and_is_followed_as_it_chan
 
     // Claude, by name whatever its case: a POST with nothing to approve.
     let send = |client: &mut Client, method: &str, url: String, body: &str| {
-        let request = HttpRequest { method: method.into(), url, headers: vec![], body: Some(body.into()), expect: Vec::new() };
+        let request = HttpRequest { method: method.into(), url, headers: vec![], body: Some(body.into()), ..Default::default() };
         let Ok(ReplyBody::Accepted { request_id }) = client.call(Command::Send { request, env: None }).unwrap() else {
             panic!("not accepted")
         };

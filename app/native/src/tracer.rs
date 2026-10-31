@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tracer_protocol::client::{Client, Incoming, Shared};
-use tracer_protocol::{ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest};
+use tracer_protocol::{ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest, StepOutcome};
 
 /// The most of a response body handed to the page. The core and its journal
 /// keep the whole body; a viewer for large ones is Phase 4.
@@ -93,6 +93,9 @@ pub struct CoreEvent {
     pub checks: String,
     /// How they came out, for `request_checked`.
     pub results: Vec<Check>,
+    /// The flow a started request is a step of, or the flow of
+    /// `flow_started` and `flow_finished`; 0 for none.
+    pub flow: u64,
 }
 
 /// One expectation, checked.
@@ -266,6 +269,18 @@ pub fn send(method: String, url: String, headers: Vec<Header>, body: String, env
     let env = if env.is_empty() { None } else { Some(env) };
     match shared()?.call(Command::Send { request, env }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Run the saved requests under folder `path` as a flow. Gives its id.
+#[rux::export]
+pub fn run_flow(path: String, env: String) -> Result<u64, CoreError> {
+    let env = if env.is_empty() { None } else { Some(env) };
+    match shared()?.call(Command::RunFlow { path, env, keep_going: false }) {
+        Ok(Ok(ReplyBody::FlowStarted { flow_id, .. })) => Ok(flow_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
@@ -538,15 +553,26 @@ fn shared() -> Result<Arc<Shared>, CoreError> {
     }
 }
 
-/// `checks` is the page's text: an expectation a line, blank lines aside.
+/// `checks` is the page's text: an expectation a line, and a flow's
+/// captures as `capture name = source`; blank lines aside.
 fn request_of(method: String, url: String, headers: Vec<Header>, body: String, checks: String) -> HttpRequest {
+    let lines: Vec<&str> = checks.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let capture = |l: &&str| l.strip_prefix("capture ").is_some();
     HttpRequest {
         method: method.to_uppercase(),
         url: url.trim().to_string(),
         headers: headers.into_iter().map(|h| (h.name, h.value)).collect(),
         body: if body.is_empty() { None } else { Some(body) },
-        expect: checks.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect(),
+        expect: lines.iter().filter(|l| !capture(l)).map(|l| l.to_string()).collect(),
+        capture: lines.iter().filter(|l| capture(l)).map(|l| l["capture ".len()..].trim().to_string()).collect(),
     }
+}
+
+/// A request's expectations and captures as the page's Checks text.
+fn checks_text(r: &HttpRequest) -> String {
+    let mut lines = r.expect.clone();
+    lines.extend(r.capture.iter().map(|c| format!("capture {c}")));
+    lines.join("\n")
 }
 
 fn headers_of(list: Vec<(String, String)>) -> Vec<Header> {
@@ -556,12 +582,12 @@ fn headers_of(list: Vec<(String, String)>) -> Vec<Header> {
 fn saved_of(saved: SavedRequest) -> Saved {
     let r = saved.request;
     Saved {
+        checks: checks_text(&r),
         path: saved.path,
         method: r.method,
         url: r.url,
         headers: headers_of(r.headers),
         body: r.body.unwrap_or_default(),
-        checks: r.expect.join("\n"),
     }
 }
 
@@ -604,21 +630,23 @@ fn to_page(event: Event) -> CoreEvent {
         allow: false,
         checks: String::new(),
         results: Vec::new(),
+        flow: 0,
     };
     let headers = headers_of;
     match event.kind {
         EventKind::ClientJoined { client } => (out.kind, out.client) = ("client_joined".into(), client),
         EventKind::ClientLeft { client } => (out.kind, out.client) = ("client_left".into(), client),
-        EventKind::RequestStarted { request_id, request, env, rerun_of } => {
+        EventKind::RequestStarted { request_id, request, env, rerun_of, flow } => {
             out.kind = "request_started".into();
+            out.flow = flow.unwrap_or(0);
             out.env = env.unwrap_or_default();
             out.request_id = request_id;
             out.rerun_of = rerun_of.unwrap_or(0);
+            out.checks = checks_text(&request);
             out.method = request.method;
             out.url = request.url;
             out.headers = headers(request.headers);
             out.body = request.body.unwrap_or_default();
-            out.checks = request.expect.join("\n");
         }
         EventKind::RequestFinished { request_id, response } => {
             out.kind = "request_finished".into();
@@ -645,11 +673,11 @@ fn to_page(event: Event) -> CoreEvent {
         EventKind::RequestSaved { path, request } => {
             out.kind = "request_saved".into();
             out.path = path;
+            out.checks = checks_text(&request);
             out.method = request.method;
             out.url = request.url;
             out.headers = headers(request.headers);
             out.body = request.body.unwrap_or_default();
-            out.checks = request.expect.join("\n");
         }
         EventKind::RequestChecked { request_id, results } => {
             out.kind = "request_checked".into();
@@ -673,6 +701,19 @@ fn to_page(event: Event) -> CoreEvent {
             out.kind = "approval_given".into();
             out.request_id = request_id;
             out.allow = allow;
+        }
+        EventKind::FlowStarted { flow_id, path, steps, .. } => {
+            (out.kind, out.flow, out.path) = ("flow_started".into(), flow_id, path);
+            out.reason = format!("{} steps", steps.len());
+        }
+        EventKind::FlowFinished { flow_id, passed, steps } => {
+            (out.kind, out.flow, out.allow) = ("flow_finished".into(), flow_id, passed);
+            let failed: Vec<String> = steps
+                .iter()
+                .filter(|s| s.outcome == StepOutcome::Failed)
+                .map(|s| format!("{}: {}", s.path, s.note))
+                .collect();
+            out.reason = failed.join("; ");
         }
         EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
         EventKind::PolicyChanged { error, .. } => {

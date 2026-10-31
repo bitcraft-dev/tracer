@@ -16,6 +16,7 @@ mod diff;
 mod envs;
 mod expect;
 mod files;
+mod flows;
 mod guard;
 mod http;
 mod hub;
