@@ -173,6 +173,22 @@ pub enum Command {
         #[serde(default)]
         keep_going: bool,
     },
+    /// Send `request` over and over: `plan.concurrency` at a time until
+    /// `plan.total` have gone or `plan.duration_secs` has passed, whichever
+    /// comes first, no faster than `plan.rate` a second if given. The first
+    /// is an ordinary request, in history, held to the policy and asked
+    /// about as any send; the rest are counted, not kept. The reply gives
+    /// the bench's id; the run is `bench_progress` events, then
+    /// `bench_finished`.
+    RunBench {
+        request: HttpRequest,
+        #[serde(default)]
+        env: Option<String>,
+        plan: BenchPlan,
+    },
+    /// Stop a running bench, whoever started it. It ends with
+    /// `bench_finished`, naming who stopped it.
+    StopBench { bench_id: u64 },
     /// Compare two finished requests' responses: status, headers, body.
     /// `ignore` adds patterns to the default noisy ones (see
     /// [`ResponseDiff::patterns`]), or replaces them with `no_defaults`.
@@ -314,6 +330,84 @@ pub enum StepOutcome {
     Skipped,
 }
 
+/// How much a bench sends. At least one of `total` and `duration_secs`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BenchPlan {
+    /// The most requests to send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// How many are in flight at once, each on a connection it keeps.
+    pub concurrency: u32,
+    /// The longest to run, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    /// The most to start a second, across all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<f64>,
+}
+
+impl BenchPlan {
+    /// `500 requests, 10 at a time`, `30 s at 20 a second, 4 at a time`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(total) = self.total {
+            parts.push(format!("{total} request{}", if total == 1 { "" } else { "s" }));
+        }
+        if let Some(secs) = self.duration_secs {
+            parts.push(format!("{secs} s"));
+        }
+        let mut out = parts.join(" or ");
+        if let Some(rate) = self.rate {
+            out.push_str(&format!(" at {rate} a second"));
+        }
+        out.push_str(&format!(", {} at a time", self.concurrency));
+        out
+    }
+}
+
+/// Upper bounds of the latency histogram's buckets, in milliseconds; the
+/// last bucket holds everything slower than the last bound.
+pub const BENCH_BUCKETS_MS: [f64; 15] =
+    [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 300.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 30000.0];
+
+/// A bench so far, or at its end. Latencies are each request's whole time,
+/// sent to the last byte of its body, of the requests that got an answer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BenchStats {
+    /// How long it has run, in milliseconds.
+    pub elapsed_ms: f64,
+    /// Requests that ended, answered or not.
+    pub done: u64,
+    /// Ended with no answer at all.
+    pub failed: u64,
+    /// Answered with a status of 400 or more.
+    pub bad_status: u64,
+    /// Answered, but an expectation of the request's failed.
+    pub failed_checks: u64,
+    /// Answers by status, lowest first.
+    pub statuses: Vec<(u16, u64)>,
+    /// Why requests got no answer, the commonest first, with how many.
+    pub errors: Vec<(String, u64)>,
+    pub min_ms: f64,
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    /// Requests ended a second, over the whole run.
+    pub per_sec: f64,
+    /// Answers in each bucket of [`BENCH_BUCKETS_MS`], one more for slower.
+    pub histogram: Vec<u64>,
+}
+
+impl BenchStats {
+    /// Requests that went wrong in any way: no answer, a status of 400 or
+    /// more, or a failed expectation.
+    pub fn bad(&self) -> u64 {
+        self.failed + self.bad_status + self.failed_checks
+    }
+}
+
 /// How two responses differ, `a` being the earlier one asked about.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseDiff {
@@ -409,6 +503,12 @@ pub struct AgentRules {
     /// filled in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body: Option<u64>,
+    /// The most requests one bench of its may send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bench: Option<u64>,
+    /// The most a bench of its may have in flight at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
 }
 
 /// Where an agent's requests may go.
@@ -432,6 +532,8 @@ pub enum ApproveWhen {
     Prod,
     /// Every request.
     All,
+    /// Every bench, before its first request.
+    Bench,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +627,9 @@ pub struct HistoryEntry {
     /// The flow it was a step of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<u64>,
+    /// The bench it was the first request of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench: Option<u64>,
     pub ended: Ended,
     /// How its expectations came out, once checked: passed and failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -621,6 +726,8 @@ pub enum ReplyBody {
     SecretSet,
     Diff { diff: ResponseDiff },
     FlowStarted { flow_id: u64, steps: Vec<String> },
+    BenchStarted { bench_id: u64 },
+    BenchStopped,
     /// The rules for every agent first, then by name; for an agent, only
     /// the rules it gets. `error` says why the policy file was not taken,
     /// in which case the rules are the last ones that were.
@@ -662,6 +769,9 @@ pub enum EventKind {
         /// The flow it's a step of.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         flow: Option<u64>,
+        /// The bench it's the first request of.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bench: Option<u64>,
     },
     RequestFinished { request_id: u64, response: HttpResponse },
     RequestFailed { request_id: u64, error: String },
@@ -693,6 +803,23 @@ pub enum EventKind {
     },
     /// A flow ended: how each step went.
     FlowFinished { flow_id: u64, passed: bool, steps: Vec<FlowStep> },
+    /// A bench began: `request` as written, sent with `env`, to `plan`.
+    BenchStarted {
+        bench_id: u64,
+        request: HttpRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+        plan: BenchPlan,
+    },
+    /// A bench so far, a few times a second while it runs.
+    BenchProgress { bench_id: u64, stats: BenchStats },
+    /// A bench ended: all it sent, or stopped early, and why.
+    BenchFinished {
+        bench_id: u64,
+        stats: BenchStats,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stopped: Option<String>,
+    },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The policy file changed. `rules` are what agents get from now on;
@@ -782,6 +909,7 @@ mod tests {
             env: Some("staging".into()),
             rerun_of: None,
             flow: None,
+            bench: None,
             ended: Ended::Done { status: 404, total_ms: 3.0, size: 2 },
             checks: None,
         };

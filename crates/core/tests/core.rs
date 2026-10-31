@@ -1247,3 +1247,115 @@ GET {base}/x
     assert_eq!((checks.len(), entry.checks), (0, None));
     core.stop();
 }
+
+fn bench(url: String, plan: tracer_protocol::BenchPlan) -> Command {
+    let request = HttpRequest { method: "GET".into(), url, ..Default::default() };
+    Command::RunBench { request, env: None, plan }
+}
+
+/// How bench `id` ended: its stats and why it stopped, if it did.
+fn bench_end(client: &mut Client, id: u64) -> (tracer_protocol::BenchStats, Option<String>) {
+    wait_for(client, |e| match &e.kind {
+        EventKind::BenchFinished { bench_id, stats, stopped } if *bench_id == id => Some((stats.clone(), stopped.clone())),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_bench_sends_its_total_counts_every_answer_and_keeps_only_its_first_in_history() {
+    use tracer_protocol::BenchPlan;
+    let ws = workspace("bench");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+
+    let plan = BenchPlan { total: Some(60), concurrency: 6, ..BenchPlan::default() };
+    let Ok(ReplyBody::BenchStarted { bench_id }) = window.call(bench(format!("{base}/load"), plan)).unwrap() else { panic!() };
+    let (stats, stopped) = bench_end(&mut window, bench_id);
+    assert_eq!(stopped, None);
+    assert_eq!((stats.done, stats.bad()), (60, 0));
+    assert_eq!(stats.statuses, vec![(200, 60)]);
+    assert_eq!(stats.histogram.iter().sum::<u64>(), 60);
+    assert!(stats.min_ms <= stats.p50_ms && stats.p50_ms <= stats.p95_ms && stats.p99_ms <= stats.max_ms);
+
+    let Ok(ReplyBody::History { entries, .. }) = window.call(Command::History { filter: Default::default() }).unwrap() else { panic!() };
+    assert_eq!(entries.len(), 1, "only the first is a request of its own");
+    assert_eq!(entries[0].bench, Some(bench_id));
+
+    // Neither a total nor a duration: refused before anything starts.
+    let endless = BenchPlan { concurrency: 1, ..BenchPlan::default() };
+    assert!(window.call(bench(format!("{base}/x"), endless)).unwrap().unwrap_err().contains("total, a duration"));
+    core.stop();
+}
+
+#[test]
+fn a_bench_with_a_rate_keeps_to_it_until_its_time_is_up() {
+    use tracer_protocol::BenchPlan;
+    let ws = workspace("bench-rate");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+
+    let plan = BenchPlan { duration_secs: Some(2), rate: Some(20.0), concurrency: 4, ..BenchPlan::default() };
+    let Ok(ReplyBody::BenchStarted { bench_id }) = window.call(bench(format!("{base}/paced"), plan)).unwrap() else { panic!() };
+    let mut progress = 0;
+    let (stats, stopped) = wait_for(&mut window, |e| match &e.kind {
+        EventKind::BenchProgress { bench_id: id, .. } if *id == bench_id => {
+            progress += 1;
+            None
+        }
+        EventKind::BenchFinished { bench_id: id, stats, stopped } if *id == bench_id => Some((stats.clone(), stopped.clone())),
+        _ => None,
+    });
+    assert_eq!(stopped, None);
+    // 20 a second for 2 s: 40, give or take the edges.
+    assert!((35..=42).contains(&stats.done), "{} sent", stats.done);
+    assert!(progress >= 4, "told how it went {progress} times");
+    core.stop();
+}
+
+#[test]
+fn an_agents_bench_is_capped_asked_about_and_stopped_by_a_person_or_the_kill_switch() {
+    use tracer_protocol::BenchPlan;
+    let ws = workspace("bench-agent");
+    std::fs::write(ws.join("agents.policy"), "[*]\nmax_bench = 100\nmax_concurrency = 4\n").unwrap();
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+
+    let big = BenchPlan { total: Some(500), concurrency: 4, ..BenchPlan::default() };
+    assert!(agent.call(bench(format!("{base}/x"), big)).unwrap().unwrap_err().contains("max_bench of 100"));
+    let wide = BenchPlan { total: Some(100), concurrency: 8, ..BenchPlan::default() };
+    assert!(agent.call(bench(format!("{base}/x"), wide)).unwrap().unwrap_err().contains("max_concurrency of 4"));
+
+    // Within the caps, it waits for a person before its first request.
+    let plan = BenchPlan { total: Some(100), concurrency: 4, ..BenchPlan::default() };
+    let Ok(ReplyBody::BenchStarted { bench_id }) = agent.call(bench(format!("{base}/x"), plan)).unwrap() else { panic!() };
+    let (first, reason) = wait_for(&mut window, |e| match &e.kind {
+        EventKind::ApprovalAsked { request_id, reason } => Some((*request_id, reason.clone())),
+        _ => None,
+    });
+    assert_eq!(reason, "a bench from an agent: 100 requests, 4 at a time");
+    // Stopped while it waits: the first is cancelled, and the bench says who.
+    assert_eq!(window.call(Command::StopBench { bench_id }).unwrap(), Ok(ReplyBody::BenchStopped));
+    assert!(matches!(end_of(&mut window, first), EventKind::RequestCancelled { .. }));
+    let (stats, stopped) = bench_end(&mut window, bench_id);
+    assert_eq!((stats.done, stopped.as_deref()), (0, Some("stopped by you")));
+    assert!(window.call(Command::StopBench { bench_id }).unwrap().is_err(), "it isn't running");
+
+    // Allowed, it runs until the kill switch stops it.
+    std::fs::write(ws.join("agents.policy"), "[*]\napprove = none\n").unwrap();
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::PolicyChanged { .. }).then_some(()));
+    let slow = BenchPlan { duration_secs: Some(30), rate: Some(20.0), concurrency: 2, ..BenchPlan::default() };
+    let Ok(ReplyBody::BenchStarted { bench_id }) = agent.call(bench(format!("{base}/y"), slow)).unwrap() else { panic!() };
+    wait_for(&mut window, |e| matches!(e.kind, EventKind::BenchProgress { bench_id: id, .. } if id == bench_id).then_some(()));
+    window.call(Command::SetAgents { allowed: false }).unwrap().unwrap();
+    let (stats, stopped) = bench_end(&mut window, bench_id);
+    assert_eq!(stopped.as_deref(), Some("stopped by you"));
+    assert!(stats.done > 0 && stats.done < 100, "{} sent", stats.done);
+    core.stop();
+}

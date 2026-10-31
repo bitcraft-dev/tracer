@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+    Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::{diff, envs, expect, flows, guard, http};
+use crate::{bench, diff, envs, expect, flows, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -164,6 +164,16 @@ pub fn serve(
                     Err(e) => Err(e),
                 }
             }
+            (Some((_, actor)), Command::RunBench { request, env, plan }) => {
+                bench::start(&hub, actor, request, env, plan).map(|bench_id| ReplyBody::BenchStarted { bench_id })
+            }
+            (Some((_, actor)), Command::StopBench { bench_id }) => {
+                if hub.stop_bench(actor, bench_id) {
+                    Ok(ReplyBody::BenchStopped)
+                } else {
+                    Err(format!("bench {bench_id} is not running"))
+                }
+            }
             (Some(_), Command::Diff { a, b, ignore, no_defaults }) => {
                 let side = |id: u64| match hub.response(id) {
                     Some((entry, Some(response), _)) => Ok((
@@ -224,12 +234,12 @@ fn send(
     rerun_of: Option<u64>,
     accepted: impl FnOnce(u64),
 ) {
-    let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of, None);
+    let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of, None, None);
     // Before the thread starts, so the sender hears its id before the end.
     accepted(request_id);
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
-        run_one(&hub, &actor, request_id, &cancelled, &request, env.as_deref(), &[]);
+        run_one(&hub, &actor, request_id, &cancelled, &request, env.as_deref(), &[], None);
     });
 }
 
@@ -245,7 +255,9 @@ pub(crate) enum Ran {
 
 /// Send started request `request_id` and publish how it ends: resolved
 /// with `env` and, over it, `extra` (a flow's captures), held to the
-/// sender's policy, approved if it must be, checked. Blocks until then.
+/// sender's policy, approved if it must be (as the first of `bench`, if it
+/// is), checked. Blocks until then.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_one(
     hub: &Hub,
     actor: &Actor,
@@ -254,6 +266,7 @@ pub(crate) fn run_one(
     request: &HttpRequest,
     env: Option<&str>,
     extra: &[(String, String)],
+    bench: Option<&BenchPlan>,
 ) -> Ran {
     // The rules as they stand when it's sent, for the whole of its run.
     let rules = hub.rules_for(actor);
@@ -275,7 +288,7 @@ pub(crate) fn run_one(
         if let Some(why) = guard::outside_rules(rules, sending) {
             return stopped(envs::redact(&format!("refused by the workspace's policy: {why}"), &secrets));
         }
-        if let Some(reason) = guard::needs_approval(rules, request, env) {
+        if let Some(reason) = guard::needs_approval(rules, request, env, bench) {
             if !approved(hub, actor, request_id, reason) {
                 return Ran::Stopped("not allowed by a person".into());
             }

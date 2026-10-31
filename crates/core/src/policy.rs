@@ -7,14 +7,16 @@
 //! approve = writes, prod   # writes, prod, all, or none
 //! rate = 60/min            # N/s, N/min, N/h, or none
 //! max_body = 1 MiB         # B, KB, KiB, MB, MiB, or none
+//! max_bench = 1000         # requests in one bench, or none
+//! max_concurrency = 10     # a bench's requests in flight at once, or none
 //!
 //! [claude-code]
 //! access = local
 //! ```
 //!
 //! A section sets only what it names; the rest comes from `[*]`, and what
-//! `[*]` leaves out is as with no policy at all: anywhere, writes and prod
-//! approved, no caps. Agent names match ignoring case.
+//! `[*]` leaves out is as with no policy at all: anywhere, writes, prod and
+//! benches approved, no caps. Agent names match ignoring case.
 //!
 //! The name is the one an agent connects under, which it chooses, and a
 //! process that can read the workspace can read the core's token. The policy
@@ -38,6 +40,8 @@ struct Section {
     approve: Option<Vec<ApproveWhen>>,
     rate: Option<Option<Rate>>,
     max_body: Option<Option<u64>>,
+    max_bench: Option<Option<u64>>,
+    max_concurrency: Option<Option<u32>>,
 }
 
 impl Default for Policy {
@@ -91,7 +95,13 @@ impl Policy {
                 "approve" => section.approve = Some(approve(value).map_err(at)?),
                 "rate" => section.rate = Some(none_or(value, rate).map_err(at)?),
                 "max_body" => section.max_body = Some(none_or(value, size).map_err(at)?),
-                _ => return Err(at(format!("`{key}` is not a setting: access, approve, rate or max_body"))),
+                "max_bench" => section.max_bench = Some(none_or(value, count).map_err(at)?),
+                "max_concurrency" => section.max_concurrency = Some(none_or(value, count).map_err(at)?),
+                _ => {
+                    return Err(at(format!(
+                        "`{key}` is not a setting: access, approve, rate, max_body, max_bench or max_concurrency"
+                    )))
+                }
             }
         }
 
@@ -113,9 +123,11 @@ fn everyone(access: Access) -> AgentRules {
     AgentRules {
         agent: "*".into(),
         access,
-        approve: vec![ApproveWhen::Writes, ApproveWhen::Prod],
+        approve: vec![ApproveWhen::Writes, ApproveWhen::Prod, ApproveWhen::Bench],
         rate: None,
         max_body: None,
+        max_bench: None,
+        max_concurrency: None,
     }
 }
 
@@ -131,6 +143,12 @@ fn apply(rules: &mut AgentRules, section: &Section) {
     }
     if let Some(max_body) = section.max_body {
         rules.max_body = max_body;
+    }
+    if let Some(max_bench) = section.max_bench {
+        rules.max_bench = max_bench;
+    }
+    if let Some(max_concurrency) = section.max_concurrency {
+        rules.max_concurrency = max_concurrency;
     }
 }
 
@@ -153,7 +171,8 @@ fn approve(value: &str) -> Result<Vec<ApproveWhen>, String> {
             "writes" => ApproveWhen::Writes,
             "prod" => ApproveWhen::Prod,
             "all" => ApproveWhen::All,
-            _ => return Err(format!("approve takes writes, prod, all or none, not `{word}`")),
+            "bench" => ApproveWhen::Bench,
+            _ => return Err(format!("approve takes writes, prod, bench, all or none, not `{word}`")),
         };
         if !out.contains(&when) {
             out.push(when);
@@ -187,6 +206,14 @@ fn rate(value: &str) -> Result<Rate, String> {
     Ok(Rate { count, per_secs })
 }
 
+/// A count of at least 1, such as `1000`.
+fn count<T: std::str::FromStr + Default + PartialEq>(value: &str) -> Result<T, String> {
+    match value.parse::<T>() {
+        Ok(n) if n != T::default() => Ok(n),
+        _ => Err(format!("expected a count of at least 1, or none, not `{value}`")),
+    }
+}
+
 /// `512`, `64 KiB`, `1MB`.
 fn size(value: &str) -> Result<u64, String> {
     let bad = || format!("max_body is a size such as `1 MiB` or `64 KB`, not `{value}`");
@@ -215,7 +242,7 @@ mod tests {
         .unwrap();
         let all = policy.for_agent("cursor");
         assert_eq!(all.access, Access::Anywhere);
-        assert_eq!(all.approve, vec![ApproveWhen::Writes, ApproveWhen::Prod]);
+        assert_eq!(all.approve, vec![ApproveWhen::Writes, ApproveWhen::Prod, ApproveWhen::Bench]);
         assert_eq!(all.rate, Some(Rate { count: 60, per_secs: 60 }));
         let claude = policy.for_agent("claude-code");
         assert_eq!(claude.agent, "Claude-Code");
@@ -223,6 +250,16 @@ mod tests {
         assert!(claude.approve.is_empty());
         assert_eq!(claude.rate, all.rate);
         assert_eq!(claude.max_body, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn bench_caps_are_counts() {
+        let policy = Policy::parse("[*]\nmax_bench = 500\nmax_concurrency = 4\n[ci]\nmax_bench = none\n").unwrap();
+        assert_eq!((policy.for_agent("x").max_bench, policy.for_agent("x").max_concurrency), (Some(500), Some(4)));
+        assert_eq!((policy.for_agent("ci").max_bench, policy.for_agent("ci").max_concurrency), (None, Some(4)));
+        for bad in ["[*]\nmax_bench = 0\n", "[*]\nmax_concurrency = lots\n"] {
+            assert!(Policy::parse(bad).unwrap_err().starts_with("line 2"), "{bad:?}");
+        }
     }
 
     #[test]

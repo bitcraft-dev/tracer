@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
-    ClientKind, Command, Ended, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
+    BenchPlan, ClientKind, Command, Ended, BENCH_BUCKETS_MS, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
     StatusClass,
 };
 
@@ -346,6 +346,82 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                     _ => {}
                 }
             }
+        }
+        "run_bench" => {
+            let path = str_arg(args, "path").ok_or("`path` is required")?;
+            let wanted = path.trim().trim_start_matches("requests/").trim_end_matches(".http");
+            let ReplyBody::Requests { requests, .. } = call(core, Command::ListRequests)? else {
+                return Err(unexpected());
+            };
+            let found = requests
+                .into_iter()
+                .find(|r| r.path == wanted)
+                .ok_or_else(|| format!("there is no saved request `{wanted}`; list_requests lists them"))?;
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            let total = args.get("total").and_then(Value::as_u64);
+            let duration_secs = args.get("duration_seconds").and_then(Value::as_u64);
+            let plan = BenchPlan {
+                total: if total.is_none() && duration_secs.is_none() { Some(100) } else { total },
+                concurrency: args.get("concurrency").and_then(Value::as_u64).unwrap_or(10) as u32,
+                duration_secs,
+                rate: args.get("rate").and_then(Value::as_f64),
+            };
+            let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT * 2).min(WAIT_MAX);
+            while core.events.try_recv().is_ok() {}
+            let ReplyBody::BenchStarted { bench_id } = call(core, Command::RunBench { request: found.request, env, plan })? else {
+                return Err(unexpected());
+            };
+            let deadline = Instant::now() + Duration::from_secs(wait);
+            let mut last = None;
+            // Its first request, and why it waits for a person, if it does.
+            let mut first = None;
+            let mut asked: Option<String> = None;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let event = match core.events.recv_timeout(left) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(reason) = asked {
+                            return Ok(json!({
+                                "bench_id": bench_id,
+                                "state": "awaiting_approval",
+                                "note": format!("waiting for a person to allow it ({reason}); nothing has been sent yet. It runs once allowed; stop_bench withdraws it"),
+                            }));
+                        }
+                        return Ok(json!({
+                            "bench_id": bench_id,
+                            "state": "running",
+                            "so_far": last,
+                            "note": format!("not finished after {wait} s; it carries on, and stop_bench stops it"),
+                        }));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Err("the core hung up".into()),
+                };
+                match event.kind {
+                    EventKind::RequestStarted { request_id, bench: Some(b), .. } if b == bench_id => first = Some(request_id),
+                    EventKind::ApprovalAsked { request_id, reason } if Some(request_id) == first => asked = Some(reason),
+                    EventKind::ApprovalGiven { request_id, .. } if Some(request_id) == first => asked = None,
+                    EventKind::BenchProgress { bench_id: b, stats } if b == bench_id => last = Some(stats),
+                    EventKind::BenchFinished { bench_id: b, stats, stopped } if b == bench_id => {
+                        let mut out = json!({
+                            "bench_id": bench_id,
+                            "state": if stopped.is_some() { "stopped" } else { "finished" },
+                            "stats": stats,
+                            "histogram_bounds_ms": BENCH_BUCKETS_MS,
+                        });
+                        if let Some(why) = stopped {
+                            out["stopped"] = json!(why);
+                        }
+                        return Ok(out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "stop_bench" => {
+            let bench_id = args.get("bench_id").and_then(Value::as_u64).ok_or("`bench_id` is required")?;
+            call(core, Command::StopBench { bench_id })?;
+            Ok(json!({ "bench_id": bench_id, "state": "stopping" }))
         }
         "read_policy" => {
             let ReplyBody::Policy { rules, error } = call(core, Command::Policy)? else {
@@ -748,6 +824,28 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "run_bench",
+            "description": "Benchmark a saved request: send it `total` times (default 100), `concurrency` at a time (default 10), or for `duration_seconds`, no faster than `rate` a second. The first is an ordinary request in the history (with its waterfall); the rest are counted. By default a person approves an agent's bench before it starts, and the policy may cap max_bench and max_concurrency (read_policy). Gives latency min/mean/p50/p95/p99/max in ms, requests a second, statuses, errors and a histogram (counts per bucket of histogram_bounds_ms, one more for slower).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A saved request's path, as list_requests gives it." },
+                    "env": env,
+                    "total": { "type": "integer" },
+                    "concurrency": { "type": "integer" },
+                    "duration_seconds": { "type": "integer" },
+                    "rate": { "type": "number", "description": "The most requests to start a second." },
+                    "wait_seconds": { "type": "integer", "description": "How long to wait for the end (default 120, at most 600)." },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "stop_bench",
+            "description": "Stop a running bench, whoever started it.",
+            "inputSchema": { "type": "object", "properties": { "bench_id": { "type": "integer" } }, "required": ["bench_id"] },
+        },
+        {
             "name": "diff_responses",
             "description": "How two past responses differ: status, headers, and the body (JSON compared as values and named by path, such as $.data[3].name; anything else line by line). Headers and keys that change on every call (Date, ETag, request ids, timestamp, …) are ignored by default, and every difference ignored is listed in `ignored`.",
             "inputSchema": {
@@ -764,7 +862,7 @@ fn tools() -> Value {
         },
         {
             "name": "read_policy",
-            "description": "What the workspace's policy lets you do: `access` (read-only, local: this machine only, or anywhere), what waits for a person's approval, how many requests you may start (`rate`: count per per_secs), and the largest request body (`max_body`, bytes).",
+            "description": "What the workspace's policy lets you do: `access` (read-only, local: this machine only, or anywhere), what waits for a person's approval, how many requests you may start (`rate`: count per per_secs), the largest request body (`max_body`, bytes), and how big a bench may be (`max_bench` requests, `max_concurrency` at a time).",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true },
         },

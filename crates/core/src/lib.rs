@@ -11,6 +11,7 @@
 //! [`Command::Hello`]: tracer_protocol::Command::Hello
 
 mod api;
+mod bench;
 mod conn;
 mod diff;
 mod envs;

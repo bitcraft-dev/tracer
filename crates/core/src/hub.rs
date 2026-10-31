@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
-    Actor, AgentRules, CheckResult, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
+    Actor, AgentRules, BenchPlan, BenchStats, CheckResult, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
     HttpResponse, SavedRequest, ServerMessage, HISTORY_LIMIT, JOURNAL_PATH, POLICY_PATH,
 };
 
@@ -34,6 +34,7 @@ struct Inner {
     next_client: u64,
     next_request: u64,
     next_flow: u64,
+    next_bench: u64,
     journal: File,
     /// Every event so far, for replay. Kept whole for now; a long-lived
     /// workspace will want this paged from the file instead.
@@ -44,6 +45,9 @@ struct Inner {
     /// early. Whoever takes a request out of here publishes how it ended, so
     /// it ends exactly once.
     running: HashMap<u64, Flight>,
+    /// Benches still running: the flag their workers check, and who stopped
+    /// it once someone has.
+    benches: HashMap<u64, Bench>,
     /// Requests waiting for a person to allow them, each with where the
     /// answer goes.
     awaiting: HashMap<u64, mpsc::Sender<(bool, Actor)>>,
@@ -70,6 +74,16 @@ struct Inner {
 struct Flight {
     cancelled: Arc<AtomicBool>,
     kind: ClientKind,
+    /// The bench it's the first request of, which stopping cancels.
+    bench: Option<u64>,
+}
+
+/// A bench running, for stopping it.
+struct Bench {
+    stop: Arc<AtomicBool>,
+    kind: ClientKind,
+    /// Why it was stopped, once it has been.
+    stopped: Option<String>,
 }
 
 #[derive(Default)]
@@ -122,6 +136,28 @@ impl Hub {
             })
             .max()
             .map_or(1, |id| id + 1);
+        let next_bench = events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::BenchStarted { bench_id, .. } => Some(bench_id),
+                _ => None,
+            })
+            .max()
+            .map_or(1, |id| id + 1);
+        // Benches a previous core never finished, with how far they got.
+        let mut open_benches: Vec<(u64, Actor, BenchStats)> = Vec::new();
+        for e in &events {
+            match &e.kind {
+                EventKind::BenchStarted { bench_id, .. } => open_benches.push((*bench_id, e.actor.clone(), BenchStats::default())),
+                EventKind::BenchProgress { bench_id, stats } => {
+                    if let Some(open) = open_benches.iter_mut().find(|(id, _, _)| id == bench_id) {
+                        open.2 = stats.clone();
+                    }
+                }
+                EventKind::BenchFinished { bench_id, .. } => open_benches.retain(|(id, _, _)| id != bench_id),
+                _ => {}
+            }
+        }
         // The kill switch outlives the core: as a person last left it.
         let agents_allowed = events
             .iter()
@@ -162,11 +198,13 @@ impl Hub {
                 next_client: 1,
                 next_request,
                 next_flow,
+                next_bench,
                 journal,
                 events,
                 clients: BTreeMap::new(),
                 subscribers: Vec::new(),
                 running: HashMap::new(),
+                benches: HashMap::new(),
                 awaiting: HashMap::new(),
                 agents_allowed,
                 policy,
@@ -185,6 +223,10 @@ impl Hub {
             for (request_id, actor) in unfinished {
                 let error = "the core stopped before it finished".to_string();
                 publish_locked(&mut inner, actor, EventKind::RequestFailed { request_id, error });
+            }
+            for (bench_id, actor, stats) in open_benches {
+                let stopped = Some("the core stopped before it finished".to_string());
+                publish_locked(&mut inner, actor, EventKind::BenchFinished { bench_id, stats, stopped });
             }
         }
         Ok(hub)
@@ -243,13 +285,14 @@ impl Hub {
         env: Option<String>,
         rerun_of: Option<u64>,
         flow: Option<u64>,
+        bench: Option<u64>,
     ) -> (u64, Arc<AtomicBool>) {
         let mut inner = self.inner.lock().unwrap();
         let request_id = inner.next_request;
         inner.next_request += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
-        inner.running.insert(request_id, Flight { cancelled: cancelled.clone(), kind: actor.kind.clone() });
-        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of, flow });
+        inner.running.insert(request_id, Flight { cancelled: cancelled.clone(), kind: actor.kind.clone(), bench });
+        publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of, flow, bench });
         (request_id, cancelled)
     }
 
@@ -260,6 +303,41 @@ impl Hub {
         inner.next_flow += 1;
         publish_locked(&mut inner, actor, EventKind::FlowStarted { flow_id, path, env, steps });
         flow_id
+    }
+
+    /// Number a new bench and publish that it started. Gives its id and the
+    /// flag that says to stop.
+    pub fn start_bench(&self, actor: Actor, request: HttpRequest, env: Option<String>, plan: BenchPlan) -> (u64, Arc<AtomicBool>) {
+        let mut inner = self.inner.lock().unwrap();
+        let bench_id = inner.next_bench;
+        inner.next_bench += 1;
+        let stop = Arc::new(AtomicBool::new(false));
+        inner.benches.insert(bench_id, Bench { stop: stop.clone(), kind: actor.kind.clone(), stopped: None });
+        publish_locked(&mut inner, actor, EventKind::BenchStarted { bench_id, request, env, plan });
+        (bench_id, stop)
+    }
+
+    /// Stop bench `bench_id` on `actor`'s behalf. False when it isn't
+    /// running. Its runner publishes the end, naming who stopped it.
+    pub fn stop_bench(&self, actor: &Actor, bench_id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        stop_bench_locked(&mut inner, actor, bench_id)
+    }
+
+    /// Publish how bench `bench_id` stands, unless it was stopped meanwhile.
+    pub fn bench_progress(&self, actor: Actor, bench_id: u64, stats: BenchStats) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.benches.get(&bench_id).is_some_and(|b| b.stopped.is_none()) {
+            publish_locked(&mut inner, actor, EventKind::BenchProgress { bench_id, stats });
+        }
+    }
+
+    /// Publish how bench `bench_id` ended: `stopped` says why it ended early,
+    /// unless someone stopped it, which says so instead.
+    pub fn end_bench(&self, actor: Actor, bench_id: u64, stats: BenchStats, stopped: Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        let by = inner.benches.remove(&bench_id).and_then(|b| b.stopped);
+        publish_locked(&mut inner, actor, EventKind::BenchFinished { bench_id, stats, stopped: by.or(stopped) });
     }
 
     /// Request `request_id` as it was written, and the environment it was
@@ -387,6 +465,12 @@ impl Hub {
             for request_id in theirs {
                 cancel_locked(&mut inner, actor.clone(), request_id);
             }
+            let mut benches: Vec<u64> =
+                inner.benches.iter().filter(|(_, b)| b.kind == ClientKind::Agent).map(|(id, _)| *id).collect();
+            benches.sort();
+            for bench_id in benches {
+                stop_bench_locked(&mut inner, &actor, bench_id);
+            }
         }
         Ok(())
     }
@@ -404,7 +488,7 @@ impl Hub {
             return Some(why);
         }
         match command {
-            Command::Send { .. } | Command::Rerun { .. } => take_rate_locked(&mut inner, actor, &rules).err(),
+            Command::Send { .. } | Command::Rerun { .. } | Command::RunBench { .. } => take_rate_locked(&mut inner, actor, &rules).err(),
             _ => None,
         }
     }
@@ -631,6 +715,22 @@ fn take_rate_locked(inner: &mut Inner, actor: &Actor, rules: &AgentRules) -> Res
     Ok(())
 }
 
+fn stop_bench_locked(inner: &mut Inner, actor: &Actor, bench_id: u64) -> bool {
+    match inner.benches.get_mut(&bench_id) {
+        Some(bench) if bench.stopped.is_none() => {
+            bench.stop.store(true, Ordering::SeqCst);
+            bench.stopped = Some(format!("stopped by {}", actor.name));
+            // Its first request, if it's still out or waiting for a person.
+            let first: Vec<u64> = inner.running.iter().filter(|(_, f)| f.bench == Some(bench_id)).map(|(id, _)| *id).collect();
+            for request_id in first {
+                cancel_locked(inner, actor.clone(), request_id);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn cancel_locked(inner: &mut Inner, actor: Actor, request_id: u64) -> bool {
     let Some(flight) = inner.running.remove(&request_id) else { return false };
     flight.cancelled.store(true, Ordering::SeqCst);
@@ -645,7 +745,7 @@ fn entries(events: &[Event]) -> Vec<HistoryEntry> {
     let mut entries: Vec<HistoryEntry> = Vec::new();
     for e in events {
         let (request_id, ended) = match &e.kind {
-            EventKind::RequestStarted { request_id, request, env, rerun_of, flow } => {
+            EventKind::RequestStarted { request_id, request, env, rerun_of, flow, bench } => {
                 entries.push(HistoryEntry {
                     request_id: *request_id,
                     at_ms: e.at_ms,
@@ -654,6 +754,7 @@ fn entries(events: &[Event]) -> Vec<HistoryEntry> {
                     env: env.clone(),
                     rerun_of: *rerun_of,
                     flow: *flow,
+                    bench: *bench,
                     ended: Ended::Running,
                     checks: None,
                 });

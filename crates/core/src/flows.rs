@@ -63,9 +63,9 @@ fn run(hub: &Hub, actor: &Actor, flow_id: u64, steps: Vec<SavedRequest>, env: Op
             continue;
         }
         let request = saved.request;
-        let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), None, Some(flow_id));
+        let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), None, Some(flow_id), None);
         step.request_id = Some(request_id);
-        match run_one(hub, actor, request_id, &cancelled, &request, env.as_deref(), &vars) {
+        match run_one(hub, actor, request_id, &cancelled, &request, env.as_deref(), &vars, None) {
             Ran::Stopped(why) => (step.outcome, step.note) = (StepOutcome::Failed, why),
             Ran::Ended(Err(error), _) => (step.outcome, step.note) = (StepOutcome::Failed, error),
             Ran::Ended(Ok(response), checks) => {

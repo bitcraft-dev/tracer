@@ -27,14 +27,14 @@
 
 mod mcp;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    Discovery, FlowStep, SavedRequest, StatusClass, StepOutcome, Timing, DISCOVERY_PATH,
+    BenchPlan, BenchStats, Discovery, FlowStep, BENCH_BUCKETS_MS, SavedRequest, StatusClass, StepOutcome, Timing, DISCOVERY_PATH,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -61,6 +61,13 @@ usage:
                                       step's `# @capture name = $.path` filling
                                       {{name}} after it; stops at a failed step
                                       unless --keep-going; exits 1 if it fails
+  tracer bench <PATH> [-n <N>] [-c <C>] [-t <DURATION>] [--rate <R>] [--env <NAME>]
+             [--report json]          send a saved request N times (default 100),
+                                      C at a time (default 10), or for DURATION
+                                      (30s, 2m), no faster than R a second; live
+                                      p50/p95/p99, a histogram, statuses, errors;
+                                      exits 1 if any went wrong
+  tracer bench stop <ID>              stop a running bench, whoever started it
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -107,6 +114,7 @@ fn main() -> ExitCode {
         Some("ls") => ls(workspace),
         Some("save") => save(workspace, args[1..].to_vec()),
         Some("run") => run(workspace, args[1..].to_vec()),
+        Some("bench") => bench(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
@@ -225,6 +233,7 @@ fn describe_rules(r: &AgentRules) -> String {
                     ApproveWhen::Writes => "writes",
                     ApproveWhen::Prod => "prod",
                     ApproveWhen::All => "all",
+                    ApproveWhen::Bench => "bench",
                 })
                 .collect();
             format!("approve {}", names.join(", "))
@@ -236,6 +245,12 @@ fn describe_rules(r: &AgentRules) -> String {
     }
     if let Some(max) = r.max_body {
         parts.push(format!("bodies up to {max} B"));
+    }
+    if let Some(max) = r.max_bench {
+        parts.push(format!("benches up to {max} requests"));
+    }
+    if let Some(max) = r.max_concurrency {
+        parts.push(format!("{max} at a time"));
     }
     format!("[{}] {}", r.agent, parts.join(" · "))
 }
@@ -608,6 +623,157 @@ fn report_json(
     serde_json::to_string_pretty(&report).unwrap_or_default()
 }
 
+fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    if args.first().map(String::as_str) == Some("stop") {
+        let id: u64 = args.get(1).and_then(|a| a.trim_start_matches('#').parse().ok()).ok_or_else(|| io::Error::other(USAGE))?;
+        let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+        client.call(Command::StopBench { bench_id: id })?.map_err(io::Error::other)?;
+        eprintln!("bench {id} stopping");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let number = |flag: &str, value: Option<String>| -> io::Result<Option<f64>> {
+        value.map(|v| v.parse::<f64>().map_err(|_| io::Error::other(format!("{flag} takes a number, not `{v}`")))).transpose()
+    };
+    let env = take_value(&mut args, "--env");
+    let report = take_value(&mut args, "--report");
+    if report.as_deref().is_some_and(|r| r != "json") {
+        return Err(io::Error::other("--report takes json"));
+    }
+    let total = number("-n", take_value(&mut args, "-n"))?.map(|n| n as u64);
+    let concurrency = number("-c", take_value(&mut args, "-c"))?.map_or(10, |c| c as u32);
+    let rate = number("--rate", take_value(&mut args, "--rate"))?;
+    let duration_secs = take_value(&mut args, "-t").map(|t| seconds(&t)).transpose()?;
+    let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let wanted = path.trim().replace('\\', "/");
+    let wanted = wanted.strip_prefix("requests/").unwrap_or(&wanted);
+    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted);
+    let (requests, _) = saved(&workspace, "tracer bench")?;
+    let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
+        return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
+    };
+    // Neither a count nor a time: a hundred.
+    let total = if total.is_none() && duration_secs.is_none() { Some(100) } else { total };
+    let plan = BenchPlan { total, concurrency, duration_secs, rate };
+
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer bench")?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    let bench_id = match client.call(Command::RunBench { request: found.request, env: env.clone(), plan: plan.clone() })? {
+        Ok(ReplyBody::BenchStarted { bench_id }) => bench_id,
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    eprintln!("bench {bench_id}: {wanted}, {}; `tracer bench stop {bench_id}` stops it", plan.describe());
+    let live = io::stderr().is_terminal();
+    loop {
+        let event = client.next_event()?;
+        match event.kind {
+            EventKind::BenchProgress { bench_id: id, stats } if id == bench_id && live => {
+                eprint!("\r\x1b[2K  {}", bench_line(&stats));
+            }
+            EventKind::ApprovalAsked { reason, request_id } => {
+                eprintln!("waits for a person: {reason}; `tracer approve {request_id}`");
+            }
+            EventKind::BenchFinished { bench_id: id, stats, stopped } if id == bench_id => {
+                if live {
+                    eprint!("\r\x1b[2K");
+                }
+                eprint!("{}", bench_summary(&stats));
+                if let Some(why) = &stopped {
+                    eprintln!("stopped early: {why}");
+                }
+                if report.is_some() {
+                    let json = serde_json::json!({
+                        "bench_id": bench_id,
+                        "path": wanted,
+                        "env": env,
+                        "plan": plan,
+                        "stopped": stopped,
+                        "stats": stats,
+                        "histogram_bounds_ms": BENCH_BUCKETS_MS,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                }
+                let ok = stopped.is_none() && stats.bad() == 0;
+                return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `30s`, `2m`, `1h`, or a bare number of seconds.
+fn seconds(text: &str) -> io::Result<u64> {
+    let t = text.trim().to_ascii_lowercase();
+    let (n, unit) = match t.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => (&t[..at], &t[at..]),
+        None => (t.as_str(), "s"),
+    };
+    let per = match unit {
+        "s" => 1,
+        "m" | "min" => 60,
+        "h" => 3600,
+        _ => 0,
+    };
+    match n.parse::<u64>() {
+        Ok(n) if per > 0 => Ok(n * per),
+        _ => Err(io::Error::other(format!("-t takes a duration such as 30s or 2m, not `{text}`"))),
+    }
+}
+
+/// `412 done · 98.2/s · p50 41 · p95 80 · p99 120 ms · 0 wrong`
+fn bench_line(s: &BenchStats) -> String {
+    format!(
+        "{} done · {:.1}/s · p50 {:.0} · p95 {:.0} · p99 {:.0} ms · {} wrong",
+        s.done,
+        s.per_sec,
+        s.p50_ms,
+        s.p95_ms,
+        s.p99_ms,
+        s.bad()
+    )
+}
+
+/// The whole of a finished bench, for a person at a terminal.
+fn bench_summary(s: &BenchStats) -> String {
+    let mut out = format!(
+        "{} requests in {:.1} s, {:.1} a second\n\n  min {:.1}  mean {:.1}  p50 {:.1}  p95 {:.1}  p99 {:.1}  max {:.1}  (ms)\n\n",
+        s.done,
+        s.elapsed_ms / 1000.0,
+        s.per_sec,
+        s.min_ms,
+        s.mean_ms,
+        s.p50_ms,
+        s.p95_ms,
+        s.p99_ms,
+        s.max_ms
+    );
+    // Only the buckets from the first to the last that hold any.
+    let most = s.histogram.iter().copied().max().unwrap_or(0).max(1);
+    let used: Vec<usize> = (0..s.histogram.len()).filter(|&i| s.histogram[i] > 0).collect();
+    if let (Some(&first), Some(&last)) = (used.first(), used.last()) {
+        for i in first..=last {
+            let label = match BENCH_BUCKETS_MS.get(i) {
+                Some(bound) => format!("≤ {bound} ms"),
+                None => format!("> {} ms", BENCH_BUCKETS_MS[BENCH_BUCKETS_MS.len() - 1]),
+            };
+            let bar = "█".repeat((s.histogram[i] * 40).div_ceil(most) as usize);
+            out.push_str(&format!("  {label:>11}  {bar} {}\n", s.histogram[i]));
+        }
+        out.push('\n');
+    }
+    let statuses: Vec<String> = s.statuses.iter().map(|(code, n)| format!("{code} × {n}")).collect();
+    if !statuses.is_empty() {
+        out.push_str(&format!("  status  {}\n", statuses.join(", ")));
+    }
+    if s.failed_checks > 0 {
+        out.push_str(&format!("  {} answered but failed a check\n", s.failed_checks));
+    }
+    for (error, n) in &s.errors {
+        out.push_str(&format!("  no answer × {n}: {error}\n"));
+    }
+    out
+}
+
 fn env_list(workspace: PathBuf) -> io::Result<ExitCode> {
     let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer env")?;
     let ReplyBody::Environments { environments, skipped, .. } = client.call(Command::ListEnvironments)?.map_err(io::Error::other)? else {
@@ -793,11 +959,12 @@ fn describe(event: &Event) -> String {
     let what = match &event.kind {
         EventKind::ClientJoined { client } => format!("joined as client {client}"),
         EventKind::ClientLeft { client } => format!("left (client {client})"),
-        EventKind::RequestStarted { request_id, request, env, rerun_of, flow } => {
+        EventKind::RequestStarted { request_id, request, env, rerun_of, flow, bench } => {
             let with = env.as_ref().map(|e| format!(" (env {e})")).unwrap_or_default();
             let again = rerun_of.map(|id| format!(", re-run of #{id}")).unwrap_or_default();
             let step = flow.map(|id| format!(", flow {id}")).unwrap_or_default();
-            format!("#{request_id} {} {}{with}{again}{step}", request.method, request.url)
+            let first = bench.map(|id| format!(", first of bench {id}")).unwrap_or_default();
+            format!("#{request_id} {} {}{with}{again}{step}{first}", request.method, request.url)
         }
         EventKind::RequestFinished { request_id, response } => format!(
             "#{request_id} → {} in {:.0} ms ({} B)",
@@ -834,6 +1001,14 @@ fn describe(event: &Event) -> String {
                 format!("flow {flow_id} failed: {failed} of {} steps", steps.len())
             }
         }
+        EventKind::BenchStarted { bench_id, request, plan, .. } => {
+            format!("bench {bench_id} started: {} {}, {}", request.method, request.url, plan.describe())
+        }
+        EventKind::BenchProgress { bench_id, stats } => format!("bench {bench_id}: {}", bench_line(stats)),
+        EventKind::BenchFinished { bench_id, stats, stopped } => match stopped {
+            Some(why) => format!("bench {bench_id} {why}: {}", bench_line(stats)),
+            None => format!("bench {bench_id} finished: {}", bench_line(stats)),
+        },
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
         EventKind::PolicyChanged { rules, error: Some(error) } => {
             format!("agents.policy not taken, {} rules stand: {error}", rules.len())

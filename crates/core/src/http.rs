@@ -25,32 +25,43 @@ use ureq::unversioned::transport::{
 };
 use ureq::Agent;
 
-/// An error status is an answer, not a failure: only a request that got no
-/// answer at all is an `Err`. Without `redirects`, a redirect is the answer.
-pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
+fn config(redirects: bool) -> Config {
     let mut config = Agent::config_builder().http_status_as_error(false);
     if !redirects {
         config = config.max_redirects(0);
     }
-    let marks = Arc::new(Mutex::new(Marks::default()));
-    let connector = ()
-        .chain(ConnectProxyConnector::default())
-        .chain(TcpConnector::default())
-        .chain(Mark { marks: marks.clone(), phase: Phase::Connected })
-        .chain(RustlsConnector::default())
-        .chain(Mark { marks: marks.clone(), phase: Phase::Secured });
-    let resolver = TimedResolver { inner: DefaultResolver::default(), marks: marks.clone() };
-    let agent = Agent::with_parts(config.build(), connector, resolver);
+    config.build()
+}
+
+/// An agent that keeps its connections, for a bench's worker: its requests
+/// after the first reuse one, as a client under load would.
+pub fn keep_alive(redirects: bool) -> Agent {
+    Agent::new_with_config(config(redirects))
+}
+
+/// Send `req` with `agent`, reading the whole body. Gives the response with
+/// only TTFB and the total timed, the phases being the connection's, which
+/// a kept connection doesn't repeat.
+pub fn execute_with(agent: &Agent, req: &HttpRequest, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
+    let request = build(req)?;
+    let started = Instant::now();
+    let mut res = agent.run(request).map_err(|e| e.to_string())?;
+    let ttfb = started.elapsed();
+    let bytes = read_body(&mut res, cancelled)?;
+    let timing = Marks::default().timing(ttfb.as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0);
+    Ok(response(&res, bytes, timing))
+}
+
+fn build(req: &HttpRequest) -> Result<ureq::http::Request<Vec<u8>>, String> {
     let mut builder = ureq::http::Request::builder().method(req.method.as_str()).uri(req.url.as_str());
     for (name, value) in &req.headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
     let body = req.body.clone().unwrap_or_default().into_bytes();
-    let request = builder.body(body).map_err(|e| e.to_string())?;
+    builder.body(body).map_err(|e| e.to_string())
+}
 
-    let started = Instant::now();
-    let mut res = agent.run(request).map_err(|e| e.to_string())?;
-    let ttfb = started.elapsed();
+fn read_body(res: &mut ureq::http::Response<ureq::Body>, cancelled: &AtomicBool) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let mut reader = res.body_mut().as_reader();
     let mut chunk = vec![0; 64 * 1024];
@@ -59,14 +70,14 @@ pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Re
             return Err("cancelled".into());
         }
         match reader.read(&mut chunk).map_err(|e| e.to_string())? {
-            0 => break,
+            0 => return Ok(bytes),
             n => bytes.extend_from_slice(&chunk[..n]),
         }
     }
-    let total = started.elapsed();
-    let timing = marks.lock().unwrap().timing(ttfb.as_secs_f64() * 1000.0, total.as_secs_f64() * 1000.0);
+}
 
-    Ok(HttpResponse {
+fn response(res: &ureq::http::Response<ureq::Body>, bytes: Vec<u8>, timing: Timing) -> HttpResponse {
+    HttpResponse {
         status: res.status().as_u16(),
         headers: res
             .headers()
@@ -76,7 +87,30 @@ pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Re
         size: bytes.len() as u64,
         body: String::from_utf8_lossy(&bytes).into_owned(),
         timing,
-    })
+    }
+}
+
+/// An error status is an answer, not a failure: only a request that got no
+/// answer at all is an `Err`. Without `redirects`, a redirect is the answer.
+pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
+    let marks = Arc::new(Mutex::new(Marks::default()));
+    let connector = ()
+        .chain(ConnectProxyConnector::default())
+        .chain(TcpConnector::default())
+        .chain(Mark { marks: marks.clone(), phase: Phase::Connected })
+        .chain(RustlsConnector::default())
+        .chain(Mark { marks: marks.clone(), phase: Phase::Secured });
+    let resolver = TimedResolver { inner: DefaultResolver::default(), marks: marks.clone() };
+    let agent = Agent::with_parts(config(redirects), connector, resolver);
+    let request = build(req)?;
+
+    let started = Instant::now();
+    let mut res = agent.run(request).map_err(|e| e.to_string())?;
+    let ttfb = started.elapsed();
+    let bytes = read_body(&mut res, cancelled)?;
+    let total = started.elapsed();
+    let timing = marks.lock().unwrap().timing(ttfb.as_secs_f64() * 1000.0, total.as_secs_f64() * 1000.0);
+    Ok(response(&res, bytes, timing))
 }
 
 /// When each phase of the first connection ended.

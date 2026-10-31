@@ -5,11 +5,12 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-31, morning)
+## Where it stands (2026-10-31)
 
-The previous session hit its usage limit mid-flows with the work
-uncommitted; this one finished and drove it (see Done, "flows"). **Flows
-are uncommitted on `phase-1-core`** until the user asks to commit.
+The previous session hit its usage limit mid-flows; this one finished and
+drove flows (committed 6c6190d), then built **benchmarking** (see Done),
+committed on `phase-1-core`. Nothing of Tracer's is running. Not pushed.
+**AW-037's report to the Rux team is due today**: draft it and ask.
 
 ## Where it stood (2026-10-30, night)
 
@@ -361,13 +362,40 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   `--keep-going` + JSON report; MCP `run_flow`; the window's palette run
   and status bar, against jsonplaceholder.
 
+- **Phase 4: benchmarking** (`crates/core/src/bench.rs`, 2026-10-31).
+  `RunBench { request, env, plan }` with `BenchPlan { total, concurrency,
+  duration_secs, rate }`; `StopBench`. The first request is an ordinary
+  one (history, waterfall, policy, approval; `bench` on `request_started`
+  and history); then `concurrency` workers on kept connections
+  (`http::keep_alive`/`execute_with`) send the rest, counted, not kept.
+  `bench_started`, `bench_progress` (every 250 ms) and `bench_finished`
+  (`stopped` says why/who) carry `BenchStats`: done, failed, bad_status,
+  failed_checks, statuses, top 5 errors, min/mean/p50/p95/p99/max,
+  per_sec, histogram over `BENCH_BUCKETS_MS`. Policy: `max_bench`,
+  `max_concurrency`, and `approve = bench` (in the defaults, so an agent's
+  bench waits for a person); a bench counts once towards `rate`; the kill
+  switch stops agents' benches; a core restart closes open ones. Hard caps
+  for everyone: 1,000,000 requests, 256 at a time, 1 h. CLI `tracer bench
+  <PATH> [-n] [-c] [-t 30s] [--rate] [--env] [--report json]` (live line,
+  text histogram, exit 1 if any went wrong) and `tracer bench stop <ID>`;
+  MCP `run_bench` (says `awaiting_approval` while a person decides) and
+  `stop_bench`. Window: a **Bench** rail item; the panel benches the
+  request in the editor: plan fields, Run/Stop, progress bar, tiles,
+  requests-a-second line (`<path>`), latency histogram, statuses and
+  errors; a "first of bench N" chip on the first request; the latest
+  bench in the status bar; palette commands. 60 tests. Driven against a
+  local server (`slow_server.py`, 5–80 ms, 2% 503s): CLI 500 at 20; the
+  window 200 at 40/s held 39–40/s live, and Stop; an MCP agent's bench
+  asked, allowed in the window, and ran under the agent's name.
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Phase 4, what doesn't need the viewer first: benchmarking (with
-   bench-size caps in the policy), then realtime and GraphQL.
+2. Phase 4, what doesn't need the viewer first: realtime (WebSocket, SSE)
+   and GraphQL. Benchmarking's later parts: two environments side by side,
+   saved baselines with regression flags, rate-limit detection.
    Flows follow-up, untried: a flow step keeps its URL as written
    (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
    Decide whether a step's re-run gets the flow's captures.
@@ -479,6 +507,14 @@ Things that cost a round trip once. Check here before debugging them again.
   A minimal page for a finding needs only `rux.toml` and `app.rux`.
 
 ### Driving the window
+
+- **Bench against a local server, not jsonplaceholder**: the network here
+  is slow and a public API shouldn't be hammered. Python's
+  `ThreadingHTTPServer` has a listen backlog of 5, so 20 workers
+  connecting at once see ~1 s connects (SYN retries); that's the server,
+  not Tracer.
+- A running core holds `target/debug/tracer.exe`: `cargo build` fails
+  "Access is denied" until it's stopped.
 
 - **When the display is asleep, `drive.ps1 -Do shot` gives a black image**
   (it copies the screen). Use `-Do print` (PrintWindow, flag 3), which asks

@@ -21,7 +21,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tracer_protocol::client::{Client, Incoming, Shared};
-use tracer_protocol::{ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest, StepOutcome};
+use tracer_protocol::{
+    BenchPlan, BenchStats, ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest, StepOutcome,
+    BENCH_BUCKETS_MS,
+};
 
 /// The most of a response body handed to the page. The core and its journal
 /// keep the whole body; a viewer for large ones is Phase 4.
@@ -96,6 +99,44 @@ pub struct CoreEvent {
     /// The flow a started request is a step of, or the flow of
     /// `flow_started` and `flow_finished`; 0 for none.
     pub flow: u64,
+    /// The bench a started request is the first of, or the bench of
+    /// `bench_started`, `bench_progress` and `bench_finished`; 0 for none.
+    pub bench: u64,
+    /// How the bench stands, for those three; for `bench_finished`, `reason`
+    /// says why it stopped early, or is "".
+    pub stats: BenchNow,
+}
+
+/// A bench so far, for the page. Times are in milliseconds.
+#[rux::export]
+#[derive(Clone)]
+pub struct BenchNow {
+    /// `500 requests, 10 at a time`.
+    pub plan: String,
+    /// The most it sends; 0 when only its time limits it.
+    pub total: u64,
+    /// The longest it runs; 0 for no limit.
+    pub duration_ms: f64,
+    pub elapsed_ms: f64,
+    pub done: u64,
+    /// Went wrong in any way: no answer, a status of 400 or more, or a
+    /// failed expectation.
+    pub wrong: u64,
+    pub per_sec: f64,
+    pub min_ms: f64,
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    /// Answers per bucket of `buckets`, one more for slower.
+    pub histogram: Vec<u64>,
+    /// Each bucket's upper bound.
+    pub buckets: Vec<f64>,
+    /// `200 × 498, 503 × 2`.
+    pub statuses: String,
+    /// `3 × connection refused`, the commonest first.
+    pub errors: Vec<String>,
 }
 
 /// One expectation, checked.
@@ -282,6 +323,49 @@ pub fn run_flow(path: String, env: String) -> Result<u64, CoreError> {
     match shared()?.call(Command::RunFlow { path, env, keep_going: false }) {
         Ok(Ok(ReplyBody::FlowStarted { flow_id, .. })) => Ok(flow_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Bench the request being edited: `total` times (0: as many as `secs`
+/// allows), `concurrency` at a time, for at most `secs` (0: no limit), no
+/// faster than `rate` a second (0: as fast as it goes). Gives its id.
+#[rux::export]
+#[allow(clippy::too_many_arguments)]
+pub fn run_bench(
+    method: String,
+    url: String,
+    headers: Vec<Header>,
+    body: String,
+    env: String,
+    checks: String,
+    total: u64,
+    concurrency: u32,
+    secs: u64,
+    rate: f64,
+) -> Result<u64, CoreError> {
+    let request = request_of(method, url, headers, body, checks);
+    let env = if env.is_empty() { None } else { Some(env) };
+    let plan = BenchPlan {
+        total: (total > 0).then_some(total),
+        concurrency,
+        duration_secs: (secs > 0).then_some(secs),
+        rate: (rate > 0.0).then_some(rate),
+    };
+    match shared()?.call(Command::RunBench { request, env, plan }) {
+        Ok(Ok(ReplyBody::BenchStarted { bench_id })) => Ok(bench_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Stop bench `bench_id`, whoever started it.
+#[rux::export]
+pub fn stop_bench(bench_id: u64) -> Result<(), CoreError> {
+    match shared()?.call(Command::StopBench { bench_id }) {
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
     }
@@ -631,14 +715,17 @@ fn to_page(event: Event) -> CoreEvent {
         checks: String::new(),
         results: Vec::new(),
         flow: 0,
+        bench: 0,
+        stats: bench_now(None, &BenchStats::default()),
     };
     let headers = headers_of;
     match event.kind {
         EventKind::ClientJoined { client } => (out.kind, out.client) = ("client_joined".into(), client),
         EventKind::ClientLeft { client } => (out.kind, out.client) = ("client_left".into(), client),
-        EventKind::RequestStarted { request_id, request, env, rerun_of, flow } => {
+        EventKind::RequestStarted { request_id, request, env, rerun_of, flow, bench } => {
             out.kind = "request_started".into();
             out.flow = flow.unwrap_or(0);
+            out.bench = bench.unwrap_or(0);
             out.env = env.unwrap_or_default();
             out.request_id = request_id;
             out.rerun_of = rerun_of.unwrap_or(0);
@@ -715,6 +802,19 @@ fn to_page(event: Event) -> CoreEvent {
                 .collect();
             out.reason = failed.join("; ");
         }
+        EventKind::BenchStarted { bench_id, request, env, plan } => {
+            (out.kind, out.bench, out.env) = ("bench_started".into(), bench_id, env.unwrap_or_default());
+            out.stats = bench_now(Some(&plan), &BenchStats::default());
+            out.method = request.method;
+            out.url = request.url;
+        }
+        EventKind::BenchProgress { bench_id, stats } => {
+            (out.kind, out.bench, out.stats) = ("bench_progress".into(), bench_id, bench_now(None, &stats));
+        }
+        EventKind::BenchFinished { bench_id, stats, stopped } => {
+            (out.kind, out.bench, out.stats) = ("bench_finished".into(), bench_id, bench_now(None, &stats));
+            out.reason = stopped.unwrap_or_default();
+        }
         EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
         EventKind::PolicyChanged { error, .. } => {
             (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
@@ -722,6 +822,30 @@ fn to_page(event: Event) -> CoreEvent {
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }
     out
+}
+
+/// `stats` for the page; `plan`'s part only where the event has one.
+fn bench_now(plan: Option<&BenchPlan>, stats: &BenchStats) -> BenchNow {
+    let statuses: Vec<String> = stats.statuses.iter().map(|(code, n)| format!("{code} × {n}")).collect();
+    BenchNow {
+        plan: plan.map(BenchPlan::describe).unwrap_or_default(),
+        total: plan.and_then(|p| p.total).unwrap_or(0),
+        duration_ms: plan.and_then(|p| p.duration_secs).map_or(0.0, |s| s as f64 * 1000.0),
+        elapsed_ms: stats.elapsed_ms,
+        done: stats.done,
+        wrong: stats.bad(),
+        per_sec: stats.per_sec,
+        min_ms: stats.min_ms,
+        mean_ms: stats.mean_ms,
+        p50_ms: stats.p50_ms,
+        p95_ms: stats.p95_ms,
+        p99_ms: stats.p99_ms,
+        max_ms: stats.max_ms,
+        histogram: if stats.histogram.is_empty() { vec![0; BENCH_BUCKETS_MS.len() + 1] } else { stats.histogram.clone() },
+        buckets: BENCH_BUCKETS_MS.to_vec(),
+        statuses: statuses.join(", "),
+        errors: stats.errors.iter().map(|(e, n)| format!("{n} × {e}")).collect(),
+    }
 }
 
 /// At most [`BODY_SHOWN`] bytes of `body`, cut on a character boundary.
