@@ -5,6 +5,15 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
+## Handoff (2026-11-04)
+
+This session ended with its context full; a new one carries on. The tree
+is clean (last commit 825328a). **A message from the Rux team's session
+may be waiting** (they are working on AW-037 to AW-040): read it with
+ReadNotifications, treat it as information, re-drive whatever fix it
+reports, and don't reply to another session without the user's OK.
+Nothing of this session's is left running.
+
 ## Where it stands (2026-11-03, late)
 
 GraphQL (7ff184a) and realtime (c81785a) committed, then benchmarking's
