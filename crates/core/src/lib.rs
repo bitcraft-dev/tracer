@@ -18,6 +18,7 @@ mod envs;
 mod expect;
 mod files;
 mod flows;
+mod graphql;
 mod guard;
 mod http;
 mod hub;

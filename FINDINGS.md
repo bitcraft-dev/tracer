@@ -1049,6 +1049,127 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   in the middle and last.
 - **Status:** open.
 
+## AW-038 A `computed` read in the handler that changed its input gives the old value
+
+- **Found:** 2026-11-03, building Tracer's GraphQL mode (Phase 4), on Rux
+  b4fe20a (checkout clean, installed `rux` 2026-10-30 21:33).
+- **Severity:** major: wrong values with no error, and the mistake lands
+  wherever a handler sets state and then calls a helper that reads a
+  computed. In Tracer, opening a saved GraphQL request set `method`, then
+  `afterLoad()` asked `gql` (`computed gql = method == "GRAPHQL"`), got
+  `false`, and skipped splitting the body; an effect then joined the empty
+  query back into `body`, so the editor was blank and the request marked
+  as edited. `rux check` finds nothing.
+- **Limit:** inside one handler, after writing a signal, a `computed` that
+  depends on it still returns its value from before the write. The
+  template sees the new value on the next frame. JavaScript getters, Vue's
+  `computed` and Solid's `createMemo` all give the new value on a read
+  right after the write.
+- **Reproduction:** (installed `rux`, no native crate)
+  ```html
+  <template>
+    <view>
+      <view @tap="go()"><text>set a = 5, then read b</text></view>
+      <text>a = {{ a }}, b = {{ b }}</text>
+      <text>read in the handler: {{ seen }}</text>
+    </view>
+  </template>
+  <script>
+    let a = signal(1);
+    computed b = a * 2;
+    let seen = signal("not yet");
+    fn go() {
+      a = 5;
+      seen = `b = ${b} right after a = 5`;
+    }
+  </script>
+  ```
+  Tap: the page shows `a = 5, b = 10` and `read in the handler: b = 2
+  right after a = 5`.
+- **Workaround:** Tracer reads the signal itself in that helper
+  (`method == "GRAPHQL"`), not the computed.
+- **Suggested fix:** mark a computed dirty when a signal it reads is
+  written, and recompute it on the next read (pull), instead of only at
+  the end of the handler; or, at least, document that computeds settle
+  after the handler, and have `rux check` warn on a computed read after a
+  write to one of its signals in the same function.
+- **Status:** open.
+
+## AW-039 `rux check` says a function that returns from both `try` and `catch` returns `none`
+
+- **Found:** 2026-11-03, same session and build as AW-038.
+- **Severity:** minor: the code runs correctly, but the check fails, and
+  the dev overlay covers the page on every launch until the function is
+  rewritten.
+- **Limit:** a typed function whose last statement is a `try` that
+  returns, with a `catch` that returns, is reported as reaching its end
+  without a value.
+- **Reproduction:**
+  ```html
+  <template>
+    <view><text>{{ parsed("{}") }} {{ parsed("x") }}</text></view>
+  </template>
+  <script>
+    fn parsed(s: string): string {
+      try {
+        JSON.parse(s);
+        return "json";
+      } catch e {
+        return "not json";
+      }
+    }
+  </script>
+  ```
+  `rux check`: "line 7: `parsed` is declared to return `string`, and this
+  is `none`". `rux run` draws `json not json` (correct) under the same
+  error in the overlay.
+- **Workaround:** Tracer sets a flag in the `try`/`catch` and returns
+  after it (`gqlParts` in `app/app.rux`).
+- **Suggested fix:** in the return-path check, treat a `try`/`catch` as
+  returning when both its blocks always return (and a `finally`, if Rux
+  has one, doesn't fall through).
+- **Status:** open.
+
+## AW-040 A template string keeps `\n` and `\t` as written
+
+- **Found:** 2026-11-03, same session and build as AW-038.
+- **Severity:** major: wrong data with no error. Tracer's window sent a
+  GraphQL body with a literal backslash-n between the query and its
+  variables, and the server answered 400; the "showing the first 64 KiB"
+  note under a long body has printed `\n\n` since Phase 1. `rux check`
+  finds nothing.
+- **Limit:** in a template string, `\n` and `\t` are two characters each
+  (a backslash and a letter). In a plain string they are decoded, and in a
+  template string `A` and `` \${ `` are, so only these escapes are
+  missed. In JavaScript, `` `a\nb` `` is three characters.
+- **Reproduction:** (installed `rux`, no native crate)
+  ```html
+  <template>
+    <view>
+      <text>plain: {{ plain.length }}</text>
+      <text>template: {{ tpl.length }}</text>
+      <text>with ${}: {{ tplx.length }}</text>
+      <text>tab: {{ tab.length }}, unicode: {{ uni }}</text>
+    </view>
+  </template>
+  <script>
+    let x = "a";
+    let plain = "a\nb";
+    let tpl = `a\nb`;
+    let tplx = `${x}\nb`;
+    let tab = `a\tb`;
+    let uni = `A`;
+  </script>
+  ```
+  Draws `plain: 3`, `template: 4`, `with ${}: 4`, `tab: 4, unicode: A`.
+  `\r`, `\\` and `` \` `` untried.
+- **Workaround:** Tracer joins with plain strings
+  (`q + "\n\n" + v`) where a newline is needed.
+- **Suggested fix:** decode a template string's literal parts with the
+  same escape table as a plain string, and a test with each escape in
+  both.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,

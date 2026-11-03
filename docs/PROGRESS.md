@@ -5,7 +5,20 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-10-31)
+## Where it stands (2026-11-03)
+
+The 2026-10-31 session hit its usage limit after GraphQL's core, CLI, MCP
+and native exports, with the page's patch written but not run. This one
+applied it, fixed what driving it found, and drove GraphQL end to end
+(see Done). **Uncommitted** on `phase-1-core`, together with a reformat of
+`app/app.rux`'s CSS (one property per line, deeper template indent) that
+was already in the tree, likely an editor formatter. New findings:
+**AW-038, AW-039, AW-040**, all open and not yet told to the Rux team
+(draft and ask). AW-037's report, due 2026-10-31, still has to be drafted.
+A Tracer window, `rux run` and core on `~/Tracer` from 2026-11-02 22:33
+(PIDs 5816, 15456, 10280) were running and were left alone: the user's.
+
+## Where it stood (2026-10-31)
 
 The previous session hit its usage limit mid-flows; this one finished and
 drove flows (committed 6c6190d), then built **benchmarking** (see Done),
@@ -388,13 +401,43 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   window 200 at 40/s held 39–40/s live, and Stop; an MCP agent's bench
   asked, allowed in the window, and ran under the agent's name.
 
+- **Phase 4: GraphQL** (`crates/core/src/graphql.rs`, 2026-10-31 and
+  2026-11-03). Method `GRAPHQL` as JetBrains writes it: the body is the
+  query, then after a blank line its variables (a JSON object); kept so in
+  the file, journal and history, sent as the JSON POST. Every GraphQL
+  request gets the check "no GraphQL errors" (servers send errors with a
+  200), so `HttpRequest::is_checked` now decides whether a client waits
+  for `request_checked`. `Command::GraphqlSchema { request_id }` reads an
+  introspection answer (`GRAPHQL_INTROSPECTION`; its `ofType` nesting is
+  cut to fit an ~8-level depth limit, so lists of non-null items show
+  their innermost type as `?`). CLI `tracer schema <URL|PATH>` (SDL); MCP
+  `send_graphql`, `graphql_schema`. Window: a **GraphQL** rail item; the
+  method shows as a label; Query and Variables tabs (edited apart, joined
+  into `body`, so saving, history and Edit work unchanged); a Response /
+  Schema switch under the editor; Schema loads by introspection (a request
+  in History), lists types with roots first, filters by type or field
+  name; Copy as cURL gives the JSON POST; palette commands. 66 tests.
+  Driven against countries.trevorblades.com: saved request opened, sent
+  (200, check 1/1), schema (10 types, filter "lang" 4 of 10), cURL run in
+  a shell (Uganda), REST and back (body joined; back, it matches the file
+  again). Found while driving: **AW-038** (a computed read in the handler
+  that set its input is stale: the editor opened blank and edited),
+  **AW-040** (a template string keeps `\n`: the window sent a literal
+  backslash-n and got 400; the 64 KiB note had the same bug since Phase 1,
+  fixed too), and **AW-039** from `rux check` (`try`/`catch` that both
+  return "returns none").
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Phase 4, what doesn't need the viewer first: realtime (WebSocket, SSE)
-   and GraphQL. Benchmarking's later parts: two environments side by side,
+2. Commit GraphQL (ask about the CSS reformat riding along), then draft
+   the Rux team's message for AW-037 to AW-040 and ask before sending.
+3. Phase 4, what doesn't need the viewer first: realtime (WebSocket, SSE).
+   GraphQL follow-ups, untried: a schema-aware query editor (completion
+   needs the viewer's line work), subscriptions (with realtime).
+   Benchmarking's later parts: two environments side by side,
    saved baselines with regression flags, rate-limit detection.
    Flows follow-up, untried: a flow step keeps its URL as written
    (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
@@ -482,6 +525,18 @@ Things that cost a round trip once. Check here before debugging them again.
 - An app with no `native/` crate runs inside `rux.exe`, so its process is
   named `rux`, not after the app.
 
+- **A second window while another runs:** `rux run` builds, then fails
+  copying over the locked `app/dist/tracer.exe` and waits. Stop it and
+  start the build it made, `app/.rux-build/desktop/target/debug/tracer.exe`,
+  with `-WorkingDirectory app` and `TRACER_WORKSPACE`/`TRACER_BIN` set (no
+  hot reload: restart it after `.rux` edits). Drive it with `drive.ps1 -Id
+  <pid>`, which otherwise picks the first `tracer` window. A watchdog must
+  skip PIDs that were already running.
+- **Patch scripts against `app.rux` break when a formatter reindents it**
+  (2026-11-03: the template went from 2 to 4 spaces a level). The
+  fix used then: match anchor lines by trimmed text (the last one as a
+  prefix), and scale the replacement's indent by the file's indent step
+  over the anchor's.
 - **Scripted edits: many files here are CRLF.** A Python replace written
   with `\n` silently doesn't match (that cost two rounds on 2026-10-30).
   Read with `newline=''` and swap `\n` for the file's own line ending, or
@@ -585,6 +640,11 @@ Things that cost a round trip once. Check here before debugging them again.
   `${n / 1024}` silently prints `1.0742…`. Use `intDiv(a, b)` for whole
   numbers (cost a round trip on 2026-10-30: the 5xx filter matched nothing,
   and `size()` had been printing long decimals).
+- **A `computed` read in the handler that just wrote its input is the old
+  value** (AW-038). In a helper called after setting state, read the
+  signal itself.
+- **`\n` and `\t` in a template string stay as written** (AW-040). Join
+  with plain strings: `a + "\n\n" + b`.
 - In text, write `{{ x ?? "" }}` with plain quotes; `&quot;` is only for
   attributes (AW-021).
 - Annotate event handler parameters (`fn onKey(e: KeyEvent)`,

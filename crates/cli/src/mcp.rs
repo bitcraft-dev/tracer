@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
-    BenchPlan, ClientKind, Command, Ended, BENCH_BUCKETS_MS, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
+    BenchPlan, ClientKind, Command, Ended, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
     StatusClass,
 };
 
@@ -220,6 +220,47 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             };
             let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
             send_and_wait(core, Command::Send { request, env }, args)
+        }
+        "send_graphql" => {
+            let query = str_arg(args, "query").ok_or("`query` is required")?.trim().to_string();
+            let body = match args.get("variables") {
+                None | Some(Value::Null) => query,
+                Some(Value::String(text)) if text.trim().is_empty() => query,
+                Some(Value::String(text)) => {
+                    let vars: Value = serde_json::from_str(text).map_err(|e| format!("`variables` is not JSON: {e}"))?;
+                    format!("{query}\n\n{vars}")
+                }
+                Some(vars) => format!("{query}\n\n{vars}"),
+            };
+            let request = HttpRequest {
+                method: "GRAPHQL".into(),
+                url: str_arg(args, "url").ok_or("`url` is required")?.to_string(),
+                headers: headers_arg(args)?,
+                body: Some(body),
+                expect: list_arg(args, "expect"),
+                capture: Vec::new(),
+            };
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            send_and_wait(core, Command::Send { request, env }, args)
+        }
+        "graphql_schema" => {
+            let request = HttpRequest {
+                method: "GRAPHQL".into(),
+                url: str_arg(args, "url").ok_or("`url` is required")?.to_string(),
+                headers: headers_arg(args)?,
+                body: Some(GRAPHQL_INTROSPECTION.into()),
+                ..Default::default()
+            };
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            let sent = send_and_wait(core, Command::Send { request, env }, args)?;
+            let request_id = sent["request_id"].as_u64().ok_or_else(unexpected)?;
+            if sent["state"] != "done" {
+                return Ok(sent);
+            }
+            let ReplyBody::GraphqlSchema { schema } = call(core, Command::GraphqlSchema { request_id })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "request_id": request_id, "types": schema.types.len(), "sdl": schema.to_sdl() }))
         }
         "run_saved_request" => {
             let path = str_arg(args, "path").ok_or("`path` is required")?;
@@ -468,7 +509,7 @@ fn send_and_wait(core: &Core, sending: Command, args: &Value) -> Result<Value, S
         };
         match event.kind {
             EventKind::RequestStarted { request_id: id, request, env, rerun_of, .. } if id == request_id => {
-                checked = !request.expect.is_empty();
+                checked = request.is_checked();
                 state["request"] = request_json(&request);
                 if let Some(env) = env {
                     state["env"] = json!(env);
@@ -747,6 +788,32 @@ fn tools() -> Value {
                     "expect": expect,
                     "wait_seconds": wait,
                 },
+                "required": ["url"],
+            },
+        },
+        {
+            "name": "send_graphql",
+            "description": "Send a GraphQL query or mutation (sent as a JSON POST) and wait for the answer. The answer is checked for GraphQL `errors`, which servers send with a 200: see `checks`. For the agent policy a query reads and a mutation writes. Saved, it's a `GRAPHQL <url>` request whose body is the query, then its variables JSON after a blank line.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "query": { "type": "string" },
+                    "variables": { "type": "object", "description": "The query's variables, as JSON." },
+                    "headers": headers,
+                    "env": env,
+                    "expect": expect,
+                    "wait_seconds": wait,
+                },
+                "required": ["url", "query"],
+            },
+        },
+        {
+            "name": "graphql_schema",
+            "description": "A GraphQL server's schema as SDL, asked for by introspection (an ordinary request, in history).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "url": { "type": "string" }, "headers": headers, "env": env, "wait_seconds": wait },
                 "required": ["url"],
             },
         },

@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    BenchPlan, BenchStats, Discovery, FlowStep, BENCH_BUCKETS_MS, SavedRequest, StatusClass, StepOutcome, Timing, DISCOVERY_PATH,
+    BenchPlan, BenchStats, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, Timing, DISCOVERY_PATH,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -68,6 +68,12 @@ usage:
                                       p50/p95/p99, a histogram, statuses, errors;
                                       exits 1 if any went wrong
   tracer bench stop <ID>              stop a running bench, whoever started it
+  tracer schema <URL|PATH> [-H 'Name: value']... [--env <NAME>]
+                                      a GraphQL server's schema as SDL, asked by
+                                      introspection (a request in history);
+                                      `tracer send GRAPHQL <URL> -d '<query>'`
+                                      sends a query, its variables JSON after a
+                                      blank line
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -115,6 +121,7 @@ fn main() -> ExitCode {
         Some("save") => save(workspace, args[1..].to_vec()),
         Some("run") => run(workspace, args[1..].to_vec()),
         Some("bench") => bench(workspace, args[1..].to_vec()),
+        Some("schema") => schema(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
@@ -701,6 +708,60 @@ fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     }
 }
 
+fn schema(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let env = take_value(&mut args, "--env");
+    let mut headers = Vec::new();
+    while let Some(h) = take_value(&mut args, "-H") {
+        let (name, value) = h.split_once(':').ok_or_else(|| io::Error::other(format!("`{h}` is not `Name: value`")))?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    let [target] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    // A saved request's URL and headers, or a URL.
+    let (url, saved_headers) = if target.contains("://") || target.contains("{{") {
+        (target, Vec::new())
+    } else {
+        let wanted = target.trim_start_matches("requests/").trim_end_matches(".http").to_string();
+        let (requests, _) = saved(&workspace, "tracer schema")?;
+        let found = requests
+            .into_iter()
+            .find(|r| r.path == wanted)
+            .ok_or_else(|| io::Error::other(format!("`{wanted}` is neither a URL nor a saved request")))?;
+        (found.request.url, found.request.headers)
+    };
+    let request = HttpRequest {
+        method: "GRAPHQL".into(),
+        url,
+        headers: saved_headers.into_iter().chain(headers).collect(),
+        body: Some(GRAPHQL_INTROSPECTION.into()),
+        ..Default::default()
+    };
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer schema")?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    let request_id = match client.call(Command::Send { request, env })? {
+        Ok(ReplyBody::Accepted { request_id }) => request_id,
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    loop {
+        match client.next_event()?.kind {
+            EventKind::RequestFinished { request_id: id, .. } if id == request_id => break,
+            EventKind::RequestFailed { request_id: id, error } if id == request_id => return Err(io::Error::other(error)),
+            EventKind::RequestCancelled { request_id: id } if id == request_id => return Err(io::Error::other("cancelled")),
+            EventKind::ApprovalAsked { request_id: id, reason } if id == request_id => eprintln!("waits for a person: {reason}"),
+            _ => {}
+        }
+    }
+    match client.call(Command::GraphqlSchema { request_id })? {
+        Ok(ReplyBody::GraphqlSchema { schema }) => {
+            println!("{}", schema.to_sdl());
+            eprintln!("#{request_id}: {} types", schema.types.len());
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
 /// `30s`, `2m`, `1h`, or a bare number of seconds.
 fn seconds(text: &str) -> io::Result<u64> {
     let t = text.trim().to_ascii_lowercase();
@@ -869,7 +930,7 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Resul
         let event = client.next_event()?;
         if let EventKind::RequestStarted { request_id: id, request, .. } = &event.kind {
             if *id == request_id {
-                checked = !request.expect.is_empty();
+                checked = request.is_checked();
             }
             continue;
         }

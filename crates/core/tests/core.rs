@@ -1359,3 +1359,100 @@ fn an_agents_bench_is_capped_asked_about_and_stopped_by_a_person_or_the_kill_swi
     assert!(stats.done > 0 && stats.done < 100, "{} sent", stats.done);
     core.stop();
 }
+
+/// A GraphQL server: introspection gets a small schema, a query naming
+/// `boom` gets errors with a 200, anything else has what was sent echoed
+/// back as `data.sent`. Gives its URL.
+fn graphql_server() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let (mut length, mut kind) = (0usize, String::new());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(v) = lower.strip_prefix("content-type:") {
+                        kind = v.trim().to_string();
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let body = String::from_utf8_lossy(&body).to_string();
+                let reply = if body.contains("__schema") {
+                    r#"{"data":{"__schema":{"queryType":{"name":"Query"},"mutationType":null,"subscriptionType":null,"types":[{"kind":"OBJECT","name":"Query","description":null,"fields":[{"name":"user","description":null,"args":[{"name":"id","type":{"kind":"NON_NULL","name":null,"ofType":{"kind":"SCALAR","name":"ID"}}}],"type":{"kind":"OBJECT","name":"User"}}],"inputFields":null,"enumValues":null,"possibleTypes":null}]}}}"#.to_string()
+                } else if body.contains("boom") {
+                    r#"{"data":null,"errors":[{"message":"Cannot query field boom"}]}"#.to_string()
+                } else {
+                    let sent = serde_json::json!({ "method": first.split_whitespace().next(), "type": kind, "body": body });
+                    serde_json::json!({ "data": { "sent": sent } }).to_string()
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/graphql")
+}
+
+#[test]
+fn a_graphql_request_goes_as_json_its_errors_fail_it_and_its_schema_is_read() {
+    use tracer_protocol::GRAPHQL_INTROSPECTION;
+    let ws = workspace("graphql");
+    let url = graphql_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let gql = |body: &str| Command::Send {
+        request: HttpRequest { method: "GRAPHQL".into(), url: url.clone(), body: Some(body.into()), ..Default::default() },
+        env: None,
+    };
+    let checked = |client: &mut Client, id: u64| {
+        wait_for(client, |e| match &e.kind {
+            EventKind::RequestChecked { request_id, results } if *request_id == id => Some(results.clone()),
+            _ => None,
+        })
+    };
+
+    // Sent as a JSON POST, its variables parsed; kept as written.
+    let Ok(ReplyBody::Accepted { request_id }) = window.call(gql("query U($id: ID!) { user(id: $id) { name } }\n\n{\"id\": \"7\"}")).unwrap()
+    else {
+        panic!()
+    };
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, request_id) else { panic!() };
+    let echoed: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(echoed["data"]["sent"]["method"], "POST");
+    assert_eq!(echoed["data"]["sent"]["type"], "application/json");
+    let sent: serde_json::Value = serde_json::from_str(echoed["data"]["sent"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(sent, serde_json::json!({ "query": "query U($id: ID!) { user(id: $id) { name } }", "variables": { "id": "7" } }));
+    assert!(checked(&mut window, request_id)[0].pass);
+    let Ok(ReplyBody::Response { entry, .. }) = window.call(Command::Response { request_id }).unwrap() else { panic!() };
+    assert_eq!(entry.request.method, "GRAPHQL", "history keeps it as written");
+
+    // Errors with a 200 fail it.
+    let Ok(ReplyBody::Accepted { request_id }) = window.call(gql("{ boom }")).unwrap() else { panic!() };
+    let results = checked(&mut window, request_id);
+    assert_eq!((results[0].expect.as_str(), results[0].pass), ("no GraphQL errors", false));
+    assert_eq!(results[0].actual, "1 error: Cannot query field boom");
+
+    // Its schema, from an introspection answer.
+    let Ok(ReplyBody::Accepted { request_id }) = window.call(gql(GRAPHQL_INTROSPECTION)).unwrap() else { panic!() };
+    end_of(&mut window, request_id);
+    let Ok(ReplyBody::GraphqlSchema { schema }) = window.call(Command::GraphqlSchema { request_id }).unwrap() else { panic!() };
+    assert_eq!(schema.to_sdl(), "type Query {\n  user(id: ID!): User\n}");
+    core.stop();
+}

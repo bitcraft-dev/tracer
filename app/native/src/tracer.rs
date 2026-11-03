@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
     BenchPlan, BenchStats, ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest, StepOutcome,
-    BENCH_BUCKETS_MS,
+    BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
 };
 
 /// The most of a response body handed to the page. The core and its journal
@@ -105,6 +105,38 @@ pub struct CoreEvent {
     /// How the bench stands, for those three; for `bench_finished`, `reason`
     /// says why it stopped early, or is "".
     pub stats: BenchNow,
+}
+
+/// A GraphQL server's schema: its root types by name ("" where it has
+/// none), and its types, the root ones first and scalars left out.
+#[rux::export]
+#[derive(Clone)]
+pub struct GSchema {
+    pub query: String,
+    pub mutation: String,
+    pub types: Vec<GType>,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct GType {
+    pub name: String,
+    /// `type`, `input`, `enum`, `interface` or `union`.
+    pub kind: String,
+    pub description: String,
+    pub fields: Vec<GField>,
+    /// An enum's values, or a union's types, as one line.
+    pub values: String,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct GField {
+    pub name: String,
+    /// `(id: ID!)`, or "".
+    pub args: String,
+    pub ty: String,
+    pub description: String,
 }
 
 /// A bench so far, for the page. Times are in milliseconds.
@@ -359,6 +391,54 @@ pub fn run_bench(
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
     }
+}
+
+/// The query that asks a GraphQL server for its schema; sent as a
+/// `GRAPHQL` request's body, its answer is read by [`graphql_schema`].
+#[rux::export]
+pub fn introspection() -> String {
+    GRAPHQL_INTROSPECTION.to_string()
+}
+
+/// The schema in finished request `request_id`'s answer.
+#[rux::export]
+pub fn graphql_schema(request_id: u64) -> Result<GSchema, CoreError> {
+    let schema = match shared()?.call(Command::GraphqlSchema { request_id }) {
+        Ok(Ok(ReplyBody::GraphqlSchema { schema })) => schema,
+        Ok(Ok(other)) => return Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => return Err(CoreError(refused)),
+        Err(e) => return Err(CoreError(e.to_string())),
+    };
+    let roots = [schema.query.clone(), schema.mutation.clone(), schema.subscription.clone()];
+    let mut ordered: Vec<&tracer_protocol::GqlType> = roots.iter().filter_map(|r| schema.types.iter().find(|t| &t.name == r)).collect();
+    ordered.extend(schema.types.iter().filter(|t| !roots.contains(&t.name) && t.kind != "SCALAR"));
+    let types = ordered
+        .into_iter()
+        .map(|t| GType {
+            name: t.name.clone(),
+            kind: match t.kind.as_str() {
+                "INPUT_OBJECT" => "input",
+                "ENUM" => "enum",
+                "INTERFACE" => "interface",
+                "UNION" => "union",
+                _ => "type",
+            }
+            .into(),
+            description: t.description.clone(),
+            fields: t
+                .fields
+                .iter()
+                .map(|f| GField {
+                    name: f.name.clone(),
+                    args: if f.args.is_empty() { String::new() } else { format!("({})", f.args) },
+                    ty: f.ty.clone(),
+                    description: f.description.clone(),
+                })
+                .collect(),
+            values: t.values.join(if t.kind == "UNION" { " | " } else { " · " }),
+        })
+        .collect();
+    Ok(GSchema { query: schema.query, mutation: schema.mutation, types })
 }
 
 /// Stop bench `bench_id`, whoever started it.

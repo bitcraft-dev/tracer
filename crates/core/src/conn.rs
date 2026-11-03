@@ -16,7 +16,7 @@ use tracer_protocol::{
     Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
 };
 
-use crate::{bench, diff, envs, expect, flows, guard, http};
+use crate::{bench, diff, envs, flows, graphql, guard, http};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -164,6 +164,11 @@ pub fn serve(
                     Err(e) => Err(e),
                 }
             }
+            (Some(_), Command::GraphqlSchema { request_id }) => match hub.response(request_id) {
+                Some((_, Some(response), _)) => graphql::schema(&response.body).map(|schema| ReplyBody::GraphqlSchema { schema }),
+                Some(_) => Err(format!("request #{request_id} has no answer to read a schema from")),
+                None => Err(format!("there is no request #{request_id} in the history")),
+            },
             (Some((_, actor)), Command::RunBench { request, env, plan }) => {
                 bench::start(&hub, actor, request, env, plan).map(|bench_id| ReplyBody::BenchStarted { bench_id })
             }
@@ -283,7 +288,9 @@ pub(crate) fn run_one(
         Ok(None) => (Ok(None), Vec::new()),
         Err(e) => (Err(e), Vec::new()),
     };
-    let resolved = environment.and_then(|e| envs::resolve(request, envs::with_extra(e, extra).as_ref()));
+    let resolved = environment
+        .and_then(|e| envs::resolve(request, envs::with_extra(e, extra).as_ref()))
+        .and_then(|r| if graphql::is_graphql(&r) { graphql::to_http(&r) } else { Ok(r) });
     if let (Some(rules), Ok(sending)) = (&rules, &resolved) {
         if let Some(why) = guard::outside_rules(rules, sending) {
             return stopped(envs::redact(&format!("refused by the workspace's policy: {why}"), &secrets));
@@ -303,7 +310,7 @@ pub(crate) fn run_one(
         .map(|response| envs::redact_response(response, &secrets))
         .map_err(|error| envs::redact(&error, &secrets));
     // Checked on what clients see, secrets already taken out.
-    let results = expect::check(&request.expect, outcome.as_ref().map_err(String::as_str));
+    let results = graphql::checks(request, outcome.as_ref().map_err(String::as_str));
     let kind = match &outcome {
         Ok(response) => EventKind::RequestFinished { request_id, response: response.clone() },
         Err(error) => EventKind::RequestFailed { request_id, error: error.clone() },

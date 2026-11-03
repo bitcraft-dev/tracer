@@ -4,371 +4,413 @@
      core, its list and its event stream, so what `tracer save` or an agent
      does shows up here as well. -->
 <template>
-  <screen class="app" @key="onKey(event)" @close="onClose()">
-    <view class="main">
-      <view class="rail">
-        <text class="logo">T</text>
-        <view class="rail-item" :class="{ on: mode == &quot;rest&quot; }" @tap="mode = &quot;rest&quot;"><text class="rail-label">REST</text></view>
-        <view class="rail-item" :class="{ on: mode == &quot;bench&quot; }" @tap="mode = &quot;bench&quot;"><text class="rail-label">Bench</text></view>
-      </view>
+    <screen class="app" @key="onKey(event)" @close="onClose()">
+        <view class="main">
+            <view class="rail">
+                <text class="logo">T</text>
+                <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && !gql }" @tap="toRest()"><text class="rail-label">REST</text></view>
+                <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && gql }" @tap="toGraphql()"><text class="rail-label">GraphQL</text></view>
+                <view class="rail-item" :class="{ on: mode == &quot;bench&quot; }" @tap="mode = &quot;bench&quot;"><text class="rail-label">Bench</text></view>
+            </view>
 
-      <view class="side" :style="`width: ${sideWidth}px`">
-        <view class="env-row">
-          <view class="env">
-            <input type="select" r-model="envPick" :options="envOptions" />
-          </view>
-          <view class="gear" @tap="openEnvEditor()"><text class="gear-t">⚙</text></view>
-        </view>
-        <text class="empty warn" r-for="w in envSkipped">skipped {{ w }}</text>
-        <view class="side-h">
-          <text class="side-title">Collections</text>
-          <text class="count">{{ saved.length }}</text>
-          <view class="side-add" @tap="newRequest()"><text class="side-add-t">+</text></view>
-        </view>
-        <view class="list">
-          <text class="empty" r-if="saved.length == 0">No saved requests yet. Ctrl+S saves the one you're editing.</text>
-          <view
-            class="row"
-            r-for="s in saved"
-            r-key="s.path"
-            :class="{ on: s.path == openPath }"
-            @tap="openSaved(s.path)">
-            <view class="row-top">
-              <text class="m" :style="`color: ${methodColor(s.method)}`">{{ s.method }}</text>
-              <text class="row-url">{{ nameOf(s.path) }}</text>
-            </view>
-            <view class="row-bottom" r-if="folderOf(s.path) != &quot;&quot;">
-              <text class="st"></text>
-              <text class="who">{{ folderOf(s.path) }}</text>
-            </view>
-          </view>
-          <text class="empty warn" r-for="w in skipped">skipped {{ w }}</text>
-        </view>
-
-        <view class="side-h second">
-          <text class="side-title">History</text>
-          <text class="count">{{ if filtering { `${shown.length} of ${requests.length}` } else { `${requests.length}` } }}</text>
-          <view class="side-add" r-if="filtering" @tap="clearFilter()"><text class="clear-t">clear</text></view>
-        </view>
-        <view class="hfilter">
-          <view class="hsearch">
-            <input r-model="hq" placeholder="Search URL, status, who, env, #id" />
-          </view>
-          <view class="hpicks">
-            <view class="hpick"><input type="select" r-model="hActor" :options="actorKinds" /></view>
-            <view class="hpick"><input type="select" r-model="hStatus" :options="statusClasses" /></view>
-          </view>
-        </view>
-        <view class="list">
-          <text class="empty" r-if="requests.length == 0">Nothing yet. Send a request, or run tracer send in this workspace.</text>
-          <text class="empty" r-if="requests.length > 0 && shown.length == 0">No request matches the filter.</text>
-          <view
-            class="row"
-            r-for="r in shown"
-            r-key="r.id"
-            :class="{ on: r.id == selected }"
-            @tap="selected = r.id">
-            <view class="row-top">
-              <text class="m" :style="`color: ${methodColor(r.method)}`">{{ r.method }}</text>
-              <text class="row-url">{{ r.url }}</text>
-            </view>
-            <view class="row-bottom">
-              <text class="st" :style="`color: ${statusColor(r)}`">{{ statusText(r) }}</text>
-              <text class="who">{{ r.actorKind }} · {{ r.actor }}</text>
-              <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
-              <text class="again" r-if="r.rerunOf > 0">↻ #{{ r.rerunOf }}</text>
-              <text class="when">{{ when(r.atMs) }}</text>
-            </view>
-          </view>
-        </view>
-      </view>
-
-      <view class="split-v" @drag="resizeSide(event)"><view class="grip-v"></view></view>
-
-      <view class="work">
-        <view class="ask" r-for="r in waiting" r-key="r.id">
-          <view class="ask-top">
-            <text class="ask-who">{{ r.actor }} asks to send</text>
-            <text class="m" :style="`color: ${methodColor(r.method)}`">{{ r.method }}</text>
-            <text class="ask-url">{{ r.url }}</text>
-            <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
-          </view>
-          <view class="ask-bottom">
-            <text class="ask-why">#{{ r.id }} · {{ r.reason }}</text>
-            <view class="link" @tap="selected = r.id"><text class="link-t">Show</text></view>
-            <view class="link danger-l" @tap="decide(r.id, false)"><text class="link-t">Refuse</text></view>
-            <view class="allow" @tap="decide(r.id, true)"><text class="allow-t">Allow</text></view>
-          </view>
-        </view>
-        <view class="title">
-          <text class="title-t" :class="{ unsaved: openPath == &quot;&quot; }">{{ if openPath == "" { "Unsaved request" } else { openPath } }}</text>
-          <text class="dirty" r-if="dirty">●</text>
-          <text class="notice" r-if="notice != &quot;&quot;">{{ notice }}</text>
-          <view class="save" @tap="save()"><text class="save-t">Save</text></view>
-        </view>
-        <view class="bar">
-          <view class="method">
-            <input type="select" r-model="method" :options="methods" />
-          </view>
-          <view class="url">
-            <input r-model="url" placeholder="https://…" />
-          </view>
-          <view class="send" r-if="!running()" :class="{ off: !connected }" @tap="send()">
-            <text class="send-label">Send</text>
-          </view>
-          <view class="send stop" r-if="running()" @tap="cancel()">
-            <text class="send-label">Cancel</text>
-          </view>
-        </view>
-        <view class="preview" r-if="url.includes(&quot;{{&quot;)">
-          <text class="preview-t">{{ preview }}</text>
-          <text class="preview-warn" r-if="preview.includes(&quot;{{&quot;)">{{ previewWarning() }}</text>
-        </view>
-
-        <view class="tabs">
-          <view class="tab" :class="{ on: reqTab == &quot;body&quot; }" @tap="reqTab = &quot;body&quot;">
-            <text class="tab-label">Body</text>
-          </view>
-          <view class="tab" :class="{ on: reqTab == &quot;headers&quot; }" @tap="reqTab = &quot;headers&quot;">
-            <text class="tab-label">Headers</text>
-            <text class="badge" r-if="sentHeaders().length > 0">{{ sentHeaders().length }}</text>
-          </view>
-          <view class="tab" :class="{ on: reqTab == &quot;checks&quot; }" @tap="reqTab = &quot;checks&quot;">
-            <text class="tab-label">Checks</text>
-            <text class="badge" r-if="checkLines() > 0">{{ checkLines() }}</text>
-          </view>
-        </view>
-        <view class="editor" :style="`height: ${reqHeight}px`">
-          <input r-if="reqTab == &quot;body&quot;" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
-          <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
-          <input r-if="reqTab == &quot;checks&quot;" type="textarea" r-model="checksText" placeholder="one per line: status 2xx · $.id == 1 · header Content-Type contains json · time &lt; 500 · len($.items) &gt;= 3" />
-        </view>
-        <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
-        <view class="split-h" @drag="resizeReq(event)"><view class="grip-h"></view></view>
-
-        <view class="res">
-          <text class="empty" r-if="mode == &quot;rest&quot; && sel == none">Pick a request in History, or send one.</text>
-          <view class="res-in" r-if="mode == &quot;rest&quot; && sel != none">
-            <view class="res-h">
-              <text class="res-id">#{{ sel.id }}</text>
-              <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
-              <text class="res-url">{{ sel.url }}</text>
-              <view class="link" @tap="copySelCurl()"><text class="link-t">cURL</text></view>
-              <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
-              <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
-            </view>
-            <view class="chips">
-              <text class="chip" :style="`color: ${statusColor(sel)}`">{{ statusText(sel) }}</text>
-              <view class="chip link-chip" r-if="sel.rerunOf > 0" @tap="selected = sel.rerunOf">
-                <text class="link-t">re-run of #{{ sel.rerunOf }}</text>
-              </view>
-              <text class="chip" r-if="sel.env != &quot;&quot;">env {{ sel.env }}</text>
-              <text class="chip" r-if="sel.flow > 0">flow {{ sel.flow }}</text>
-              <view class="chip link-chip" r-if="sel.bench > 0" @tap="showBench(sel.bench)">
-                <text class="link-t">first of bench {{ sel.bench }}</text>
-              </view>
-              <text class="chip" r-if="sel.state == &quot;done&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
-              <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
-              <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
-              <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
-              <text class="chip">sent {{ when(sel.atMs) }}</text>
-            </view>
-            <view class="fall" r-if="sel.state == &quot;done&quot; && sel.dnsMs >= 0.0">
-              <view class="fall-bar">
-                <view class="fall-seg" r-for="p in phases(sel)" :style="`flex-grow: ${p.ms}; background: ${p.color}`"></view>
-              </view>
-              <view class="fall-keys">
-                <view class="fall-key" r-for="p in phases(sel)">
-                  <view class="fall-dot" :style="`background: ${p.color}`"></view>
-                  <text class="fall-t">{{ p.name }} {{ ms(p.ms) }}</text>
-                </view>
-              </view>
-            </view>
-            <view class="tabs">
-              <view class="tab" :class="{ on: resTab == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
-                <text class="tab-label">Body</text>
-              </view>
-              <view class="tab" :class="{ on: resTab == &quot;headers&quot; }" @tap="resTab = &quot;headers&quot;">
-                <text class="tab-label">Headers</text>
-                <text class="badge">{{ sel.resHeaders.length }}</text>
-              </view>
-              <view class="tab" r-if="sel.results.length > 0" :class="{ on: resTab == &quot;checks&quot; }" @tap="resTab = &quot;checks&quot;">
-                <text class="tab-label">Checks</text>
-                <text class="badge" :class="{ bad: failedChecks(sel) > 0 }">{{ sel.results.length - failedChecks(sel) }}/{{ sel.results.length }}</text>
-              </view>
-            </view>
-            <view class="pane">
-              <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
-              <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
-              <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
-              <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
-              <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
-              <view class="check" r-if="resTab == &quot;checks&quot;" r-for="c in sel.results">
-                <text class="check-mark" :class="{ bad: !c.pass }">{{ if c.pass { "✓" } else { "✗" } }}</text>
-                <text class="check-e">{{ c.expect }}</text>
-                <text class="check-a">found {{ c.actual }}</text>
-              </view>
-              <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
-                <text class="hdr-n">{{ h.name }}</text>
-                <text class="hdr-v">{{ h.value }}</text>
-              </view>
-            </view>
-          </view>
-          <view class="bench" r-if="mode == &quot;bench&quot;">
-            <view class="bench-form">
-              <view class="bf"><text class="bf-l">Requests</text><view class="bf-in"><input r-model="bTotal" placeholder="none" /></view></view>
-              <view class="bf"><text class="bf-l">At a time</text><view class="bf-in"><input r-model="bConc" placeholder="10" /></view></view>
-              <view class="bf"><text class="bf-l">Seconds</text><view class="bf-in"><input r-model="bSecs" placeholder="no limit" /></view></view>
-              <view class="bf"><text class="bf-l">Per second</text><view class="bf-in"><input r-model="bRate" placeholder="any" /></view></view>
-              <view class="send" r-if="!benchRunning" :class="{ off: !connected }" @tap="runBench()">
-                <text class="send-label">Run bench</text>
-              </view>
-              <view class="send stop" r-if="benchRunning" @tap="stopBench()">
-                <text class="send-label">Stop</text>
-              </view>
-            </view>
-            <text class="empty" r-if="bn == none">Sends the request above over and over: Requests in all, At a time in flight, for at most Seconds, no faster than Per second. Its first request goes to History with its waterfall; the rest are counted here.</text>
-            <view class="bench-in" r-if="bn != none">
-              <view class="res-h">
-                <text class="res-id">bench {{ benchId }}</text>
-                <text class="m" :style="`color: ${methodColor(benchMethod)}`">{{ benchMethod }}</text>
-                <text class="res-url">{{ benchUrl }}</text>
-              </view>
-              <view class="chips">
-                <text class="chip" :style="`color: ${benchColor()}`">{{ benchState() }}</text>
-                <text class="chip">{{ benchPlan }}</text>
-                <text class="chip" r-if="benchEnv != &quot;&quot;">env {{ benchEnv }}</text>
-                <text class="chip">by {{ benchBy }}</text>
-              </view>
-              <view class="fall-bar">
-                <view class="fall-seg" :style="`flex-grow: ${benchShare()}; background: #7c6cf0`"></view>
-                <view class="fall-seg" :style="`flex-grow: ${1.0 - benchShare()}; background: #262626`"></view>
-              </view>
-              <view class="tiles">
-                <view class="tile"><text class="tile-v">{{ bn.done }}</text><text class="tile-l">done</text></view>
-                <view class="tile"><text class="tile-v">{{ bn.perSec.toFixed(1) }}</text><text class="tile-l">a second</text></view>
-                <view class="tile"><text class="tile-v">{{ ms(bn.p50Ms) }}</text><text class="tile-l">p50</text></view>
-                <view class="tile"><text class="tile-v">{{ ms(bn.p95Ms) }}</text><text class="tile-l">p95</text></view>
-                <view class="tile"><text class="tile-v">{{ ms(bn.p99Ms) }}</text><text class="tile-l">p99</text></view>
-                <view class="tile"><text class="tile-v">{{ ms(bn.maxMs) }}</text><text class="tile-l">max</text></view>
-                <view class="tile"><text class="tile-v" :class="{ bad: bn.wrong > 0 }">{{ bn.wrong }}</text><text class="tile-l">wrong</text></view>
-              </view>
-              <view class="plots">
-                <view class="plot-box">
-                  <text class="sub">Requests a second · top {{ rpsTop().round() }}</text>
-                  <view class="plot"><path class="line" :d="rpsPath()" /></view>
-                </view>
-                <view class="plot-box grow">
-                  <text class="sub">Latency · {{ bn.histogram.reduce((a, n) => a + n, 0) }} answers</text>
-                  <view class="hist">
-                    <view class="hcol" r-for="b in bars()">
-                      <text class="hn">{{ if b.n > 0 { `${b.n}` } else { "" } }}</text>
-                      <view class="hbar" :style="`height: ${b.h}px`"></view>
-                      <text class="hl">{{ b.label }}</text>
+            <view class="side" :style="`width: ${sideWidth}px`">
+                <view class="env-row">
+                    <view class="env">
+                        <input type="select" r-model="envPick" :options="envOptions" />
                     </view>
-                  </view>
+                    <view class="gear" @tap="openEnvEditor()"><text class="gear-t">⚙</text></view>
                 </view>
-              </view>
-              <text class="mono" r-if="bn.statuses != &quot;&quot;">status {{ bn.statuses }}</text>
-              <text class="mono err" r-for="x in bn.errors">no answer: {{ x }}</text>
-            </view>
-          </view>
-        </view>
-      </view>
-    </view>
+                <text class="empty warn" r-for="w in envSkipped">skipped {{ w }}</text>
+                <view class="side-h">
+                    <text class="side-title">Collections</text>
+                    <text class="count">{{ saved.length }}</text>
+                    <view class="side-add" @tap="newRequest()"><text class="side-add-t">+</text></view>
+                </view>
+                <view class="list">
+                    <text class="empty" r-if="saved.length == 0">No saved requests yet. Ctrl+S saves the one you're editing.</text>
+                    <view
+                        class="row"
+                        r-for="s in saved"
+                        r-key="s.path"
+                        :class="{ on: s.path == openPath }"
+                        @tap="openSaved(s.path)">
+                        <view class="row-top">
+                            <text class="m" :style="`color: ${methodColor(s.method)}`">{{ s.method }}</text>
+                            <text class="row-url">{{ nameOf(s.path) }}</text>
+                        </view>
+                        <view class="row-bottom" r-if="folderOf(s.path) != &quot;&quot;">
+                            <text class="st"></text>
+                            <text class="who">{{ folderOf(s.path) }}</text>
+                        </view>
+                    </view>
+                    <text class="empty warn" r-for="w in skipped">skipped {{ w }}</text>
+                </view>
 
-    <view class="status">
-      <text class="dot" :style="`color: ${linkColor()}`">●</text>
-      <text class="status-t">{{ linkText() }}</text>
-      <text class="status-t">env: {{ if envPick == NO_ENV { "none" } else { envPick } }}</text>
-      <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
-      <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
-      <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
-      <text class="status-t flow-t" r-if="lastBench != &quot;&quot;" :class="{ bad: !benchOk }" @tap="showBench(benchId)">{{ lastBench }}</text>
-      <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
-      <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
-        <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
-      </view>
-      <text class="status-t key">Ctrl+K</text>
-    </view>
+                <view class="side-h second">
+                    <text class="side-title">History</text>
+                    <text class="count">{{ if filtering { `${shown.length} of ${requests.length}` } else { `${requests.length}` } }}</text>
+                    <view class="side-add" r-if="filtering" @tap="clearFilter()"><text class="clear-t">clear</text></view>
+                </view>
+                <view class="hfilter">
+                    <view class="hsearch">
+                        <input r-model="hq" placeholder="Search URL, status, who, env, #id" />
+                    </view>
+                    <view class="hpicks">
+                        <view class="hpick"><input type="select" r-model="hActor" :options="actorKinds" /></view>
+                        <view class="hpick"><input type="select" r-model="hStatus" :options="statusClasses" /></view>
+                    </view>
+                </view>
+                <view class="list">
+                    <text class="empty" r-if="requests.length == 0">Nothing yet. Send a request, or run tracer send in this workspace.</text>
+                    <text class="empty" r-if="requests.length > 0 && shown.length == 0">No request matches the filter.</text>
+                    <view
+                        class="row"
+                        r-for="r in shown"
+                        r-key="r.id"
+                        :class="{ on: r.id == selected }"
+                        @tap="selected = r.id">
+                        <view class="row-top">
+                        <text class="m" :style="`color: ${methodColor(r.method)}`">{{ r.method }}</text>
+                        <text class="row-url">{{ r.url }}</text>
+                        </view>
+                        <view class="row-bottom">
+                        <text class="st" :style="`color: ${statusColor(r)}`">{{ statusText(r) }}</text>
+                        <text class="who">{{ r.actorKind }} · {{ r.actor }}</text>
+                        <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
+                        <text class="again" r-if="r.rerunOf > 0">↻ #{{ r.rerunOf }}</text>
+                        <text class="when">{{ when(r.atMs) }}</text>
+                        </view>
+                    </view>
+                </view>
+            </view>
 
-    <view class="scrim" r-if="naming" @tap="naming = false">
-      <view class="palette" @tap="noop()">
-        <text class="prompt-h">Save as</text>
-        <view class="pal-field">
-          <input r-model="saveName" placeholder="folder/name, such as albums/get album" autofocus @key="nameKey(event)" />
-        </view>
-        <text class="prompt-hint">requests/{{ saveName }}.http · Enter saves · Esc cancels</text>
-      </view>
-    </view>
+            <view class="split-v" @drag="resizeSide(event)"><view class="grip-v"></view></view>
 
-    <view class="scrim" r-if="editingEnvs" @tap="editingEnvs = false">
-      <view class="envpanel" @tap="noop()">
-        <view class="envlist">
-          <text class="prompt-h">Environments</text>
-          <view
-            class="row"
-            r-for="e in envs"
-            r-key="e.name"
-            :class="{ on: e.name == editEnv }"
-            @tap="pickEnv(e.name)">
-            <text class="row-url">{{ e.name }}</text>
-          </view>
-          <view class="pal-field small">
-            <input r-model="newEnvName" placeholder="new environment, Enter" @key="newEnvKey(event)" />
-          </view>
-        </view>
-        <view class="envbody">
-          <text class="empty" r-if="editEnv == &quot;&quot;">Pick an environment, or name a new one.</text>
-          <view class="envbody-in" r-if="editEnv != &quot;&quot;">
-            <view class="envbody-h">
-              <text class="prompt-h">{{ editEnv }}</text>
-              <view class="link danger" @tap="deleteEnv()"><text class="link-t">Delete</text></view>
-            </view>
-            <text class="sub">Variables · environments/{{ editEnv }}.env</text>
-            <view class="var" r-for="v in draftVars" r-key="v.id">
-              <view class="vf name"><input r-model="v.name" placeholder="name" /></view>
-              <view class="vf grow"><input r-model="v.value" placeholder="value" /></view>
-              <view class="x" @tap="removeVar(v.id)"><text class="x-t">✕</text></view>
-            </view>
-            <view class="envbody-h">
-              <view class="link" @tap="addVar()"><text class="link-t">+ variable</text></view>
-              <view class="save" @tap="saveEnv()"><text class="save-t">Save variables</text></view>
-            </view>
-            <text class="sub">Secrets · kept out of git; values never shown or sent to clients</text>
-            <view class="var" r-for="name in editSecrets" r-key="name">
-              <text class="secret-n">{{ name }}</text>
-              <text class="secret-v">••••••</text>
-              <view class="x" @tap="removeSecret(name)"><text class="x-t">✕</text></view>
-            </view>
-            <view class="var">
-              <view class="vf name"><input r-model="secretName" placeholder="name" /></view>
-              <view class="vf grow"><input r-model="secretValue" placeholder="value (replaces one of that name)" /></view>
-              <view class="link" @tap="setSecret()"><text class="link-t">Set</text></view>
-            </view>
-          </view>
-        </view>
-      </view>
-    </view>
+            <view class="work">
+                <view class="ask" r-for="r in waiting" r-key="r.id">
+                <view class="ask-top">
+                    <text class="ask-who">{{ r.actor }} asks to send</text>
+                    <text class="m" :style="`color: ${methodColor(r.method)}`">{{ r.method }}</text>
+                    <text class="ask-url">{{ r.url }}</text>
+                    <text class="env-tag" r-if="r.env != &quot;&quot;">{{ r.env }}</text>
+                </view>
+                <view class="ask-bottom">
+                    <text class="ask-why">#{{ r.id }} · {{ r.reason }}</text>
+                    <view class="link" @tap="selected = r.id"><text class="link-t">Show</text></view>
+                    <view class="link danger-l" @tap="decide(r.id, false)"><text class="link-t">Refuse</text></view>
+                    <view class="allow" @tap="decide(r.id, true)"><text class="allow-t">Allow</text></view>
+                </view>
+                </view>
+                <view class="title">
+                    <text class="title-t" :class="{ unsaved: openPath == &quot;&quot; }">{{ if openPath == "" { "Unsaved request" } else { openPath } }}</text>
+                    <text class="dirty" r-if="dirty">●</text>
+                    <text class="notice" r-if="notice != &quot;&quot;">{{ notice }}</text>
+                    <view class="save" @tap="save()"><text class="save-t">Save</text></view>
+                </view>
+                <view class="bar">
+                    <view class="method" r-if="!gql">
+                        <input type="select" r-model="method" :options="methods" />
+                    </view>
+                    <view class="method gql-m" r-if="gql"><text class="gql-t">GraphQL</text></view>
+                    <view class="url">
+                        <input r-model="url" placeholder="https://…" />
+                    </view>
+                    <view class="send" r-if="!running()" :class="{ off: !connected }" @tap="send()">
+                        <text class="send-label">Send</text>
+                    </view>
+                    <view class="send stop" r-if="running()" @tap="cancel()">
+                        <text class="send-label">Cancel</text>
+                    </view>
+                </view>
+                <view class="preview" r-if="url.includes(&quot;{{&quot;)">
+                    <text class="preview-t">{{ preview }}</text>
+                    <text class="preview-warn" r-if="preview.includes(&quot;{{&quot;)">{{ previewWarning() }}</text>
+                </view>
 
-    <view class="scrim" r-if="palette" @tap="closePalette()">
-      <view class="palette" @tap="noop()">
-        <view class="pal-field">
-          <input r-model="search" placeholder="Type a command…" autofocus @key="paletteKey(event)" />
+                <view class="tabs">
+                    <view class="tab" r-if="!gql" :class="{ on: reqTab == &quot;body&quot; }" @tap="reqTab = &quot;body&quot;">
+                        <text class="tab-label">Body</text>
+                    </view>
+                    <view class="tab" r-if="gql" :class="{ on: reqTab == &quot;query&quot; }" @tap="reqTab = &quot;query&quot;">
+                        <text class="tab-label">Query</text>
+                    </view>
+                    <view class="tab" r-if="gql" :class="{ on: reqTab == &quot;vars&quot; }" @tap="reqTab = &quot;vars&quot;">
+                        <text class="tab-label">Variables</text>
+                        <text class="badge" r-if="gqlVars.trim() != &quot;&quot;">JSON</text>
+                    </view>
+                    <view class="tab" :class="{ on: reqTab == &quot;headers&quot; }" @tap="reqTab = &quot;headers&quot;">
+                        <text class="tab-label">Headers</text>
+                        <text class="badge" r-if="sentHeaders().length > 0">{{ sentHeaders().length }}</text>
+                    </view>
+                    <view class="tab" :class="{ on: reqTab == &quot;checks&quot; }" @tap="reqTab = &quot;checks&quot;">
+                        <text class="tab-label">Checks</text>
+                        <text class="badge" r-if="checkLines() > 0">{{ checkLines() }}</text>
+                    </view>
+                </view>
+                <view class="editor" :style="`height: ${reqHeight}px`">
+                    <input r-if="reqTab == &quot;body&quot; && !gql" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
+                    <input r-if="reqTab == &quot;query&quot; && gql" type="textarea" r-model="gqlQuery" placeholder="query { … } or mutation { … }; the Schema view lists what the server has" />
+                    <input r-if="reqTab == &quot;vars&quot; && gql" type="textarea" r-model="gqlVars" placeholder="the query's variables as a JSON object, such as { &quot;id&quot;: 7 }" />
+                    <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
+                    <input r-if="reqTab == &quot;checks&quot;" type="textarea" r-model="checksText" placeholder="one per line: status 2xx · $.id == 1 · header Content-Type contains json · time &lt; 500 · len($.items) &gt;= 3" />
+                </view>
+                <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
+                <view class="split-h" @drag="resizeReq(event)"><view class="grip-h"></view></view>
+
+                <view class="res">
+                    <view class="tabs" r-if="mode == &quot;rest&quot; && gql">
+                        <view class="tab" :class="{ on: gqlView == &quot;response&quot; }" @tap="gqlView = &quot;response&quot;">
+                            <text class="tab-label">Response</text>
+                        </view>
+                        <view class="tab" :class="{ on: gqlView == &quot;schema&quot; }" @tap="gqlView = &quot;schema&quot;">
+                            <text class="tab-label">Schema</text>
+                            <text class="badge" r-if="schema != none">{{ schema.types.length }}</text>
+                        </view>
+                    </view>
+                    <view class="schema" r-if="mode == &quot;rest&quot; && gql && gqlView == &quot;schema&quot;">
+                        <view class="schema-h">
+                            <view class="link" @tap="loadSchema()"><text class="link-t">{{ if schema == none { "Load the schema" } else { "Load again" } }}</text></view>
+                            <view class="hsearch grow"><input r-model="schemaQ" placeholder="Filter types and fields" /></view>
+                            <text class="count" r-if="schema != none">{{ shownTypes.length }} of {{ schema.types.length }}</text>
+                        </view>
+                        <text class="empty" r-if="schemaNote != &quot;&quot;">{{ schemaNote }}</text>
+                        <view class="gtype" r-for="t in shownTypes" r-key="t.name">
+                            <view class="gtype-h">
+                                <text class="gkind">{{ t.kind }}</text>
+                                <text class="gname">{{ t.name }}</text>
+                                <text class="groot" r-if="t.name == queryRoot || t.name == mutationRoot">{{ if t.name == queryRoot { "queries" } else { "mutations" } }}</text>
+                            </view>
+                            <text class="gdesc" r-if="t.description != &quot;&quot;">{{ t.description }}</text>
+                            <view class="gfield" r-for="f in t.fields">
+                                <text class="gf-n">{{ f.name }}</text>
+                                <text class="gf-a" r-if="f.args != &quot;&quot;">{{ f.args }}</text>
+                                <text class="gf-t">{{ f.ty }}</text>
+                            </view>
+                            <text class="gvals" r-if="t.values != &quot;&quot;">{{ t.values }}</text>
+                        </view>
+                    </view>
+                    <text class="empty" r-if="showRes && sel == none">Pick a request in History, or send one.</text>
+                    <view class="res-in" r-if="showRes && sel != none">
+                        <view class="res-h">
+                            <text class="res-id">#{{ sel.id }}</text>
+                            <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
+                            <text class="res-url">{{ sel.url }}</text>
+                            <view class="link" @tap="copySelCurl()"><text class="link-t">cURL</text></view>
+                            <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
+                            <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
+                        </view>
+                        <view class="chips">
+                            <text class="chip" :style="`color: ${statusColor(sel)}`">{{ statusText(sel) }}</text>
+                            <view class="chip link-chip" r-if="sel.rerunOf > 0" @tap="selected = sel.rerunOf">
+                                <text class="link-t">re-run of #{{ sel.rerunOf }}</text>
+                            </view>
+                            <text class="chip" r-if="sel.env != &quot;&quot;">env {{ sel.env }}</text>
+                            <text class="chip" r-if="sel.flow > 0">flow {{ sel.flow }}</text>
+                            <view class="chip link-chip" r-if="sel.bench > 0" @tap="showBench(sel.bench)">
+                                <text class="link-t">first of bench {{ sel.bench }}</text>
+                            </view>
+                            <text class="chip" r-if="sel.state == &quot;done&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
+                            <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
+                            <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
+                            <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
+                            <text class="chip">sent {{ when(sel.atMs) }}</text>
+                            </view>
+                            <view class="fall" r-if="sel.state == &quot;done&quot; && sel.dnsMs >= 0.0">
+                                <view class="fall-bar">
+                                    <view class="fall-seg" r-for="p in phases(sel)" :style="`flex-grow: ${p.ms}; background: ${p.color}`"></view>
+                                </view>
+                                <view class="fall-keys">
+                                    <view class="fall-key" r-for="p in phases(sel)">
+                                    <view class="fall-dot" :style="`background: ${p.color}`"></view>
+                                    <text class="fall-t">{{ p.name }} {{ ms(p.ms) }}</text>
+                                    </view>
+                                </view>
+                            </view>
+                            <view class="tabs">
+                                <view class="tab" :class="{ on: resTab == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
+                                    <text class="tab-label">Body</text>
+                                </view>
+                                <view class="tab" :class="{ on: resTab == &quot;headers&quot; }" @tap="resTab = &quot;headers&quot;">
+                                    <text class="tab-label">Headers</text>
+                                    <text class="badge">{{ sel.resHeaders.length }}</text>
+                                </view>
+                                <view class="tab" r-if="sel.results.length > 0" :class="{ on: resTab == &quot;checks&quot; }" @tap="resTab = &quot;checks&quot;">
+                                    <text class="tab-label">Checks</text>
+                                    <text class="badge" :class="{ bad: failedChecks(sel) > 0 }">{{ sel.results.length - failedChecks(sel) }}/{{ sel.results.length }}</text>
+                                </view>
+                            </view>
+                            <view class="pane">
+                            <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
+                            <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
+                            <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
+                            <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
+                            <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
+                            <view class="check" r-if="resTab == &quot;checks&quot;" r-for="c in sel.results">
+                                <text class="check-mark" :class="{ bad: !c.pass }">{{ if c.pass { "✓" } else { "✗" } }}</text>
+                                <text class="check-e">{{ c.expect }}</text>
+                                <text class="check-a">found {{ c.actual }}</text>
+                            </view>
+                            <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
+                                <text class="hdr-n">{{ h.name }}</text>
+                                <text class="hdr-v">{{ h.value }}</text>
+                            </view>
+                        </view>
+                    </view>
+                    <view class="bench" r-if="mode == &quot;bench&quot;">
+                        <view class="bench-form">
+                        <view class="bf"><text class="bf-l">Requests</text><view class="bf-in"><input r-model="bTotal" placeholder="none" /></view></view>
+                        <view class="bf"><text class="bf-l">At a time</text><view class="bf-in"><input r-model="bConc" placeholder="10" /></view></view>
+                        <view class="bf"><text class="bf-l">Seconds</text><view class="bf-in"><input r-model="bSecs" placeholder="no limit" /></view></view>
+                        <view class="bf"><text class="bf-l">Per second</text><view class="bf-in"><input r-model="bRate" placeholder="any" /></view></view>
+                        <view class="send" r-if="!benchRunning" :class="{ off: !connected }" @tap="runBench()">
+                            <text class="send-label">Run bench</text>
+                        </view>
+                        <view class="send stop" r-if="benchRunning" @tap="stopBench()">
+                            <text class="send-label">Stop</text>
+                        </view>
+                        </view>
+                        <text class="empty" r-if="bn == none">Sends the request above over and over: Requests in all, At a time in flight, for at most Seconds, no faster than Per second. Its first request goes to History with its waterfall; the rest are counted here.</text>
+                        <view class="bench-in" r-if="bn != none">
+                        <view class="res-h">
+                            <text class="res-id">bench {{ benchId }}</text>
+                            <text class="m" :style="`color: ${methodColor(benchMethod)}`">{{ benchMethod }}</text>
+                            <text class="res-url">{{ benchUrl }}</text>
+                        </view>
+                        <view class="chips">
+                            <text class="chip" :style="`color: ${benchColor()}`">{{ benchState() }}</text>
+                            <text class="chip">{{ benchPlan }}</text>
+                            <text class="chip" r-if="benchEnv != &quot;&quot;">env {{ benchEnv }}</text>
+                            <text class="chip">by {{ benchBy }}</text>
+                        </view>
+                        <view class="fall-bar">
+                            <view class="fall-seg" :style="`flex-grow: ${benchShare()}; background: #7c6cf0`"></view>
+                            <view class="fall-seg" :style="`flex-grow: ${1.0 - benchShare()}; background: #262626`"></view>
+                        </view>
+                        <view class="tiles">
+                            <view class="tile"><text class="tile-v">{{ bn.done }}</text><text class="tile-l">done</text></view>
+                            <view class="tile"><text class="tile-v">{{ bn.perSec.toFixed(1) }}</text><text class="tile-l">a second</text></view>
+                            <view class="tile"><text class="tile-v">{{ ms(bn.p50Ms) }}</text><text class="tile-l">p50</text></view>
+                            <view class="tile"><text class="tile-v">{{ ms(bn.p95Ms) }}</text><text class="tile-l">p95</text></view>
+                            <view class="tile"><text class="tile-v">{{ ms(bn.p99Ms) }}</text><text class="tile-l">p99</text></view>
+                            <view class="tile"><text class="tile-v">{{ ms(bn.maxMs) }}</text><text class="tile-l">max</text></view>
+                            <view class="tile"><text class="tile-v" :class="{ bad: bn.wrong > 0 }">{{ bn.wrong }}</text><text class="tile-l">wrong</text></view>
+                        </view>
+                        <view class="plots">
+                            <view class="plot-box">
+                            <text class="sub">Requests a second · top {{ rpsTop().round() }}</text>
+                            <view class="plot"><path class="line" :d="rpsPath()" /></view>
+                            </view>
+                            <view class="plot-box grow">
+                            <text class="sub">Latency · {{ bn.histogram.reduce((a, n) => a + n, 0) }} answers</text>
+                            <view class="hist">
+                                <view class="hcol" r-for="b in bars()">
+                                <text class="hn">{{ if b.n > 0 { `${b.n}` } else { "" } }}</text>
+                                <view class="hbar" :style="`height: ${b.h}px`"></view>
+                                <text class="hl">{{ b.label }}</text>
+                                </view>
+                            </view>
+                            </view>
+                        </view>
+                        <text class="mono" r-if="bn.statuses != &quot;&quot;">status {{ bn.statuses }}</text>
+                        <text class="mono err" r-for="x in bn.errors">no answer: {{ x }}</text>
+                        </view>
+                    </view>
+                </view>
+            </view>
         </view>
-        <view
-          class="cmd"
-          r-for="(c, i) in hits"
-          r-key="c.id"
-          :class="{ on: i == pick }"
-          @tap="run(c.id)">
-          <text class="cmd-label">{{ c.label }}</text>
-          <text class="cmd-hint">{{ c.hint }}</text>
+
+        <view class="status">
+            <text class="dot" :style="`color: ${linkColor()}`">●</text>
+            <text class="status-t">{{ linkText() }}</text>
+            <text class="status-t">env: {{ if envPick == NO_ENV { "none" } else { envPick } }}</text>
+            <text class="status-t dim">{{ tracer.link?.workspace ?? "" }}</text>
+            <text class="status-t right">{{ clients.length }} connected · event {{ lastSeq }}</text>
+            <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
+            <text class="status-t flow-t" r-if="lastBench != &quot;&quot;" :class="{ bad: !benchOk }" @tap="showBench(benchId)">{{ lastBench }}</text>
+            <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
+            <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
+                <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
+            </view>
+            <text class="status-t key">Ctrl+K</text>
         </view>
-        <text class="empty" r-if="hits.length == 0">No command matches</text>
-      </view>
-    </view>
-  </screen>
+
+        <view class="scrim" r-if="naming" @tap="naming = false">
+        <view class="palette" @tap="noop()">
+            <text class="prompt-h">Save as</text>
+            <view class="pal-field">
+                <input r-model="saveName" placeholder="folder/name, such as albums/get album" autofocus @key="nameKey(event)" />
+            </view>
+            <text class="prompt-hint">requests/{{ saveName }}.http · Enter saves · Esc cancels</text>
+        </view>
+        </view>
+
+        <view class="scrim" r-if="editingEnvs" @tap="editingEnvs = false">
+        <view class="envpanel" @tap="noop()">
+            <view class="envlist">
+            <text class="prompt-h">Environments</text>
+            <view
+                class="row"
+                r-for="e in envs"
+                r-key="e.name"
+                :class="{ on: e.name == editEnv }"
+                @tap="pickEnv(e.name)">
+                <text class="row-url">{{ e.name }}</text>
+            </view>
+            <view class="pal-field small">
+                <input r-model="newEnvName" placeholder="new environment, Enter" @key="newEnvKey(event)" />
+            </view>
+            </view>
+            <view class="envbody">
+            <text class="empty" r-if="editEnv == &quot;&quot;">Pick an environment, or name a new one.</text>
+            <view class="envbody-in" r-if="editEnv != &quot;&quot;">
+                <view class="envbody-h">
+                <text class="prompt-h">{{ editEnv }}</text>
+                <view class="link danger" @tap="deleteEnv()"><text class="link-t">Delete</text></view>
+                </view>
+                <text class="sub">Variables · environments/{{ editEnv }}.env</text>
+                <view class="var" r-for="v in draftVars" r-key="v.id">
+                <view class="vf name"><input r-model="v.name" placeholder="name" /></view>
+                <view class="vf grow"><input r-model="v.value" placeholder="value" /></view>
+                <view class="x" @tap="removeVar(v.id)"><text class="x-t">✕</text></view>
+                </view>
+                <view class="envbody-h">
+                <view class="link" @tap="addVar()"><text class="link-t">+ variable</text></view>
+                <view class="save" @tap="saveEnv()"><text class="save-t">Save variables</text></view>
+                </view>
+                <text class="sub">Secrets · kept out of git; values never shown or sent to clients</text>
+                <view class="var" r-for="name in editSecrets" r-key="name">
+                <text class="secret-n">{{ name }}</text>
+                <text class="secret-v">••••••</text>
+                <view class="x" @tap="removeSecret(name)"><text class="x-t">✕</text></view>
+                </view>
+                <view class="var">
+                <view class="vf name"><input r-model="secretName" placeholder="name" /></view>
+                <view class="vf grow"><input r-model="secretValue" placeholder="value (replaces one of that name)" /></view>
+                <view class="link" @tap="setSecret()"><text class="link-t">Set</text></view>
+                </view>
+            </view>
+            </view>
+        </view>
+        </view>
+
+        <view class="scrim" r-if="palette" @tap="closePalette()">
+        <view class="palette" @tap="noop()">
+            <view class="pal-field">
+            <input r-model="search" placeholder="Type a command…" autofocus @key="paletteKey(event)" />
+            </view>
+            <view
+            class="cmd"
+            r-for="(c, i) in hits"
+            r-key="c.id"
+            :class="{ on: i == pick }"
+            @tap="run(c.id)">
+            <text class="cmd-label">{{ c.label }}</text>
+            <text class="cmd-hint">{{ c.hint }}</text>
+            </view>
+            <text class="empty" r-if="hits.length == 0">No command matches</text>
+        </view>
+        </view>
+    </screen>
 </template>
 
 <style>
@@ -397,7 +439,14 @@
     background: #181818;
     border-right: 1px solid #262626;
   }
-  .logo { color: #7c6cf0; font-size: 18px; font-weight: 700; padding-bottom: 10px; }
+
+  .logo {
+    color: #7c6cf0;
+    font-size: 18px;
+    font-weight: 700;
+    padding-bottom: 10px;
+  }
+
   .rail-item { padding: 8px 6px; border-radius: 6px; }
   .rail-item.on { background: #2b2540; }
   .rail-label { color: #e0e0e0; font-size: 11px; font-weight: 700; }
@@ -410,16 +459,48 @@
   }
 
   /* Drag handles: a wide target with a thin line, lit while hovered. */
-  .split-v { display: flex; justify-content: center; width: 7px; flex-shrink: 0; cursor: col-resize; }
+  .split-v {
+    display: flex;
+    justify-content: center;
+    width: 7px;
+    flex-shrink: 0;
+    cursor: col-resize;
+  }
+
   .grip-v { width: 1px; background: #262626; }
   .split-v:hover .grip-v { width: 3px; background: #7c6cf0; }
-  .split-h { display: flex; flex-direction: column; justify-content: center; height: 9px; flex-shrink: 0; cursor: row-resize; }
+
+  .split-h {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    height: 9px;
+    flex-shrink: 0;
+    cursor: row-resize;
+  }
+
   .grip-h { height: 1px; background: #262626; }
   .split-h:hover .grip-h { height: 3px; background: #7c6cf0; }
-  .side-h { display: flex; align-items: center; gap: 8px; padding: 14px 14px 10px 14px; }
+
+  .side-h {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 14px 10px 14px;
+  }
+
   .side-title { color: #f0f0f0; font-size: 13px; font-weight: 700; }
-  .count { color: #8a8a8a; font-size: 11px; padding: 1px 6px; background: #262626; border-radius: 8px; }
+
+  .count {
+    color: #8a8a8a;
+    font-size: 11px;
+    padding: 1px 6px;
+    background: #262626;
+    border-radius: 8px;
+  }
+
   .side-h.second { border-top: 1px solid #262626; }
+
   .env {
     display: flex;
     align-items: center;
@@ -430,11 +511,19 @@
     border: 1px solid #2e2e2e;
     border-radius: 6px;
   }
-  .env-row { display: flex; align-items: center; gap: 6px; margin: 12px 10px 2px 10px; }
+
+  .env-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 12px 10px 2px 10px;
+  }
+
   .env-row .env { flex: 1; margin: 0; }
   .gear { padding: 4px 8px; border-radius: 6px; cursor: pointer; }
   .gear:hover { background: #2b2540; }
   .gear-t { color: #9d8ff5; font-size: 16px; }
+
   .envpanel {
     display: flex;
     width: 760px;
@@ -443,14 +532,41 @@
     border: 1px solid #333333;
     border-radius: 10px;
   }
-  .envlist { display: flex; flex-direction: column; gap: 2px; width: 200px; padding: 12px; border-right: 1px solid #2e2e2e; overflow-y: auto; }
-  .envbody { flex: 1; display: flex; flex-direction: column; padding: 12px 16px; overflow-y: auto; }
+
+  .envlist {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 200px;
+    padding: 12px;
+    border-right: 1px solid #2e2e2e;
+    overflow-y: auto;
+  }
+
+  .envbody {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 12px 16px;
+    overflow-y: auto;
+  }
+
   .envbody-in { display: flex; flex-direction: column; gap: 6px; }
   .envbody-h { display: flex; align-items: center; gap: 8px; }
   .envbody-h .save { margin-left: auto; }
   .sub { color: #7a7a7a; font-size: 11px; padding-top: 10px; }
   .var { display: flex; align-items: center; gap: 6px; }
-  .vf { display: flex; align-items: center; height: 30px; padding: 0 8px; background: #141414; border: 1px solid #2e2e2e; border-radius: 5px; }
+
+  .vf {
+    display: flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 8px;
+    background: #141414;
+    border: 1px solid #2e2e2e;
+    border-radius: 5px;
+  }
+
   .vf.name { width: 160px; }
   .vf.grow { flex: 1; min-width: 0; }
   .x { padding: 2px 6px; border-radius: 4px; cursor: pointer; }
@@ -461,38 +577,143 @@
   .link-t { color: #9d8ff5; font-size: 12px; font-weight: 700; }
   .link.danger { margin-left: auto; }
   .link.danger .link-t { color: #f0716c; }
-  .secret-n { width: 176px; color: #d4d4d4; font-size: 12px; font-family: monospace; }
-  .secret-v { flex: 1; color: #7a7a7a; font-size: 12px; font-family: monospace; }
+
+  .secret-n {
+    width: 176px;
+    color: #d4d4d4;
+    font-size: 12px;
+    font-family: monospace;
+  }
+
+  .secret-v {
+    flex: 1;
+    color: #7a7a7a;
+    font-size: 12px;
+    font-family: monospace;
+  }
+
   .pal-field.small { height: 30px; margin-top: 8px; }
-  .env-tag { color: #9d8ff5; font-size: 10px; padding: 0 5px; border: 1px solid #3a3550; border-radius: 4px; }
-  .side-add { margin-left: auto; padding: 0 8px; border-radius: 4px; cursor: pointer; }
+
+  .env-tag {
+    color: #9d8ff5;
+    font-size: 10px;
+    padding: 0 5px;
+    border: 1px solid #3a3550;
+    border-radius: 4px;
+  }
+
+  .side-add {
+    margin-left: auto;
+    padding: 0 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
   .side-add:hover { background: #2b2540; }
   .side-add-t { color: #9d8ff5; font-size: 16px; font-weight: 700; }
-  .list { flex: 1; display: flex; flex-direction: column; gap: 2px; padding: 0 8px 8px 8px; overflow-y: auto; }
+
+  .list {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 8px 8px 8px;
+    overflow-y: auto;
+  }
+
   .empty { color: #6a6a6a; font-size: 12px; padding: 8px; }
   .empty.warn { color: #e8a54b; font-family: monospace; font-size: 11px; }
 
-  .row { display: flex; flex-direction: column; gap: 3px; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+  .row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 7px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
   .row:hover { background: #232323; }
   .row.on { background: #2b2540; }
   .row-top { display: flex; gap: 8px; }
   .row-bottom { display: flex; gap: 8px; }
-  .m { font-size: 11px; font-weight: 700; font-family: monospace; width: 64px; }
-  .row-url { flex: 1; color: #d4d4d4; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .m {
+    font-size: 11px;
+    font-weight: 700;
+    font-family: monospace;
+    width: 64px;
+  }
+
+  .row-url {
+    flex: 1;
+    color: #d4d4d4;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .st { font-size: 11px; font-family: monospace; width: 64px; }
-  .who { color: #7a7a7a; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-  .work { flex: 1; display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; min-width: 0; }
+  .who {
+    color: #7a7a7a;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
-  .title { display: flex; gap: 8px; align-items: center; min-height: 26px; }
-  .title-t { color: #e0e0e0; font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .work {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px 18px;
+    min-width: 0;
+  }
+
+  .title {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    min-height: 26px;
+  }
+
+  .title-t {
+    color: #e0e0e0;
+    font-size: 13px;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .title-t.unsaved { color: #8a8a8a; font-weight: 400; }
   .dirty { color: #e8a54b; font-size: 10px; }
-  .notice { flex: 1; min-width: 0; color: #e8a54b; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .save { margin-left: auto; padding: 4px 14px; border: 1px solid #3a3550; border-radius: 6px; cursor: pointer; }
+
+  .notice {
+    flex: 1;
+    min-width: 0;
+    color: #e8a54b;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .save {
+    margin-left: auto;
+    padding: 4px 14px;
+    border: 1px solid #3a3550;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
   .save:hover { background: #2b2540; }
   .save-t { color: #c8c0f8; font-size: 12px; font-weight: 700; }
   .bar { display: flex; gap: 8px; align-items: center; }
+
   .method, .url {
     display: flex;
     align-items: center;
@@ -502,37 +723,116 @@
     border: 1px solid #2e2e2e;
     border-radius: 6px;
   }
+
   .method { width: 120px; }
   .url { flex: 1; min-width: 0; }
-  .send { padding: 9px 26px; background: #7c6cf0; border-radius: 6px; cursor: pointer; }
+
+  .send {
+    padding: 9px 26px;
+    background: #7c6cf0;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
   .send:hover { background: #8f81f5; }
   .send.off { background: #3a3550; }
   .send.stop { background: #8a3a38; }
   .send.stop:hover { background: #a04542; }
   .send-label { color: #ffffff; font-size: 14px; font-weight: 700; }
 
-  .preview { display: flex; gap: 10px; align-items: center; margin-top: -4px; padding: 0 2px; }
-  .preview-t { flex: 1; min-width: 0; color: #8a8a8a; font-size: 12px; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .preview {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-top: -4px;
+    padding: 0 2px;
+  }
+
+  .preview-t {
+    flex: 1;
+    min-width: 0;
+    color: #8a8a8a;
+    font-size: 12px;
+    font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .preview-warn { color: #e8a54b; font-size: 11px; white-space: nowrap; }
   .tabs { display: flex; gap: 18px; border-bottom: 1px solid #262626; }
-  .tab { display: flex; gap: 6px; align-items: center; padding: 6px 0; cursor: pointer; border-bottom: 2px solid #141414; }
+
+  .tab {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 6px 0;
+    cursor: pointer;
+    border-bottom: 2px solid #141414;
+  }
+
   .tab.on { border-bottom: 2px solid #7c6cf0; }
   .tab-label { color: #9a9a9a; font-size: 13px; }
   .tab.on .tab-label { color: #f0f0f0; }
-  .badge { color: #9a9a9a; font-size: 10px; padding: 0 5px; background: #262626; border-radius: 6px; }
 
-  .editor { flex-shrink: 0; display: flex; flex-direction: column; padding: 8px 10px; background: #1b1b1b; border: 1px solid #2e2e2e; border-radius: 6px; }
+  .badge {
+    color: #9a9a9a;
+    font-size: 10px;
+    padding: 0 5px;
+    background: #262626;
+    border-radius: 6px;
+  }
+
+  .editor {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 8px 10px;
+    background: #1b1b1b;
+    border: 1px solid #2e2e2e;
+    border-radius: 6px;
+  }
+
   .error { color: #f0716c; font-size: 12px; font-family: monospace; }
 
-  .res { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-  .res-in { flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .res {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .res-in {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+  }
+
   .res-h { display: flex; gap: 8px; align-items: center; }
-  .res-url { flex: 1; min-width: 0; color: #c8c8c8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .res-url {
+    flex: 1;
+    min-width: 0;
+    color: #c8c8c8;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .res-id { color: #7a7a7a; font-size: 11px; font-family: monospace; }
   .link-chip { cursor: pointer; padding: 2px 9px; }
   .link-chip:hover { background: #2b2540; }
 
-  .hfilter { display: flex; flex-direction: column; gap: 6px; padding: 0 10px 8px 10px; }
+  .hfilter {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 10px 8px 10px;
+  }
+
   .hsearch, .hpick {
     display: flex;
     align-items: center;
@@ -542,27 +842,65 @@
     border: 1px solid #2e2e2e;
     border-radius: 5px;
   }
+
   .hpicks { display: flex; gap: 6px; }
   .hpick { flex: 1; min-width: 0; }
   .clear-t { color: #9d8ff5; font-size: 11px; }
   .again { color: #7a7a7a; font-size: 10px; font-family: monospace; }
-  .when { margin-left: auto; color: #6a6a6a; font-size: 10px; font-family: monospace; white-space: nowrap; }
+
+  .when {
+    margin-left: auto;
+    color: #6a6a6a;
+    font-size: 10px;
+    font-family: monospace;
+    white-space: nowrap;
+  }
+
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
   .check { display: flex; gap: 10px; align-items: baseline; }
-  .check-mark { width: 14px; color: #4ec98f; font-size: 12px; font-family: monospace; }
+
+  .check-mark {
+    width: 14px;
+    color: #4ec98f;
+    font-size: 12px;
+    font-family: monospace;
+  }
+
   .check-mark.bad { color: #f0716c; }
   .check-e { color: #d4d4d4; font-size: 12px; font-family: monospace; }
-  .check-a { flex: 1; min-width: 0; color: #7a7a7a; font-size: 12px; font-family: monospace; }
-  .badge.bad { color: #f0716c; }
 
+  .check-a {
+    flex: 1;
+    min-width: 0;
+    color: #7a7a7a;
+    font-size: 12px;
+    font-family: monospace;
+  }
+
+  .badge.bad { color: #f0716c; }
   .fall { display: flex; flex-direction: column; gap: 6px; }
-  .fall-bar { display: flex; gap: 1px; height: 8px; border-radius: 2px; overflow: hidden; }
+
+  .fall-bar {
+    display: flex;
+    gap: 1px;
+    height: 8px;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
   .fall-seg { flex-basis: 0; flex-shrink: 1; min-width: 2px; }
   .fall-keys { display: flex; flex-wrap: wrap; gap: 4px 14px; }
   .fall-key { display: flex; align-items: center; gap: 5px; }
   .fall-dot { width: 8px; height: 8px; border-radius: 2px; }
   .fall-t { color: #9a9a9a; font-size: 11px; font-family: monospace; }
-  .chip { padding: 3px 9px; border: 1px solid #333333; border-radius: 4px; font-size: 12px; color: #c8c8c8; }
+
+  .chip {
+    padding: 3px 9px;
+    border: 1px solid #333333;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #c8c8c8;
+  }
 
   .pane {
     flex: 1;
@@ -575,24 +913,89 @@
     border-radius: 6px;
     overflow-y: auto;
   }
-  .mono { color: #d4d4d4; font-size: 12px; font-family: monospace; white-space: pre-wrap; }
+
+  .mono {
+    color: #d4d4d4;
+    font-size: 12px;
+    font-family: monospace;
+    white-space: pre-wrap;
+  }
+
   .mono.err { color: #f0716c; }
   .dim { color: #6a6a6a; }
   .hdr { display: flex; gap: 12px; }
-  .hdr-n { color: #9d8ff5; font-size: 12px; font-family: monospace; width: 220px; }
-  .hdr-v { flex: 1; color: #d4d4d4; font-size: 12px; font-family: monospace; }
 
-  .ask { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; background: #2a2416; border: 1px solid #6b5426; border-radius: 8px; }
+  .hdr-n {
+    color: #9d8ff5;
+    font-size: 12px;
+    font-family: monospace;
+    width: 220px;
+  }
+
+  .hdr-v {
+    flex: 1;
+    color: #d4d4d4;
+    font-size: 12px;
+    font-family: monospace;
+  }
+
+  .ask {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    background: #2a2416;
+    border: 1px solid #6b5426;
+    border-radius: 8px;
+  }
+
   .ask-top, .ask-bottom { display: flex; gap: 8px; align-items: center; }
-  .ask-who { color: #f0d9a8; font-size: 12px; font-weight: 700; white-space: nowrap; }
-  .ask-url { flex: 1; min-width: 0; color: #e0e0e0; font-size: 12px; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ask-why { flex: 1; min-width: 0; color: #c8b48a; font-size: 11px; }
+
+  .ask-who {
+    color: #f0d9a8;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .ask-url {
+    flex: 1;
+    min-width: 0;
+    color: #e0e0e0;
+    font-size: 12px;
+    font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ask-why {
+    flex: 1;
+    min-width: 0;
+    color: #c8b48a;
+    font-size: 11px;
+  }
+
   .danger-l .link-t { color: #f0716c; }
-  .allow { padding: 4px 16px; background: #3d8f63; border-radius: 6px; cursor: pointer; }
+
+  .allow {
+    padding: 4px 16px;
+    background: #3d8f63;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
   .allow:hover { background: #47a572; }
   .allow-t { color: #ffffff; font-size: 12px; font-weight: 700; }
   .warn-t { color: #e8a54b; }
-  .agents { padding: 1px 8px; border: 1px solid #2e5a43; border-radius: 4px; cursor: pointer; }
+
+  .agents {
+    padding: 1px 8px;
+    border: 1px solid #2e5a43;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
   .agents-t { color: #4ec98f; font-size: 11px; }
   .agents.off { border: 1px solid #6b2a28; background: #3a1d1c; }
   .agents.off .agents-t { color: #f0716c; }
@@ -606,8 +1009,15 @@
     background: #181818;
     border-top: 1px solid #262626;
   }
+
   .dot { font-size: 10px; }
-  .status-t.key { color: #8a8a8a; padding: 1px 6px; background: #262626; border-radius: 4px; }
+
+  .status-t.key {
+    color: #8a8a8a;
+    padding: 1px 6px;
+    background: #262626;
+    border-radius: 4px;
+  }
 
   .scrim {
     position: absolute;
@@ -621,6 +1031,7 @@
     padding-top: 90px;
     background: rgba(0, 0, 0, 0.5);
   }
+
   .palette {
     display: flex;
     flex-direction: column;
@@ -633,40 +1044,186 @@
     border: 1px solid #333333;
     border-radius: 10px;
   }
-  .pal-field { display: flex; align-items: center; height: 38px; padding: 0 10px; margin-bottom: 6px; background: #141414; border: 1px solid #2e2e2e; border-radius: 6px; }
-  .cmd { display: flex; align-items: center; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+
+  .pal-field {
+    display: flex;
+    align-items: center;
+    height: 38px;
+    padding: 0 10px;
+    margin-bottom: 6px;
+    background: #141414;
+    border: 1px solid #2e2e2e;
+    border-radius: 6px;
+  }
+
+  .cmd {
+    display: flex;
+    align-items: center;
+    padding: 8px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
   .cmd:hover { background: #262626; }
   .cmd.on { background: #2b2540; }
   .cmd-label { flex: 1; color: #d4d4d4; font-size: 13px; }
   .cmd-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; }
-  .prompt-h { color: #f0f0f0; font-size: 13px; font-weight: 700; padding: 2px 4px 8px 4px; }
-  .prompt-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; padding: 2px 4px; }
+
+  .prompt-h {
+    color: #f0f0f0;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 2px 4px 8px 4px;
+  }
+
+  .prompt-hint {
+    color: #7a7a7a;
+    font-size: 11px;
+    font-family: monospace;
+    padding: 2px 4px;
+  }
+
   .status-t { color: #b0b0b0; font-size: 11px; white-space: nowrap; }
-  .status-t.flow-t { min-width: 0; color: #4ec98f; overflow: hidden; text-overflow: ellipsis; }
+
+  .status-t.flow-t {
+    min-width: 0;
+    color: #4ec98f;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .status-t.flow-t.bad { color: #f0716c; }
-  .bench { display: flex; flex-direction: column; gap: 10px; padding-top: 6px; }
+
+  .bench {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 6px;
+  }
+
   .bench-form { display: flex; gap: 8px; align-items: flex-end; }
-  .bf { display: flex; flex-direction: column; gap: 4px; width: 110px; }
+
+  .bf {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 110px;
+  }
+
   .bf-l { color: #7a7a7a; font-size: 11px; }
-  .bf-in { height: 34px; background: #1e1e1e; border: 1px solid #2e2e2e; border-radius: 6px; padding: 0 8px; }
+
+  .bf-in {
+    height: 34px;
+    background: #1e1e1e;
+    border: 1px solid #2e2e2e;
+    border-radius: 6px;
+    padding: 0 8px;
+  }
+
   .bench-in { display: flex; flex-direction: column; gap: 10px; }
   .tiles { display: flex; gap: 8px; flex-wrap: wrap; }
-  .tile { display: flex; flex-direction: column; gap: 2px; min-width: 84px; padding: 8px 10px; background: #1a1a1a; border: 1px solid #262626; border-radius: 6px; }
-  .tile-v { color: #f0f0f0; font-size: 16px; font-weight: 700; font-family: monospace; white-space: nowrap; }
+
+  .tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 84px;
+    padding: 8px 10px;
+    background: #1a1a1a;
+    border: 1px solid #262626;
+    border-radius: 6px;
+  }
+
+  .tile-v {
+    color: #f0f0f0;
+    font-size: 16px;
+    font-weight: 700;
+    font-family: monospace;
+    white-space: nowrap;
+  }
+
   .tile-v.bad { color: #f0716c; }
   .tile-l { color: #7a7a7a; font-size: 11px; }
   .plots { display: flex; gap: 12px; flex-wrap: wrap; }
   .plot-box { display: flex; flex-direction: column; gap: 4px; }
   .plot-box.grow { flex: 1; min-width: 320px; }
-  .plot { width: 360px; height: 100px; background: #0e0e0e; border: 1px solid #262626; border-radius: 6px; }
-  .line { stroke: #4ec98f; stroke-width: 2px; stroke-linejoin: round; fill: none; }
-  .hist { display: flex; align-items: flex-end; gap: 3px; height: 100px; padding: 4px 6px 0 6px; background: #0e0e0e; border: 1px solid #262626; border-radius: 6px; }
-  .hcol { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 2px; min-width: 0; }
+
+  .plot {
+    width: 360px;
+    height: 100px;
+    background: #0e0e0e;
+    border: 1px solid #262626;
+    border-radius: 6px;
+  }
+
+  .line {
+    stroke: #4ec98f;
+    stroke-width: 2px;
+    stroke-linejoin: round;
+    fill: none;
+  }
+
+  .hist {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 100px;
+    padding: 4px 6px 0 6px;
+    background: #0e0e0e;
+    border: 1px solid #262626;
+    border-radius: 6px;
+  }
+
+  .hcol {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+    min-width: 0;
+  }
+
   .hbar { width: 100%; background: #7c6cf0; border-radius: 2px 2px 0 0; }
   .hn { color: #b0b0b0; font-size: 9px; font-family: monospace; }
-  .hl { color: #6a6a6a; font-size: 9px; font-family: monospace; white-space: nowrap; }
-  .status-t.policy-bad { min-width: 0; color: #f0716c; overflow: hidden; text-overflow: ellipsis; }
-  .status-t.dim { flex: 1; min-width: 0; color: #6a6a6a; overflow: hidden; text-overflow: ellipsis; }
+
+  .hl {
+    color: #6a6a6a;
+    font-size: 9px;
+    font-family: monospace;
+    white-space: nowrap;
+  }
+
+  .gql-m { display: flex; align-items: center; padding: 0 14px; }
+  .gql-t { color: #e535ab; font-size: 14px; font-weight: 700; }
+  .schema { display: flex; flex-direction: column; gap: 10px; padding-top: 6px; }
+  .schema-h { display: flex; gap: 10px; align-items: center; }
+  .hsearch.grow { flex: 1; }
+  .gtype { display: flex; flex-direction: column; gap: 3px; padding: 8px 10px; background: #1a1a1a; border: 1px solid #262626; border-radius: 6px; }
+  .gtype-h { display: flex; gap: 8px; align-items: baseline; }
+  .gkind { color: #7a7a7a; font-size: 11px; font-family: monospace; }
+  .gname { color: #e535ab; font-size: 13px; font-weight: 700; font-family: monospace; }
+  .groot { color: #4ec98f; font-size: 11px; }
+  .gdesc { color: #8a8a8a; font-size: 11px; }
+  .gfield { display: flex; gap: 6px; padding-left: 12px; }
+  .gf-n { color: #d4d4d4; font-size: 12px; font-family: monospace; }
+  .gf-a { color: #7a7a7a; font-size: 12px; font-family: monospace; }
+  .gf-t { color: #79b8ff; font-size: 12px; font-family: monospace; }
+  .gvals { color: #b0b0b0; font-size: 12px; font-family: monospace; padding-left: 12px; }
+  .status-t.policy-bad {
+    min-width: 0;
+    color: #f0716c;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .status-t.dim {
+    flex: 1;
+    min-width: 0;
+    color: #6a6a6a;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 </style>
 
 <script>
@@ -678,6 +1235,8 @@
   use type native::tracer::Var;
   use type native::tracer::Check;
   use type native::tracer::BenchNow;
+  use type native::tracer::GSchema;
+  use type native::tracer::GType;
 
   // One request as the core described it: started, then finished or failed.
   type Row = {
@@ -726,7 +1285,7 @@
   let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
   let method = signal("GET");
   let url = signal("https://jsonplaceholder.typicode.com/todos/1");
-  let body = signal("");
+    let body = signal("");
   let headerText = signal("Accept: application/json");
   // Expectations, one a line; saved as `# @expect` lines.
   let checksText = signal("");
@@ -759,6 +1318,9 @@
     { id: "bench-stop", label: "Stop the bench on show", hint: "" },
     { id: "mode:bench", label: "Show the bench", hint: "" },
     { id: "mode:rest", label: "Show responses", hint: "" },
+    { id: "graphql", label: "Make the request GraphQL", hint: "" },
+    { id: "rest", label: "Make the request REST", hint: "" },
+    { id: "schema", label: "Load the GraphQL server's schema", hint: "" },
     { id: "curl-editor", label: "Copy the request being edited as cURL", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
@@ -823,6 +1385,18 @@
 
   // What the work area shows under the editor: responses, or the bench.
   let mode = signal("rest");
+
+  // A GraphQL request is method GRAPHQL, its body the query and then, after
+  // a blank line, its variables; they're edited apart and joined here.
+  let gqlQuery = signal("");
+  let gqlVars = signal("");
+  // Under a GraphQL request: its response, or the server's schema.
+  let gqlView = signal("response");
+  let schema: GSchema? = signal(none);
+  let schemaQ = signal("");
+  let schemaNote = signal("");
+  // The introspection request whose answer becomes the schema, or 0.
+  let schemaFor = signal(0);
   // The next bench's plan, as typed; blank is no limit.
   let bTotal = signal("200");
   let bConc = signal("10");
@@ -862,6 +1436,11 @@
   let hStatus = signal(ANY_STATUS);
 
   computed connected = (tracer.link?.state ?? "") == "connected";
+  computed gql = method == "GRAPHQL";
+  computed showRes = mode == "rest" && !(gql && gqlView == "schema");
+  computed queryRoot = schema?.query ?? "";
+  computed mutationRoot = schema?.mutation ?? "";
+  computed shownTypes =if schema == none { [] } else { schema.types.filter(t => typeMatches(t, schemaQ.trim().toLowerCase())) };
   computed history = requests.sort((a, b) => b.id - a.id);
   // Agents' requests waiting for this person, oldest first.
   computed waiting = requests.filter(r => r.state == "approval");
@@ -1016,6 +1595,14 @@
         policyError = e.error;
       } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {
         requests = requests.map(r => if r.id == e.requestId { settle(r, e) } else { r });
+        if e.requestId == schemaFor {
+          if e.kind == "request_finished" {
+            readSchema(e.requestId);
+          } else {
+            schemaFor = 0;
+            schemaNote = if e.kind == "request_failed" { `no schema: ${e.error}` } else { "cancelled" };
+          }
+        }
       } else if e.kind == "client_joined" {
         clients.push({ client: e.client, actor: e.actor, actorKind: e.actorKind });
       } else if e.kind == "client_left" {
@@ -1074,10 +1661,90 @@
     }
   }
 
+  // The query and variables, edited apart, are the body.
+  effect {
+    let q = gqlQuery;
+    let v = gqlVars;
+    if method == "GRAPHQL" { body = joinGql(q, v); }
+  }
+
+  fn joinGql(q: string, v: string): string {
+    // Not a template string: one keeps `\n` as written (AW-040).
+    if v.trim() == "" { q.trimEnd() } else { q.trimEnd() + "\n\n" + v.trim() }
+  }
+
+  // A GraphQL body as [query, variables]: the variables are the last
+  // paragraph, if it's a JSON object (a query that starts with `{` isn't JSON).
+  fn gqlParts(b: string): string[] {
+    let all = b.trimEnd();
+    let at = all.lastIndexOf("\n\n");
+    if at < 0 { return [all, ""]; }
+    let rest = all.slice(at).trim();
+    if !rest.startsWith("{") { return [all, ""]; }
+    let json = true;
+    try {
+      JSON.parse(rest);
+    } catch e {
+      json = false;
+    }
+    if json { [all.slice(0, at).trimEnd(), rest] } else { [all, ""] }
+  }
+
+  fn splitGql(b: string) {
+    let p = gqlParts(b);
+    gqlQuery = p[0];
+    gqlVars = p[1];
+  }
+
+  fn toGraphql() {
+    mode = "rest";
+    if gql { return; }
+    method = "GRAPHQL";
+    splitGql(body);
+    reqTab = "query";
+  }
+
+  fn toRest() {
+    mode = "rest";
+    if !gql { return; }
+    method = "POST";
+    reqTab = "body";
+  }
+
+  // Ask the server in the URL bar for its schema: an ordinary request,
+  // which then shows in History; its answer is read when it comes.
+  fn loadSchema() {
+    if url.trim() == "" {
+      schemaNote = "put the server's URL in the bar first";
+      return;
+    }
+    try {
+      let env = if envPick == NO_ENV { "" } else { envPick };
+      schemaFor = tracer.send("GRAPHQL", url, sentHeaders(), tracer.introspection(), env, "");
+      schemaNote = `asking for the schema (#${schemaFor})…`;
+    } catch e {
+      schemaNote = e.message;
+    }
+  }
+
+  fn readSchema(id: int) {
+    schemaFor = 0;
+    try {
+      schema = tracer.graphqlSchema(id);
+      schemaNote = "";
+    } catch e {
+      schemaNote = e.message;
+    }
+  }
+
+  fn typeMatches(t: GType, q: string): bool {
+    q == "" || t.name.toLowerCase().includes(q) || t.fields.some(f => f.name.toLowerCase().includes(q))
+  }
+
   // Whether the editor holds exactly `s`.
   fn sameAs(s: Saved): bool {
-    method == s.method && url.trim() == s.url && body == s.body && headerLines(sentHeaders()) == headerLines(s.headers)
-      && checksText.trim() == s.checks.trim()
+    method == s.method && url.trim() == s.url && (body == s.body || (gql && body == normGql(s.body))) && headerLines(sentHeaders()) == headerLines(s.headers)
+    && checksText.trim() == s.checks.trim()
   }
 
   fn load(s: Saved) {
@@ -1086,6 +1753,26 @@
     body = s.body;
     headerText = headerLines(s.headers);
     checksText = s.checks;
+    afterLoad();
+  }
+
+  // A request just put in the editor: a GraphQL one is split for editing,
+  // and the tabs are the ones its kind has. `method`, not `gql`: a computed
+  // read in the handler that set its input is still the old value (AW-038).
+  fn afterLoad() {
+    if method == "GRAPHQL" {
+      splitGql(body);
+      if reqTab == "body" { reqTab = "query"; }
+      mode = "rest";
+    } else if reqTab == "query" || reqTab == "vars" {
+      reqTab = "body";
+    }
+  }
+
+  // A saved GraphQL body as the editor would join it.
+  fn normGql(b: string): string {
+    let p = gqlParts(b);
+    joinGql(p[0], p[1])
   }
 
   fn fillVars(text: string): string {
@@ -1114,6 +1801,7 @@
   // A shell command that sends the request, its variables filled in from
   // `envName`; secrets stay `{{name}}` for whoever runs it to fill.
   fn curlOf(m: string, u: string, headers: Header[], b: string, envName: string): string {
+    if m == "GRAPHQL" { return gqlCurl(u, headers, b, envName); }
     let parts = ["curl"];
     if m != "GET" { parts.push(`-X ${m}`); }
     parts.push(shellQuote(fillIn(u.trim(), envName, "")));
@@ -1122,6 +1810,22 @@
     }
     if b != "" { parts.push(`--data-raw ${shellQuote(fillIn(b, envName, ""))}`); }
     parts.join(" ")
+  }
+
+  // A GraphQL request as the JSON POST the core sends.
+  fn gqlCurl(u: string, headers: Header[], b: string, envName: string): string {
+    let p = gqlParts(b);
+    let payload = if p[1] == "" {
+      JSON.stringify({ query: p[0] })
+    } else {
+      `{"query":${JSON.stringify(p[0])},"variables":${p[1]}}`
+    };
+    let all = if headers.some(h => h.name.toLowerCase() == "content-type") {
+      headers
+    } else {
+      [...headers, { name: "Content-Type", value: "application/json" }]
+    };
+    curlOf("POST", u, all, payload, envName)
   }
 
   // In single quotes for a POSIX shell: each ' becomes '"'"'.
@@ -1609,6 +2313,7 @@
     body = r.reqBody;
     headerText = headerLines(r.reqHeaders);
     checksText = r.reqChecks;
+    afterLoad();
     notice = `from #${r.id}`;
     if r.env == "" {
       envPick = NO_ENV;
@@ -1673,7 +2378,9 @@
     if r.body == "" {
       "(empty body)"
     } else if r.body.length < r.size {
-      `${r.body}\n\n… showing the first 64 KiB of ${size(r.size)}`
+      // A plain string for the newlines: a template string keeps `\n` as
+      // written (AW-040).
+      r.body + "\n\n" + `… showing the first 64 KiB of ${size(r.size)}`
     } else {
       r.body
     }
@@ -1826,6 +2533,14 @@
       runBench();
     } else if id == "bench-stop" {
       stopBench();
+    } else if id == "graphql" {
+      toGraphql();
+    } else if id == "rest" {
+      toRest();
+    } else if id == "schema" {
+      toGraphql();
+      gqlView = "schema";
+      loadSchema();
     } else if id == "mode:bench" {
       mode = "bench";
     } else if id == "mode:rest" {

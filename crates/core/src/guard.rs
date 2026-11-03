@@ -24,10 +24,17 @@ const SAFE_METHODS: [&str; 3] = ["GET", "HEAD", "OPTIONS"];
 /// `bench` if it is, needs a person to allow it, if it does.
 pub fn needs_approval(rules: &AgentRules, request: &HttpRequest, env: Option<&str>, bench: Option<&BenchPlan>) -> Option<String> {
     let method = request.method.to_ascii_uppercase();
+    // A GraphQL query reads; a mutation writes.
+    let writes = if crate::graphql::is_graphql(request) {
+        crate::graphql::is_write(request.body.as_deref().unwrap_or(""))
+    } else {
+        !SAFE_METHODS.contains(&method.as_str())
+    };
+    let method = if crate::graphql::is_graphql(request) && writes { "GraphQL mutation".to_string() } else { method };
     let reason = if rules.approve.contains(&ApproveWhen::All) {
         Some(format!("{method} from an agent whose every request is approved"))
     } else {
-        let unsafe_method = rules.approve.contains(&ApproveWhen::Writes) && !SAFE_METHODS.contains(&method.as_str());
+        let unsafe_method = rules.approve.contains(&ApproveWhen::Writes) && writes;
         let prod = env.filter(|e| rules.approve.contains(&ApproveWhen::Prod) && is_production(e));
         match (unsafe_method, prod) {
             (true, Some(env)) => Some(format!("{method} from an agent, with environment {env}")),
@@ -140,6 +147,7 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::Response { .. }
             | Command::Policy
             | Command::Diff { .. }
+            | Command::GraphqlSchema { .. }
             | Command::Status
     );
     if reads {
@@ -214,6 +222,14 @@ mod tests {
             assert!(outside_rules(&local, &to(url)).is_some(), "{url}");
         }
         assert_eq!(outside_rules(&rules(""), &to("https://example.com/")), None);
+    }
+
+    #[test]
+    fn a_graphql_query_reads_and_a_mutation_asks() {
+        let gql = |body: &str| HttpRequest { body: Some(body.into()), ..request("GRAPHQL") };
+        assert_eq!(needs_approval(&rules(""), &gql("{ users { id } }"), None, None), None);
+        let asked = needs_approval(&rules(""), &gql("mutation { del(id: 1) }"), None, None);
+        assert_eq!(asked.as_deref(), Some("GraphQL mutation from an agent"));
     }
 
     #[test]

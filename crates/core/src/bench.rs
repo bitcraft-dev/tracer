@@ -20,7 +20,7 @@ use tracer_protocol::{Access, Actor, BenchPlan, BenchStats, CheckResult, HttpReq
 
 use crate::conn::{run_one, Ran};
 use crate::hub::Hub;
-use crate::{envs, expect, guard, http};
+use crate::{envs, graphql, guard, http};
 
 /// How often a running bench tells how it's going.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
@@ -77,7 +77,7 @@ fn run(
     let deadline = plan.duration_secs.map(|s| started + Duration::from_secs(s));
     // The number of the next request to send; the first has gone.
     let next = Arc::new(AtomicU64::new(1));
-    let shared = Arc::new(Worker { sending, secrets, expect: request.expect.clone(), total, deadline, rate: plan.rate, started });
+    let shared = Arc::new(Worker { sending, secrets, written: request.clone(), total, deadline, rate: plan.rate, started });
     let workers: Vec<_> = (0..plan.concurrency.min(total.saturating_sub(1).min(u32::MAX as u64) as u32))
         .map(|_| {
             let (shared, next, stop, samples) = (shared.clone(), next.clone(), stop.clone(), samples.clone());
@@ -95,7 +95,8 @@ fn run(
 struct Worker {
     sending: HttpRequest,
     secrets: Vec<(String, String)>,
-    expect: Vec<String>,
+    /// The request as written, for its checks.
+    written: HttpRequest,
     total: u64,
     deadline: Option<Instant>,
     rate: Option<f64>,
@@ -127,11 +128,7 @@ impl Worker {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-            let checks = if self.expect.is_empty() {
-                Vec::new()
-            } else {
-                expect::check(&self.expect, outcome.as_ref().map_err(String::as_str))
-            };
+            let checks = graphql::checks(&self.written, outcome.as_ref().map_err(String::as_str));
             samples.lock().unwrap().add(outcome.as_ref().map_err(String::as_str), &checks);
         }
     }
@@ -162,7 +159,9 @@ fn resolve(hub: &Hub, request: &HttpRequest, env: Option<&str>) -> Result<(HttpR
         }
         None => (None, Vec::new()),
     };
-    let sending = envs::resolve(request, environment.as_ref()).map_err(|e| envs::redact(&e, &secrets))?;
+    let sending = envs::resolve(request, environment.as_ref())
+        .and_then(|r| if graphql::is_graphql(&r) { graphql::to_http(&r) } else { Ok(r) })
+        .map_err(|e| envs::redact(&e, &secrets))?;
     Ok((sending, secrets))
 }
 

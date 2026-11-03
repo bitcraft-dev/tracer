@@ -189,6 +189,9 @@ pub enum Command {
     /// Stop a running bench, whoever started it. It ends with
     /// `bench_finished`, naming who stopped it.
     StopBench { bench_id: u64 },
+    /// The GraphQL schema in finished request `request_id`'s answer: one
+    /// sent with the introspection query ([`GRAPHQL_INTROSPECTION`]).
+    GraphqlSchema { request_id: u64 },
     /// Compare two finished requests' responses: status, headers, body.
     /// `ignore` adds patterns to the default noisy ones (see
     /// [`ResponseDiff::patterns`]), or replaces them with `no_defaults`.
@@ -230,6 +233,14 @@ pub struct HttpRequest {
     /// status`. Saved as `# @capture` lines above the request line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capture: Vec<String>,
+}
+
+impl HttpRequest {
+    /// Whether `request_checked` follows its end: it has expectations, or
+    /// it's GraphQL, whose answer is always checked for errors.
+    pub fn is_checked(&self) -> bool {
+        !self.expect.is_empty() || self.method.eq_ignore_ascii_case("GRAPHQL")
+    }
 }
 
 /// One expectation, checked: whether it held, and what was found.
@@ -405,6 +416,87 @@ impl BenchStats {
     /// more, or a failed expectation.
     pub fn bad(&self) -> u64 {
         self.failed + self.bad_status + self.failed_checks
+    }
+}
+
+/// What a `GRAPHQL` request sends to ask a server for its schema, which
+/// [`Command::GraphqlSchema`] then reads from the answer. Field types nest
+/// three deep, enough for `[User!]!`, and arguments' two, so the whole query
+/// stays within the depth of 8 that servers commonly cap queries at; an
+/// argument of type `[ID!]!` reads as `[?]!`.
+pub const GRAPHQL_INTROSPECTION: &str = "query Schema { __schema { queryType { name } mutationType { name } subscriptionType { name } types { kind name description fields { name description args { name type { ...A } } type { ...T } } inputFields { name type { ...T } } enumValues { name } possibleTypes { name } } } } fragment T on __Type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } fragment A on __Type { kind name ofType { kind name ofType { kind name } } }";
+
+/// A GraphQL server's schema, as its introspection describes it, its own
+/// `__` types left out. The root types are named, or "" where it has none.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqlSchema {
+    pub query: String,
+    pub mutation: String,
+    pub subscription: String,
+    pub types: Vec<GqlType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqlType {
+    pub name: String,
+    /// `OBJECT`, `INPUT_OBJECT`, `ENUM`, `INTERFACE`, `UNION` or `SCALAR`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// An object's or interface's fields, or an input's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<GqlField>,
+    /// An enum's values, or the types a union or interface may be.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqlField {
+    pub name: String,
+    /// `id: ID!, first: Int`, or "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
+    /// `[User!]!`.
+    pub ty: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+impl GqlSchema {
+    /// As SDL, the root types first and scalars left out: compact enough to
+    /// read, or to hand an agent.
+    pub fn to_sdl(&self) -> String {
+        let roots = [&self.query, &self.mutation, &self.subscription];
+        let mut ordered: Vec<&GqlType> = roots.iter().filter_map(|r| self.types.iter().find(|t| &t.name == *r)).collect();
+        ordered.extend(self.types.iter().filter(|t| !roots.contains(&&t.name) && t.kind != "SCALAR"));
+        let mut out = String::new();
+        for t in ordered {
+            if !t.description.is_empty() {
+                out.push_str(&format!("\"{}\"\n", t.description.replace('\n', " ")));
+            }
+            match t.kind.as_str() {
+                "ENUM" => out.push_str(&format!("enum {} {{ {} }}\n\n", t.name, t.values.join(" "))),
+                "UNION" => out.push_str(&format!("union {} = {}\n\n", t.name, t.values.join(" | "))),
+                kind => {
+                    let word = match kind {
+                        "INPUT_OBJECT" => "input",
+                        "INTERFACE" => "interface",
+                        _ => "type",
+                    };
+                    out.push_str(&format!("{word} {} {{\n", t.name));
+                    for f in &t.fields {
+                        if !f.description.is_empty() {
+                            out.push_str(&format!("  \"{}\"\n", f.description.replace('\n', " ")));
+                        }
+                        let args = if f.args.is_empty() { String::new() } else { format!("({})", f.args) };
+                        out.push_str(&format!("  {}{args}: {}\n", f.name, f.ty));
+                    }
+                    out.push_str("}\n\n");
+                }
+            }
+        }
+        out.trim_end().to_string()
     }
 }
 
@@ -728,6 +820,7 @@ pub enum ReplyBody {
     FlowStarted { flow_id: u64, steps: Vec<String> },
     BenchStarted { bench_id: u64 },
     BenchStopped,
+    GraphqlSchema { schema: GqlSchema },
     /// The rules for every agent first, then by name; for an agent, only
     /// the rules it gets. `error` says why the policy file was not taken,
     /// in which case the rules are the last ones that were.

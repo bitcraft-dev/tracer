@@ -9,12 +9,14 @@
 #   tools/drive.ps1 -Proc tracer-probes -Do drag  -X 100 -Y 200 -X2 300 -Y2 200
 #   tools/drive.ps1 -Proc tracer-probes -Do keys  -Text "^k"      (SendKeys syntax)
 #   tools/drive.ps1 -Proc tracer-probes -Do rect
+#   tools/drive.ps1 -Id 1234 -Do shot   (one window when several share a name)
 param(
   [string]$Proc = "tracer-probes",
   [string]$Do = "shot",
   [string]$Out = "",
   [int]$X = 0, [int]$Y = 0, [int]$X2 = 0, [int]$Y2 = 0,
-  [string]$Text = ""
+  [string]$Text = "",
+  [int]$Id = 0
 )
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -37,7 +39,8 @@ public static class W {
 "@
 [W]::SetProcessDPIAware() | Out-Null
 
-$p = Get-Process $Proc -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+# -Id picks one process when several share the name (another window open).
+$p = if ($Id) { Get-Process -Id $Id -ErrorAction Stop } else { Get-Process $Proc -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1 }
 if (-not $p) { throw "no window for $Proc" }
 $h = $p.MainWindowHandle
 [W]::ShowWindow($h, 9) | Out-Null
