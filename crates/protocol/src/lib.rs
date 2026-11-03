@@ -192,6 +192,20 @@ pub enum Command {
     /// The GraphQL schema in finished request `request_id`'s answer: one
     /// sent with the introspection query ([`GRAPHQL_INTROSPECTION`]).
     GraphqlSchema { request_id: u64 },
+    /// Send `text` on open WebSocket `request_id` (a `WEBSOCKET` request
+    /// that has published `stream_opened` and not yet closed). It goes out
+    /// as a text frame and is published as an outgoing `stream_message` in
+    /// the asker's name. A stream is closed with [`Command::Cancel`].
+    StreamSend { request_id: u64, text: String },
+    /// A stream's messages after number `after` (0: from the first), up to
+    /// `limit` ([`STREAM_LIMIT`] if not given), and whether it is still open.
+    StreamMessages {
+        request_id: u64,
+        #[serde(default)]
+        after: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+    },
     /// Compare two finished requests' responses: status, headers, body.
     /// `ignore` adds patterns to the default noisy ones (see
     /// [`ResponseDiff::patterns`]), or replaces them with `no_defaults`.
@@ -417,6 +431,70 @@ impl BenchStats {
     pub fn bad(&self) -> u64 {
         self.failed + self.bad_status + self.failed_checks
     }
+}
+
+/// The method of a request that opens a WebSocket, as JetBrains' HTTP
+/// client writes it: `WEBSOCKET wss://host/path`. Its body, if any, is the
+/// messages to send once it's open, separated by lines of `===`; a line
+/// `=== wait-for-server` before one sends it only after the server has sent
+/// something since the last. Any request whose answer is
+/// `text/event-stream` is a stream too (server-sent events).
+pub const WEBSOCKET: &str = "WEBSOCKET";
+
+/// The most of a stream message's text an event carries; `size` tells the
+/// whole.
+pub const STREAM_TEXT_MAX: usize = 64 * 1024;
+
+/// The most messages [`Command::StreamMessages`] gives at once.
+pub const STREAM_LIMIT: u64 = 500;
+
+/// What kind of live connection a stream is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    Websocket,
+    Sse,
+}
+
+/// Which way a stream message went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// From the server.
+    #[default]
+    In,
+    /// To the server.
+    Out,
+}
+
+/// One message on a stream, either way.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamMessage {
+    /// 1, 2, 3, … within its stream, both ways counted together.
+    pub n: u64,
+    pub dir: Direction,
+    /// Up to [`STREAM_TEXT_MAX`] of it. A binary message is told as its
+    /// size and its first bytes in hex.
+    pub text: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
+    /// Its whole size in bytes.
+    pub size: u64,
+    /// A server-sent event's `event:` name, if it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// A server-sent event's `id:`, if it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// A stream message as [`Command::StreamMessages`] gives it: when, and who
+/// sent it (the stream's opener, for what came in).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamItem {
+    pub at_ms: u64,
+    pub by: Actor,
+    pub message: StreamMessage,
 }
 
 /// What a `GRAPHQL` request sends to ask a server for its schema, which
@@ -821,6 +899,14 @@ pub enum ReplyBody {
     BenchStarted { bench_id: u64 },
     BenchStopped,
     GraphqlSchema { schema: GqlSchema },
+    StreamSent,
+    StreamMessages {
+        messages: Vec<StreamItem>,
+        /// Whether the stream is still open.
+        open: bool,
+        /// How many more there are after these.
+        more: u64,
+    },
     /// The rules for every agent first, then by name; for an agent, only
     /// the rules it gets. `error` says why the policy file was not taken,
     /// in which case the rules are the last ones that were.
@@ -924,6 +1010,17 @@ pub enum EventKind {
     },
     /// The core was asked to stop, by this event's actor. Only the asker's
     /// own `client_left` can follow it.
+    /// A request's connection stayed open as a stream: a WebSocket after
+    /// its handshake, or an answer of server-sent events. `response` is the
+    /// handshake's or the answer's head (status, headers, timing; no body).
+    /// Its messages follow, then `stream_closed`, then `request_finished`.
+    StreamOpened { request_id: u64, kind: StreamKind, response: HttpResponse },
+    /// A message on an open stream: one that came in, in the opener's name,
+    /// or one sent, in the sender's.
+    StreamMessage { request_id: u64, message: StreamMessage },
+    /// A stream ended: why (closed by a person or agent, by the server, or
+    /// the connection went), and how many messages went each way.
+    StreamClosed { request_id: u64, reason: String, received: u64, sent: u64 },
     CoreStopping,
 }
 

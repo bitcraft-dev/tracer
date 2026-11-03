@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
-    BenchPlan, ClientKind, Command, Ended, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
-    StatusClass,
+    BenchPlan, ClientKind, Command, Direction, Ended, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
+    StatusClass, StreamItem, StreamKind, StreamMessage, WEBSOCKET,
 };
 
 /// MCP versions this server speaks, newest first. A client asking for
@@ -38,6 +38,10 @@ const WAIT_DEFAULT: u64 = 60;
 const WAIT_MAX: u64 = 600;
 /// How long a core started here gets to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the stream tools listen for messages unless told otherwise, and
+/// how long `read_stream` may wait for new ones.
+const LISTEN_DEFAULT: u64 = 2;
+const LISTEN_MAX: u64 = 120;
 
 const INSTRUCTIONS: &str = "\
 Tracer is an API workbench. These tools send HTTP requests through the \
@@ -56,7 +60,13 @@ to allow it in the window. Such a send returns `awaiting_approval`; call \
 get_response later for the outcome. A refused request fails with `refused by \
 <person>`. The workspace's policy may say otherwise for you, and may limit \
 where your requests go, how many you start and how big their bodies are: \
-read_policy says what applies to you.";
+read_policy says what applies to you.
+
+Streams: open_stream opens a WebSocket (ws:// or wss://) or reads server-sent \
+events (an http(s) URL answered with text/event-stream). It stays open, its \
+messages numbered both ways, until close_stream (or a person) closes it: \
+read_stream gives messages after a number, send_stream_message sends on a \
+WebSocket. Opening a WebSocket counts as a write for approval.";
 
 pub fn serve(workspace: PathBuf, name_override: Option<String>) -> io::Result<()> {
     let mut server = Server { workspace, name_override, core: None };
@@ -474,6 +484,78 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             }
             Ok(out)
         }
+        "open_stream" => {
+            let url = str_arg(args, "url").ok_or("`url` is required")?.to_string();
+            let websocket = url.starts_with("ws://") || url.starts_with("wss://");
+            let mut headers = headers_arg(args)?;
+            if !websocket && !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("accept")) {
+                headers.push(("Accept".into(), "text/event-stream".into()));
+            }
+            let body = list_arg(args, "messages").iter().map(|m| format!("===\n{m}\n")).collect::<String>();
+            let request = HttpRequest {
+                method: if websocket { WEBSOCKET.into() } else { "GET".into() },
+                url,
+                headers,
+                body: (!body.is_empty()).then_some(body),
+                ..Default::default()
+            };
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            open_and_listen(core, Command::Send { request, env }, args)
+        }
+        "read_stream" => {
+            let request_id = id_arg(args)?;
+            let after = args.get("after").and_then(Value::as_u64).unwrap_or(0);
+            let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(0).min(LISTEN_MAX);
+            while core.events.try_recv().is_ok() {}
+            let read = || match call(core, Command::StreamMessages { request_id, after, limit: None })? {
+                ReplyBody::StreamMessages { messages, open, more } => Ok((messages, open, more)),
+                _ => Err(unexpected()),
+            };
+            // Until there's something new, it has closed, or the wait is up;
+            // one still connecting (just allowed, say) is waited for too.
+            let deadline = Instant::now() + Duration::from_secs(wait);
+            let (messages, open, more) = loop {
+                let now = read();
+                let waited = Instant::now() >= deadline;
+                match now {
+                    Ok((messages, open, more)) if !messages.is_empty() || !open || waited => break (messages, open, more),
+                    Err(e) if waited => return Err(e),
+                    _ => {}
+                }
+                while let Ok(event) = core.events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    if concerns(&event.kind, request_id) {
+                        break;
+                    }
+                }
+            };
+            let next = messages.last().map_or(after, |m| m.message.n);
+            Ok(json!({
+                "request_id": request_id,
+                "open": open,
+                "messages": messages.iter().map(item_json).collect::<Vec<_>>(),
+                "more": more,
+                "next_after": next,
+            }))
+        }
+        "send_stream_message" => {
+            let request_id = id_arg(args)?;
+            let text = str_arg(args, "text").ok_or("`text` is required")?.to_string();
+            while core.events.try_recv().is_ok() {}
+            call(core, Command::StreamSend { request_id, text })?;
+            let listen = args.get("listen_seconds").and_then(Value::as_u64).unwrap_or(LISTEN_DEFAULT).min(LISTEN_MAX);
+            let mut state = json!({ "request_id": request_id, "open": true });
+            let messages = listen_to(core, request_id, Duration::from_secs(listen), &mut state);
+            state["messages"] = json!(messages);
+            Ok(state)
+        }
+        "close_stream" => {
+            let request_id = id_arg(args)?;
+            while core.events.try_recv().is_ok() {}
+            call(core, Command::Cancel { request_id })?;
+            let mut state = json!({ "request_id": request_id, "open": true });
+            listen_to(core, request_id, Duration::from_secs(10), &mut state);
+            Ok(state)
+        }
         "cancel_request" => {
             let request_id = id_arg(args)?;
             call(core, Command::Cancel { request_id })?;
@@ -556,6 +638,139 @@ fn send_and_wait(core: &Core, sending: Command, args: &Value) -> Result<Value, S
             _ => {}
         }
     }
+}
+
+/// Open a stream and listen to it for `listen_seconds`; or, if it never
+/// opens as one, what [`send_and_wait`] would say.
+fn open_and_listen(core: &Core, sending: Command, args: &Value) -> Result<Value, String> {
+    let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT).min(WAIT_MAX);
+    while core.events.try_recv().is_ok() {}
+    let ReplyBody::Accepted { request_id } = call(core, sending)? else {
+        return Err(unexpected());
+    };
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    let mut state = json!({ "request_id": request_id, "state": "connecting" });
+    loop {
+        let event = match core.events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => {
+                state["note"] = json!(format!("not open after {wait} s; get_response with request_id {request_id} gives the outcome"));
+                return Ok(state);
+            }
+            Err(RecvTimeoutError::Disconnected) => return Err("the core hung up".into()),
+        };
+        match event.kind {
+            EventKind::StreamOpened { request_id: id, kind, response } if id == request_id => {
+                state["state"] = json!("open");
+                state["open"] = json!(true);
+                state["kind"] = json!(if kind == StreamKind::Websocket { "websocket" } else { "sse" });
+                state["status"] = json!(response.status);
+                state["ttfb_ms"] = json!(response.timing.ttfb_ms.round());
+                let listen = args.get("listen_seconds").and_then(Value::as_u64).unwrap_or(LISTEN_DEFAULT).min(LISTEN_MAX);
+                let messages = listen_to(core, request_id, Duration::from_secs(listen), &mut state);
+                state["next_after"] = json!(messages.last().and_then(|m| m["n"].as_u64()).unwrap_or(0));
+                state["messages"] = json!(messages);
+                state["note"] = json!("open until close_stream; read_stream gives what comes after next_after");
+                return Ok(state);
+            }
+            EventKind::ApprovalAsked { request_id: id, reason } if id == request_id => {
+                state["state"] = json!("awaiting_approval");
+                state["reason"] = json!(reason);
+                state["note"] = json!(format!(
+                    "a person has to allow this in Tracer's window; read_stream with request_id {request_id} follows it once open"
+                ));
+                return Ok(state);
+            }
+            EventKind::RequestFinished { request_id: id, response } if id == request_id => {
+                state["state"] = json!("done");
+                state["note"] = json!("answered without opening a stream");
+                add_response(&mut state, &response, BODY_SHOWN);
+                return Ok(state);
+            }
+            EventKind::RequestFailed { request_id: id, error } if id == request_id => {
+                state["state"] = json!("failed");
+                state["error"] = json!(error);
+                return Ok(state);
+            }
+            EventKind::RequestCancelled { request_id: id } if id == request_id => {
+                state["state"] = json!("cancelled");
+                state["cancelled_by"] = json!(event.actor.name);
+                return Ok(state);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stream `request_id`'s messages for `listen`, or until it closes, which
+/// `state` then says.
+fn listen_to(core: &Core, request_id: u64, listen: Duration, state: &mut Value) -> Vec<Value> {
+    let deadline = Instant::now() + listen;
+    let mut messages = Vec::new();
+    while let Ok(event) = core.events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        match event.kind {
+            EventKind::StreamMessage { request_id: id, message } if id == request_id => {
+                messages.push(message_json(&message, &event.actor.name, event.at_ms));
+            }
+            EventKind::StreamClosed { request_id: id, reason, received, sent } if id == request_id => {
+                state["open"] = json!(false);
+                state["closed"] = json!({ "reason": reason, "received": received, "sent": sent });
+                break;
+            }
+            // Ended before it opened: cancelled, refused, or failed.
+            EventKind::RequestCancelled { request_id: id } if id == request_id => {
+                state["open"] = json!(false);
+                state["state"] = json!("cancelled");
+                break;
+            }
+            EventKind::RequestFailed { request_id: id, error } if id == request_id => {
+                state["open"] = json!(false);
+                state["state"] = json!("failed");
+                state["error"] = json!(error);
+                break;
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+/// Whether `kind` is news of request `request_id`'s stream.
+fn concerns(kind: &EventKind, request_id: u64) -> bool {
+    match kind {
+        EventKind::StreamOpened { request_id: id, .. }
+        | EventKind::StreamMessage { request_id: id, .. }
+        | EventKind::StreamClosed { request_id: id, .. }
+        | EventKind::RequestFinished { request_id: id, .. }
+        | EventKind::RequestFailed { request_id: id, .. }
+        | EventKind::RequestCancelled { request_id: id } => *id == request_id,
+        _ => false,
+    }
+}
+
+fn message_json(m: &StreamMessage, by: &str, at_ms: u64) -> Value {
+    let mut v = json!({
+        "n": m.n,
+        "dir": if m.dir == Direction::In { "in" } else { "out" },
+        "text": m.text,
+        "size": m.size,
+        "by": by,
+        "at_ms": at_ms,
+    });
+    if m.binary {
+        v["binary"] = json!(true);
+    }
+    if let Some(event) = &m.event {
+        v["event"] = json!(event);
+    }
+    if let Some(id) = &m.id {
+        v["id"] = json!(id);
+    }
+    v
+}
+
+fn item_json(item: &StreamItem) -> Value {
+    message_json(&item.message, &item.by.name, item.at_ms)
 }
 
 fn call(core: &Core, command: Command) -> Result<ReplyBody, String> {
@@ -932,6 +1147,54 @@ fn tools() -> Value {
             "description": "What the workspace's policy lets you do: `access` (read-only, local: this machine only, or anywhere), what waits for a person's approval, how many requests you may start (`rate`: count per per_secs), the largest request body (`max_body`, bytes), and how big a bench may be (`max_bench` requests, `max_concurrency` at a time).",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "open_stream",
+            "description": "Open a WebSocket (a ws:// or wss:// URL) or read server-sent events (an http(s) URL answered with text/event-stream), and listen for a moment. It stays open until close_stream; every message, either way, is numbered and shows in Tracer's window. Opening a WebSocket counts as a write: by default a person must allow it (state awaiting_approval).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "ws:// or wss:// for a WebSocket, http(s):// for server-sent events. May use `{{name}}` from `env`." },
+                    "headers": headers,
+                    "messages": { "type": "array", "items": { "type": "string" }, "description": "For a WebSocket: messages to send, in order, once it's open." },
+                    "env": env,
+                    "listen_seconds": { "type": "integer", "description": "How long to collect messages once open before returning (default 2, at most 120)." },
+                    "wait_seconds": wait,
+                },
+                "required": ["url"],
+            },
+        },
+        {
+            "name": "read_stream",
+            "description": "A stream's messages numbered after `after`, up to 500 at a time, and whether it is still open. With wait_seconds, waits that long for a new one when there is none yet.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": id,
+                    "after": { "type": "integer", "description": "The last message number already read (next_after from before); 0 for all." },
+                    "wait_seconds": { "type": "integer", "description": "How long to wait for a new message if there is none (default 0, at most 120)." },
+                },
+                "required": ["request_id"],
+            },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "send_stream_message",
+            "description": "Send a text message on an open WebSocket, then return what comes in during listen_seconds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": id,
+                    "text": { "type": "string" },
+                    "listen_seconds": { "type": "integer", "description": "How long to collect what comes back (default 2, at most 120)." },
+                },
+                "required": ["request_id", "text"],
+            },
+        },
+        {
+            "name": "close_stream",
+            "description": "Close an open WebSocket or event stream. It ends as a finished request; the result says why it closed and how many messages went each way.",
+            "inputSchema": { "type": "object", "properties": { "request_id": id }, "required": ["request_id"] },
         },
         {
             "name": "cancel_request",

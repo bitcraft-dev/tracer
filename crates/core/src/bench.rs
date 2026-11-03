@@ -28,6 +28,9 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 /// Check `plan` against the sender's policy, start the bench on a thread of
 /// its own, and give its id.
 pub fn start(hub: &Arc<Hub>, actor: &Actor, request: HttpRequest, env: Option<String>, plan: BenchPlan) -> Result<u64, String> {
+    if crate::realtime::is_websocket(&request) {
+        return Err("a WebSocket stays open, so it can't be benched; bench an HTTP request".into());
+    }
     if let Some(why) = guard::bench_refused(&plan, hub.rules_for(actor).as_ref()) {
         return Err(why);
     }

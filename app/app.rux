@@ -8,8 +8,9 @@
         <view class="main">
             <view class="rail">
                 <text class="logo">T</text>
-                <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && !gql }" @tap="toRest()"><text class="rail-label">REST</text></view>
+                <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && !gql && !wsMode }" @tap="toRest()"><text class="rail-label">REST</text></view>
                 <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && gql }" @tap="toGraphql()"><text class="rail-label">GraphQL</text></view>
+                <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && wsMode }" @tap="toRealtime()"><text class="rail-label">Realtime</text></view>
                 <view class="rail-item" :class="{ on: mode == &quot;bench&quot; }" @tap="mode = &quot;bench&quot;"><text class="rail-label">Bench</text></view>
             </view>
 
@@ -119,7 +120,7 @@
                         <text class="send-label">Send</text>
                     </view>
                     <view class="send stop" r-if="running()" @tap="cancel()">
-                        <text class="send-label">Cancel</text>
+                        <text class="send-label">{{ if streamOpen() { "Close" } else { "Cancel" } }}</text>
                     </view>
                 </view>
                 <view class="preview" r-if="url.includes(&quot;{{&quot;)">
@@ -129,7 +130,7 @@
 
                 <view class="tabs">
                     <view class="tab" r-if="!gql" :class="{ on: reqTab == &quot;body&quot; }" @tap="reqTab = &quot;body&quot;">
-                        <text class="tab-label">Body</text>
+                        <text class="tab-label">{{ if wsMode { "Messages" } else { "Body" } }}</text>
                     </view>
                     <view class="tab" r-if="gql" :class="{ on: reqTab == &quot;query&quot; }" @tap="reqTab = &quot;query&quot;">
                         <text class="tab-label">Query</text>
@@ -148,7 +149,8 @@
                     </view>
                 </view>
                 <view class="editor" :style="`height: ${reqHeight}px`">
-                    <input r-if="reqTab == &quot;body&quot; && !gql" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
+                    <input r-if="reqTab == &quot;body&quot; && !gql && !wsMode" type="textarea" r-model="body" placeholder="request body (not sent with GET or HEAD when empty)" />
+                    <input r-if="reqTab == &quot;body&quot; && wsMode" type="textarea" r-model="body" placeholder="messages to send once it's open, each after a line of ===; a line of === wait-for-server waits for the server first" />
                     <input r-if="reqTab == &quot;query&quot; && gql" type="textarea" r-model="gqlQuery" placeholder="query { … } or mutation { … }; the Schema view lists what the server has" />
                     <input r-if="reqTab == &quot;vars&quot; && gql" type="textarea" r-model="gqlVars" placeholder="the query's variables as a JSON object, such as { &quot;id&quot;: 7 }" />
                     <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
@@ -209,13 +211,14 @@
                             <view class="chip link-chip" r-if="sel.bench > 0" @tap="showBench(sel.bench)">
                                 <text class="link-t">first of bench {{ sel.bench }}</text>
                             </view>
-                            <text class="chip" r-if="sel.state == &quot;done&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
+                            <text class="chip" r-if="sel.stream != &quot;&quot; && !sel.open">{{ streamText(sel) }}</text>
+                            <text class="chip" r-if="sel.state == &quot;done&quot; || sel.stream != &quot;&quot;">TTFB {{ sel.ttfbMs.round() }} ms</text>
                             <text class="chip" r-if="sel.state == &quot;done&quot;">Total {{ sel.totalMs.round() }} ms</text>
                             <text class="chip" r-if="sel.state == &quot;done&quot;">{{ size(sel.size) }}</text>
                             <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
                             <text class="chip">sent {{ when(sel.atMs) }}</text>
                             </view>
-                            <view class="fall" r-if="sel.state == &quot;done&quot; && sel.dnsMs >= 0.0">
+                            <view class="fall" r-if="(sel.state == &quot;done&quot; || sel.stream != &quot;&quot;) && sel.dnsMs >= 0.0">
                                 <view class="fall-bar">
                                     <view class="fall-seg" r-for="p in phases(sel)" :style="`flex-grow: ${p.ms}; background: ${p.color}`"></view>
                                 </view>
@@ -238,10 +241,14 @@
                                     <text class="tab-label">Checks</text>
                                     <text class="badge" :class="{ bad: failedChecks(sel) > 0 }">{{ sel.results.length - failedChecks(sel) }}/{{ sel.results.length }}</text>
                                 </view>
+                                <view class="tab" r-if="sel.stream != &quot;&quot;" :class="{ on: resTab == &quot;messages&quot; }" @tap="resTab = &quot;messages&quot;">
+                                    <text class="tab-label">Messages</text>
+                                    <text class="badge">{{ selMsgs.length }}</text>
+                                </view>
                             </view>
                             <view class="pane">
                             <text class="mono err" r-if="sel.state == &quot;failed&quot;">{{ sel.error }}</text>
-                            <text class="mono dim" r-if="sel.state == &quot;running&quot;">waiting for the answer…</text>
+                            <text class="mono dim" r-if="sel.state == &quot;running&quot; && sel.stream == &quot;&quot;">waiting for the answer…</text>
                             <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
                             <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
                             <text class="mono" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">{{ shownBody(sel) }}</text>
@@ -250,7 +257,24 @@
                                 <text class="check-e">{{ c.expect }}</text>
                                 <text class="check-a">found {{ c.actual }}</text>
                             </view>
-                            <view class="hdr" r-if="sel.state == &quot;done&quot; && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
+                            <view class="stream" r-if="resTab == &quot;messages&quot; && sel.stream != &quot;&quot;">
+                                  <view class="compose" r-if="sel.stream == &quot;websocket&quot; && sel.open">
+                                       <view class="hsearch grow"><input r-model="wsText" placeholder="a message to send, Enter" @key="wsKey(event)" /></view>
+                                       <view class="link" @tap="sendWs()"><text class="link-t">Send</text></view>
+                                  </view>
+                                  <text class="mono dim" r-if="!sel.open && sel.closedWhy != &quot;&quot;">{{ sel.closedWhy }} · {{ sel.msgIn }} in, {{ sel.msgOut }} out</text>
+                                  <text class="mono dim" r-if="selMsgs.length == 0">nothing yet</text>
+                                  <text class="mono dim" r-if="selMsgsAll > selMsgs.length">the newest {{ selMsgs.length }} of {{ selMsgsAll }}</text>
+                                  <view class="msg" r-for="m in selMsgs" r-key="m.n">
+                                       <text class="msg-d" :class="{ out: m.dir == &quot;out&quot; }">{{ if m.dir == "in" { "↓" } else { "↑" } }}</text>
+                                       <text class="msg-n">{{ m.n }}</text>
+                                       <text class="msg-at">{{ clock(m.atMs) }}</text>
+                                       <text class="msg-ev" r-if="m.event != &quot;&quot;">{{ m.event }}</text>
+                                       <text class="msg-by" r-if="m.dir == &quot;out&quot;">{{ m.by }}</text>
+                                       <text class="msg-t" :class="{ bin: m.binary }">{{ m.text }}</text>
+                                  </view>
+                            </view>
+                            <view class="hdr" r-if="(sel.state == &quot;done&quot; || sel.stream != &quot;&quot;) && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
                                 <text class="hdr-n">{{ h.name }}</text>
                                 <text class="hdr-v">{{ h.value }}</text>
                             </view>
@@ -724,7 +748,7 @@
     border-radius: 6px;
   }
 
-  .method { width: 120px; }
+  .method { width: 140px; }
   .url { flex: 1; min-width: 0; }
 
   .send {
@@ -1210,6 +1234,17 @@
   .gf-a { color: #7a7a7a; font-size: 12px; font-family: monospace; }
   .gf-t { color: #79b8ff; font-size: 12px; font-family: monospace; }
   .gvals { color: #b0b0b0; font-size: 12px; font-family: monospace; padding-left: 12px; }
+  .stream { display: flex; flex-direction: column; gap: 4px; }
+  .compose { display: flex; gap: 10px; align-items: center; padding-bottom: 6px; }
+  .msg { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; border-bottom: 1px solid #1f1f1f; }
+  .msg-d { color: #4ec98f; font-size: 13px; font-weight: 700; width: 12px; }
+  .msg-d.out { color: #e8a54b; }
+  .msg-n { color: #6a6a6a; font-size: 11px; font-family: monospace; width: 34px; }
+  .msg-at { color: #6a6a6a; font-size: 11px; font-family: monospace; }
+  .msg-ev { color: #b09cf5; font-size: 11px; font-family: monospace; padding: 0 5px; background: #2b2540; border-radius: 4px; }
+  .msg-by { color: #8a8a8a; font-size: 11px; }
+  .msg-t { color: #d4d4d4; font-size: 12px; font-family: monospace; white-space: pre-wrap; flex: 1; }
+  .msg-t.bin { color: #8a8a8a; }
   .status-t.policy-bad {
     min-width: 0;
     color: #f0716c;
@@ -1274,15 +1309,40 @@
     // The flow it was a step of, or 0.
     flow: int,
     // The bench it was the first request of, or 0.
-    bench: int
+    bench: int,
+    // Its stream's kind ("websocket" or "sse"), or "" if it isn't one;
+    // whether it's open; once closed, why and how many went each way.
+    stream: string,
+    open: bool,
+    closedWhy: string,
+    msgIn: int,
+    msgOut: int
   };
+
+  // One message on a stream, either way. Kept apart from the rows, so a
+  // busy stream doesn't rebuild them all for each one.
+  type Msg = {
+    rid: int,
+    n: int,
+    dir: string,
+    text: string,
+    event: string,
+    by: string,
+    atMs: int,
+    binary: bool
+  };
+  let msgs: Msg[] = signal([]);
+  // The most of a stream's messages shown at once, newest first.
+  let MSGS_SHOWN = 500;
+  // What's typed to send on the open WebSocket on show.
+  let wsText = signal("");
 
   type Client = { client: int, actor: string, actorKind: string };
 
   // The picker's entry for sending with no environment.
   let NO_ENV = "No environment";
 
-  let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+  let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WEBSOCKET"];
   let method = signal("GET");
   let url = signal("https://jsonplaceholder.typicode.com/todos/1");
     let body = signal("");
@@ -1319,6 +1379,8 @@
     { id: "mode:bench", label: "Show the bench", hint: "" },
     { id: "mode:rest", label: "Show responses", hint: "" },
     { id: "graphql", label: "Make the request GraphQL", hint: "" },
+    { id: "realtime", label: "Make the request a WebSocket", hint: "" },
+    { id: "close-stream", label: "Close the stream on show", hint: "" },
     { id: "rest", label: "Make the request REST", hint: "" },
     { id: "schema", label: "Load the GraphQL server's schema", hint: "" },
     { id: "curl-editor", label: "Copy the request being edited as cURL", hint: "" },
@@ -1437,6 +1499,7 @@
 
   computed connected = (tracer.link?.state ?? "") == "connected";
   computed gql = method == "GRAPHQL";
+  computed wsMode = method == "WEBSOCKET";
   computed showRes = mode == "rest" && !(gql && gqlView == "schema");
   computed queryRoot = schema?.query ?? "";
   computed mutationRoot = schema?.mutation ?? "";
@@ -1447,6 +1510,8 @@
   computed shown = history.filter(r => passes(r, hq.trim().toLowerCase(), hActor, hStatus));
   computed filtering = hq.trim() != "" || hActor != ANYONE || hStatus != ANY_STATUS;
   computed sel = requests.find(r => r.id == selected);
+  computed selMsgsAll = if sel == none { 0 } else { msgs.filter(m => m.rid == sel.id).length };
+  computed selMsgs = if sel == none { [] } else { newest(msgs.filter(m => m.rid == sel.id)) };
   computed current = saved.find(s => s.path == openPath);
   // Unsaved edits to a saved request. A request never saved is a scratch pad.
   computed dirty = if openPath == "" { false } else if current == none { true } else { !sameAs(current) };
@@ -1546,7 +1611,12 @@
           reqChecks: e.checks,
           results: [],
           flow: e.flow,
-          bench: e.bench
+          bench: e.bench,
+          stream: "",
+          open: false,
+          closedWhy: "",
+          msgIn: 0,
+          msgOut: 0
         });
       } else if e.kind == "approval_asked" {
         requests = requests.map(r => if r.id == e.requestId { asked(r, e.reason) } else { r });
@@ -1603,6 +1673,22 @@
             schemaNote = if e.kind == "request_failed" { `no schema: ${e.error}` } else { "cancelled" };
           }
         }
+      } else if e.kind == "stream_opened" {
+        requests = requests.map(r => if r.id == e.requestId { opened(r, e) } else { r });
+        if e.requestId == selected && resTab == "body" { resTab = "messages"; }
+      } else if e.kind == "stream_message" {
+        msgs.push({
+          rid: e.requestId,
+          n: e.n,
+          dir: e.dir,
+          text: e.body,
+          event: e.sseEvent,
+          by: e.actor,
+          atMs: e.atMs,
+          binary: e.binary
+        });
+      } else if e.kind == "stream_closed" {
+        requests = requests.map(r => if r.id == e.requestId { closed(r, e) } else { r });
       } else if e.kind == "client_joined" {
         clients.push({ client: e.client, actor: e.actor, actorKind: e.actorKind });
       } else if e.kind == "client_left" {
@@ -1706,9 +1792,87 @@
 
   fn toRest() {
     mode = "rest";
+    if wsMode {
+      method = "GET";
+      return;
+    }
     if !gql { return; }
     method = "POST";
     reqTab = "body";
+  }
+
+  // A WebSocket: method WEBSOCKET, its body the messages to send once open.
+  fn toRealtime() {
+    mode = "rest";
+    if wsMode { return; }
+    method = "WEBSOCKET";
+    reqTab = "body";
+    if url.startsWith("https://") {
+      url = "wss://" + url.slice(8);
+    } else if url.startsWith("http://") {
+      url = "ws://" + url.slice(7);
+    }
+  }
+
+  fn opened(r: Row, e: CoreEvent): Row {
+    let out = r;
+    out.stream = e.stream;
+    out.open = true;
+    out.status = e.status;
+    out.resHeaders = e.headers;
+    out.ttfbMs = e.ttfbMs;
+    out.dnsMs = e.dnsMs;
+    out.connectMs = e.connectMs;
+    out.tlsMs = e.tlsMs;
+    out
+  }
+
+  fn closed(r: Row, e: CoreEvent): Row {
+    let out = r;
+    out.open = false;
+    out.closedWhy = e.reason;
+    out.msgIn = e.received;
+    out.msgOut = e.sent;
+    out
+  }
+
+  // A stream's messages, newest first, at most MSGS_SHOWN of them.
+  fn newest(list: Msg[]): Msg[] {
+    let sorted = list.sort((a, b) => b.n - a.n);
+    if sorted.length > MSGS_SHOWN { sorted.slice(0, MSGS_SHOWN) } else { sorted }
+  }
+
+  // Whether the request on show is a stream still open.
+  fn streamOpen(): bool {
+    sel != none && sel.stream != "" && sel.open
+  }
+
+  fn streamText(r: Row): string {
+    let what = if r.stream == "websocket" { "WebSocket" } else { "events" };
+    if r.open { `${what} open` } else { `${what} closed` }
+  }
+
+  // `14:03:07`, for a message.
+  fn clock(atMs: int): string {
+    let s = Date.seconds(atMs);
+    if s < 10 { `${Date.time(atMs)}:0${s}` } else { `${Date.time(atMs)}:${s}` }
+  }
+
+  fn sendWs() {
+    if sel == none || wsText == "" { return; }
+    try {
+      tracer.streamSend(sel.id, wsText);
+      wsText = "";
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  fn wsKey(e: KeyEvent) {
+    if e.key == "Enter" {
+      sendWs();
+      return false;
+    }
   }
 
   // Ask the server in the URL bar for its schema: an ordinary request,
@@ -2089,7 +2253,10 @@
     }
     let before = r.dnsMs + r.connectMs + Math.max(r.tlsMs, 0.0);
     out.push({ name: "wait", ms: Math.max(r.ttfbMs - before, 0.0), color: "#4ec98f" });
-    out.push({ name: "download", ms: Math.max(r.totalMs - r.ttfbMs, 0.0), color: "#9d8ff5" });
+    // A stream's time open is no download; Total tells it.
+    if r.stream == "" {
+      out.push({ name: "download", ms: Math.max(r.totalMs - r.ttfbMs, 0.0), color: "#9d8ff5" });
+    }
     out
   }
 
@@ -2387,7 +2554,9 @@
   }
 
   fn statusText(r: Row): string {
-    if r.state == "running" {
+    if r.state == "running" && r.stream != "" {
+      "open"
+    } else if r.state == "running" {
       "…"
     } else if r.state == "approval" {
       "approval?"
@@ -2399,7 +2568,9 @@
   }
 
   fn statusColor(r: Row): string {
-    if r.state == "running" || r.state == "cancelled" {
+    if r.state == "running" && r.stream != "" {
+      "#4ec98f"
+    } else if r.state == "running" || r.state == "cancelled" {
       "#8a8a8a"
     } else if r.state == "failed" || r.status >= 500 {
       "#f0716c"
@@ -2535,6 +2706,10 @@
       stopBench();
     } else if id == "graphql" {
       toGraphql();
+    } else if id == "realtime" {
+      toRealtime();
+    } else if id == "close-stream" {
+      if streamOpen() { cancel(); }
     } else if id == "rest" {
       toRest();
     } else if id == "schema" {

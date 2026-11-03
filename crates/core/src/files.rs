@@ -157,8 +157,10 @@ pub fn from_text(text: &str) -> Result<HttpRequest, String> {
         [m, u, v] if v.starts_with("HTTP/") => (*m, *u),
         _ => return Err(format!("`{first}` is not `METHOD URL`")),
     };
-    // `GRAPHQL` as JetBrains writes it: the body is the query (see graphql.rs).
-    const METHODS: [&str; 10] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "GRAPHQL"];
+    // `GRAPHQL` and `WEBSOCKET` as JetBrains writes them: the body is the
+    // query (see graphql.rs), or the messages to send (see realtime.rs).
+    const METHODS: [&str; 11] =
+        ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "GRAPHQL", "WEBSOCKET"];
     if !METHODS.contains(&method.to_uppercase().as_str()) {
         return Err(format!("`{method}` is not an HTTP method"));
     }

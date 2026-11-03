@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
     Actor, AgentRules, BenchPlan, BenchStats, CheckResult, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
-    HttpResponse, SavedRequest, ServerMessage, HISTORY_LIMIT, JOURNAL_PATH, POLICY_PATH,
+    HttpResponse, SavedRequest, ServerMessage, StreamItem, StreamKind, StreamMessage, HISTORY_LIMIT, JOURNAL_PATH, POLICY_PATH,
 };
 
 use crate::policy::Policy;
@@ -76,6 +76,20 @@ struct Flight {
     kind: ClientKind,
     /// The bench it's the first request of, which stopping cancels.
     bench: Option<u64>,
+    /// Its stream, once its connection has stayed open as one.
+    stream: Option<Live>,
+}
+
+/// An open stream. Cancelling it closes it rather than dropping it: its
+/// worker sees the flag, closes the connection and ends it as finished,
+/// naming `closed_by`.
+struct Live {
+    /// Where messages to send on a WebSocket go, with who sends them.
+    outbox: Sender<(Actor, String)>,
+    kind: StreamKind,
+    /// Messages so far, both ways.
+    messages: u64,
+    closed_by: Option<Actor>,
 }
 
 /// A bench running, for stopping it.
@@ -291,7 +305,7 @@ impl Hub {
         let request_id = inner.next_request;
         inner.next_request += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
-        inner.running.insert(request_id, Flight { cancelled: cancelled.clone(), kind: actor.kind.clone(), bench });
+        inner.running.insert(request_id, Flight { cancelled: cancelled.clone(), kind: actor.kind.clone(), bench, stream: None });
         publish_locked(&mut inner, actor, EventKind::RequestStarted { request_id, request, env, rerun_of, flow, bench });
         (request_id, cancelled)
     }
@@ -383,6 +397,87 @@ impl Hub {
             _ => None,
         });
         Some((entry, response, checks.unwrap_or_default()))
+    }
+
+    /// Publish that running request `request_id` stays open as a stream of
+    /// `kind`, its head `response`. Gives where messages to send on it
+    /// arrive; `None` if it was cancelled meanwhile.
+    pub fn open_stream(&self, actor: Actor, request_id: u64, kind: StreamKind, response: HttpResponse) -> Option<Receiver<(Actor, String)>> {
+        let mut inner = self.inner.lock().unwrap();
+        let flight = inner.running.get_mut(&request_id)?;
+        let (outbox, messages) = mpsc::channel();
+        flight.stream = Some(Live { outbox, kind, messages: 0, closed_by: None });
+        publish_locked(&mut inner, actor, EventKind::StreamOpened { request_id, kind, response });
+        Some(messages)
+    }
+
+    /// Number `message` and publish it on open stream `request_id`, in
+    /// `actor`'s name.
+    pub fn stream_message(&self, actor: Actor, request_id: u64, mut message: StreamMessage) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(live) = inner.running.get_mut(&request_id).and_then(|f| f.stream.as_mut()) else { return };
+        live.messages += 1;
+        message.n = live.messages;
+        publish_locked(&mut inner, actor, EventKind::StreamMessage { request_id, message });
+    }
+
+    /// Hand `text` to open WebSocket `request_id`'s worker to send.
+    pub fn stream_send(&self, actor: Actor, request_id: u64, text: String) -> Result<(), String> {
+        let inner = self.inner.lock().unwrap();
+        match inner.running.get(&request_id).map(|f| f.stream.as_ref()) {
+            Some(Some(live)) if live.kind == StreamKind::Websocket && live.closed_by.is_none() => {
+                live.outbox.send((actor, text)).map_err(|_| format!("stream #{request_id} is closing"))
+            }
+            Some(Some(live)) if live.kind == StreamKind::Sse => {
+                Err(format!("#{request_id} is server-sent events, which only the server sends on"))
+            }
+            Some(Some(_)) => Err(format!("stream #{request_id} is closing")),
+            Some(None) => Err(format!("request #{request_id} is not open as a stream (yet)")),
+            None => Err(format!("request #{request_id} is not running")),
+        }
+    }
+
+    /// Who closed stream `request_id`, once someone has.
+    pub fn closed_by(&self, request_id: u64) -> Option<Actor> {
+        let inner = self.inner.lock().unwrap();
+        inner.running.get(&request_id)?.stream.as_ref()?.closed_by.clone()
+    }
+
+    /// Publish why stream `request_id` ended. Its `request_finished`
+    /// follows from its worker.
+    pub fn stream_closed(&self, actor: Actor, request_id: u64, reason: String, received: u64, sent: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.running.contains_key(&request_id) {
+            publish_locked(&mut inner, actor, EventKind::StreamClosed { request_id, reason, received, sent });
+        }
+    }
+
+    /// Stream `request_id`'s messages numbered after `after`, up to
+    /// `limit`; whether it's still open; how many more there are. `None` if
+    /// the request was never a stream.
+    pub fn stream_messages(&self, request_id: u64, after: u64, limit: u64) -> Option<(Vec<StreamItem>, bool, u64)> {
+        let inner = self.inner.lock().unwrap();
+        let mut opened = false;
+        let mut closed = false;
+        let mut messages = Vec::new();
+        let mut more = 0;
+        for e in &inner.events {
+            match &e.kind {
+                EventKind::StreamOpened { request_id: id, .. } if *id == request_id => opened = true,
+                EventKind::StreamClosed { request_id: id, .. } if *id == request_id => closed = true,
+                EventKind::StreamMessage { request_id: id, message } if *id == request_id && message.n > after => {
+                    if (messages.len() as u64) < limit {
+                        messages.push(StreamItem { at_ms: e.at_ms, by: e.actor.clone(), message: message.clone() });
+                    } else {
+                        more += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A core that stopped mid-stream closed it as a dangling request.
+        let open = opened && !closed && inner.running.contains_key(&request_id);
+        opened.then_some((messages, open, more))
     }
 
     /// Publish how a request ended, unless it was cancelled first.
@@ -488,7 +583,9 @@ impl Hub {
             return Some(why);
         }
         match command {
-            Command::Send { .. } | Command::Rerun { .. } | Command::RunBench { .. } => take_rate_locked(&mut inner, actor, &rules).err(),
+            Command::Send { .. } | Command::Rerun { .. } | Command::RunBench { .. } | Command::StreamSend { .. } => {
+                take_rate_locked(&mut inner, actor, &rules).err()
+            }
             _ => None,
         }
     }
@@ -732,6 +829,16 @@ fn stop_bench_locked(inner: &mut Inner, actor: &Actor, bench_id: u64) -> bool {
 }
 
 fn cancel_locked(inner: &mut Inner, actor: Actor, request_id: u64) -> bool {
+    // An open stream is closed by its worker, which ends it as finished.
+    if let Some(flight) = inner.running.get_mut(&request_id) {
+        if let Some(live) = flight.stream.as_mut() {
+            if live.closed_by.is_none() {
+                live.closed_by = Some(actor);
+                flight.cancelled.store(true, Ordering::SeqCst);
+            }
+            return true;
+        }
+    }
     let Some(flight) = inner.running.remove(&request_id) else { return false };
     flight.cancelled.store(true, Ordering::SeqCst);
     // Dropping the answer's sender wakes a worker waiting for approval.

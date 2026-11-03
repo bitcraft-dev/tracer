@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION,
+    Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION, STREAM_LIMIT,
 };
 
-use crate::{bench, diff, envs, flows, graphql, guard, http};
+use crate::{bench, diff, envs, flows, graphql, guard, http, realtime};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -179,6 +179,15 @@ pub fn serve(
                     Err(format!("bench {bench_id} is not running"))
                 }
             }
+            (Some((_, actor)), Command::StreamSend { request_id, text }) => {
+                hub.stream_send(actor.clone(), request_id, text).map(|_| ReplyBody::StreamSent)
+            }
+            (Some(_), Command::StreamMessages { request_id, after, limit }) => {
+                match hub.stream_messages(request_id, after, limit.unwrap_or(STREAM_LIMIT).min(STREAM_LIMIT)) {
+                    Some((messages, open, more)) => Ok(ReplyBody::StreamMessages { messages, open, more }),
+                    None => Err(format!("request #{request_id} has not been a stream")),
+                }
+            }
             (Some(_), Command::Diff { a, b, ignore, no_defaults }) => {
                 let side = |id: u64| match hub.response(id) {
                     Some((entry, Some(response), _)) => Ok((
@@ -305,8 +314,18 @@ pub(crate) fn run_one(
     let redirects = rules.as_ref().is_none_or(|r| r.access != Access::Local);
     // Secret values that come back are replaced by their names before
     // anything is published or journalled.
+    // A WebSocket, or an answer of server-sent events, stays open as a
+    // stream until it's closed.
+    let link = realtime::Link { hub, actor, request_id, cancelled, secrets: &secrets };
+    let read_events = |head, reader, started| realtime::sse(&link, head, reader, started);
     let outcome = resolved
-        .and_then(|sending| http::execute(&sending, redirects, cancelled))
+        .and_then(|sending| {
+            if realtime::is_websocket(&sending) {
+                realtime::websocket(&link, &sending)
+            } else {
+                http::execute(&sending, redirects, cancelled, Some(&read_events))
+            }
+        })
         .map(|response| envs::redact_response(response, &secrets))
         .map_err(|error| envs::redact(&error, &secrets));
     // Checked on what clients see, secrets already taken out.

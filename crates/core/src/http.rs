@@ -90,9 +90,16 @@ fn response(res: &ureq::http::Response<ureq::Body>, bytes: Vec<u8>, timing: Timi
     }
 }
 
+/// What reads an answer of server-sent events once its head has come
+/// (see [`crate::realtime::sse`]): the head, timed to TTFB; the body as it
+/// arrives; when the request was sent.
+pub type EventsReader<'a> = &'a dyn Fn(HttpResponse, Box<dyn Read + Send>, Instant) -> Result<HttpResponse, String>;
+
 /// An error status is an answer, not a failure: only a request that got no
 /// answer at all is an `Err`. Without `redirects`, a redirect is the answer.
-pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
+/// An answer of server-sent events goes to `events`, if given, rather than
+/// being read to an end it may never have.
+pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool, events: Option<EventsReader>) -> Result<HttpResponse, String> {
     let marks = Arc::new(Mutex::new(Marks::default()));
     let connector = ()
         .chain(ConnectProxyConnector::default())
@@ -107,6 +114,13 @@ pub fn execute(req: &HttpRequest, redirects: bool, cancelled: &AtomicBool) -> Re
     let started = Instant::now();
     let mut res = agent.run(request).map_err(|e| e.to_string())?;
     let ttfb = started.elapsed();
+    if let Some(read_events) = events {
+        let ttfb_ms = ttfb.as_secs_f64() * 1000.0;
+        let head = response(&res, Vec::new(), marks.lock().unwrap().timing(ttfb_ms, ttfb_ms));
+        if crate::realtime::is_event_stream(&head.headers) {
+            return read_events(head, Box::new(res.into_body().into_reader()), started);
+        }
+    }
     let bytes = read_body(&mut res, cancelled)?;
     let total = started.elapsed();
     let timing = marks.lock().unwrap().timing(ttfb.as_secs_f64() * 1000.0, total.as_secs_f64() * 1000.0);

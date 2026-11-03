@@ -1456,3 +1456,238 @@ fn a_graphql_request_goes_as_json_its_errors_fail_it_and_its_schema_is_read() {
     assert_eq!(schema.to_sdl(), "type Query {\n  user(id: ID!): User\n}");
     core.stop();
 }
+
+/// A WebSocket server that answers every text message with it in capitals,
+/// and a close with a close. A path of `/nope` is refused with a 404.
+fn shouting_server() -> String {
+    use tracer_core::ws::{accept_key, frame, take_frame, CLOSE, TEXT};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut first, mut key) = (String::new(), String::new());
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("sec-websocket-key") {
+                            key = value.trim().to_string();
+                        }
+                    }
+                }
+                if first.contains("/nope") {
+                    let _ = write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nnope!");
+                    return;
+                }
+                let accept = accept_key(&key);
+                write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while let Ok(Some(f)) = take_frame(&mut buf, 1 << 20) {
+                        let reply = match f.opcode {
+                            TEXT => frame(TEXT, String::from_utf8(f.payload).unwrap().to_uppercase().as_bytes(), None),
+                            CLOSE => {
+                                let _ = stream.write_all(&frame(CLOSE, &f.payload, None));
+                                return;
+                            }
+                            _ => continue,
+                        };
+                        stream.write_all(&reply).unwrap();
+                    }
+                    match reader.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+    });
+    format!("ws://127.0.0.1:{port}")
+}
+
+fn messages(events: &[Event], id: u64) -> Vec<(u64, tracer_protocol::Direction, String)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::StreamMessage { request_id, message } if *request_id == id => {
+                Some((message.n, message.dir, message.text.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Events from `client` until `done` says the ones so far are enough.
+fn collect_until(client: &mut Client, seen: &mut Vec<Event>, done: impl Fn(&[Event]) -> bool) {
+    while !done(seen) {
+        seen.push(client.next_event().unwrap());
+    }
+}
+
+#[test]
+fn a_websocket_sends_its_body_waits_for_the_server_takes_more_and_closes_as_finished() {
+    use tracer_protocol::Direction::{In, Out};
+    use tracer_protocol::{Ended, HistoryFilter, StreamKind};
+    let ws = workspace("websocket");
+    let server = shouting_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer ws").unwrap();
+
+    let body = "===\nfirst\n=== wait-for-server\nsecond";
+    let request = HttpRequest { method: "WEBSOCKET".into(), url: format!("{server}/chat"), body: Some(body.into()), ..Default::default() };
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(Command::Send { request, env: None }).unwrap() else { panic!() };
+
+    let mut seen = Vec::new();
+    collect_until(&mut window, &mut seen, |s| messages(s, request_id).len() >= 4);
+    let opened = seen.iter().find_map(|e| match &e.kind {
+        EventKind::StreamOpened { request_id: id, kind, response } if *id == request_id => Some((*kind, response.status)),
+        _ => None,
+    });
+    assert_eq!(opened, Some((StreamKind::Websocket, 101)));
+    // "second" waited for the answer to "first".
+    assert_eq!(
+        messages(&seen, request_id),
+        vec![(1, Out, "first".into()), (2, In, "FIRST".into()), (3, Out, "second".into()), (4, In, "SECOND".into())]
+    );
+
+    // Anyone may send on it; the message is in their name.
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "claude-code").unwrap();
+    assert_eq!(agent.call(Command::StreamSend { request_id, text: "third".into() }).unwrap(), Ok(ReplyBody::StreamSent));
+    collect_until(&mut window, &mut seen, |s| messages(s, request_id).len() >= 6);
+    let third = seen.iter().find(|e| matches!(&e.kind, EventKind::StreamMessage { message, .. } if message.n == 5)).unwrap();
+    assert_eq!(third.actor.name, "claude-code");
+
+    // Closing it is cancelling it: it ends as finished, saying who closed it.
+    assert_eq!(window.call(Command::Cancel { request_id }).unwrap(), Ok(ReplyBody::Cancelled));
+    collect_until(&mut window, &mut seen, |s| matches!(s.last(), Some(Event { kind: EventKind::RequestFinished { .. }, .. })));
+    let closed = seen.iter().find_map(|e| match &e.kind {
+        EventKind::StreamClosed { request_id: id, reason, received, sent } if *id == request_id => {
+            Some((reason.clone(), *received, *sent))
+        }
+        _ => None,
+    });
+    assert_eq!(closed, Some(("closed by window".to_string(), 3, 3)));
+    assert!(!seen.iter().any(|e| matches!(e.kind, EventKind::RequestCancelled { .. })));
+    let Some(EventKind::RequestFinished { response, .. }) = seen.last().map(|e| &e.kind) else { unreachable!() };
+    assert_eq!((response.status, response.size), (101, "FIRSTSECONDTHIRD".len() as u64));
+
+    // Its messages read back a page at a time; sending on it is over.
+    let Ok(ReplyBody::StreamMessages { messages, open, more }) =
+        cli.call(Command::StreamMessages { request_id, after: 2, limit: Some(2) }).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(messages.iter().map(|m| m.message.n).collect::<Vec<_>>(), vec![3, 4]);
+    assert_eq!((open, more), (false, 2));
+    assert!(cli.call(Command::StreamSend { request_id, text: "late".into() }).unwrap().is_err());
+    let Ok(ReplyBody::History { entries, .. }) = cli.call(Command::History { filter: HistoryFilter::default() }).unwrap() else { panic!() };
+    assert!(matches!(entries[0].ended, Ended::Done { status: 101, .. }));
+
+    // A refused handshake is an ordinary answer, never a stream.
+    let request = HttpRequest { method: "WEBSOCKET".into(), url: format!("{server}/nope"), ..Default::default() };
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(Command::Send { request, env: None }).unwrap() else { panic!() };
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, request_id) else { panic!() };
+    assert_eq!((response.status, response.body.as_str()), (404, "nope!"));
+    assert!(cli.call(Command::StreamMessages { request_id, after: 0, limit: None }).unwrap().is_err());
+    core.stop();
+}
+
+/// Server-sent events: `/end` sends two and ends the answer; anything else
+/// sends three and then a comment every 100 ms, forever.
+fn events_server() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let end = first.contains("/end");
+                let head = if end {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                };
+                stream.write_all(head.as_bytes()).unwrap();
+                let chunk = |s: &mut TcpStream, text: &str| {
+                    let bytes = if end { text.to_string() } else { format!("{:x}\r\n{text}\r\n", text.len()) };
+                    s.write_all(bytes.as_bytes())
+                };
+                let n = if end { 2 } else { 3 };
+                for i in 1..=n {
+                    chunk(&mut stream, &format!("event: tick\nid: {i}\ndata: tick {i}\n\n")).unwrap();
+                    thread::sleep(Duration::from_millis(30));
+                }
+                if end {
+                    return;
+                }
+                while chunk(&mut stream, ": still here\n").is_ok() {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn an_event_stream_is_read_as_it_comes_until_the_server_ends_it_or_someone_closes_it() {
+    let ws = workspace("sse");
+    let server = events_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer send").unwrap();
+
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("{server}/live"))).unwrap() else { panic!() };
+    let mut seen = Vec::new();
+    collect_until(&mut window, &mut seen, |s| messages(s, request_id).len() >= 3);
+    let ticks: Vec<String> = messages(&seen, request_id).into_iter().map(|m| m.2).collect();
+    assert_eq!(ticks, ["tick 1", "tick 2", "tick 3"]);
+    let named = seen.iter().find_map(|e| match &e.kind {
+        EventKind::StreamMessage { message, .. } if message.n == 2 => Some((message.event.clone(), message.id.clone())),
+        _ => None,
+    });
+    assert_eq!(named, Some((Some("tick".into()), Some("2".into()))));
+    // Only the server sends on server-sent events.
+    assert!(cli.call(Command::StreamSend { request_id, text: "x".into() }).unwrap().is_err());
+
+    // Closed at once, though the server only sends comments.
+    let asked = std::time::Instant::now();
+    cli.call(Command::Cancel { request_id }).unwrap().unwrap();
+    let closed = wait_for(&mut window, |e| match &e.kind {
+        EventKind::StreamClosed { request_id: id, reason, received, .. } if *id == request_id => Some((reason.clone(), *received)),
+        _ => None,
+    });
+    assert_eq!(closed, ("closed by tracer send".into(), 3));
+    assert!(asked.elapsed() < Duration::from_secs(2));
+    assert!(matches!(end_of(&mut window, request_id), EventKind::RequestFinished { .. }));
+
+    // One the server ends finishes by itself.
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("{server}/end"))).unwrap() else { panic!() };
+    let closed = wait_for(&mut window, |e| match &e.kind {
+        EventKind::StreamClosed { request_id: id, reason, received, .. } if *id == request_id => Some((reason.clone(), *received)),
+        _ => None,
+    });
+    assert_eq!(closed, ("the server ended the stream".into(), 2));
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, request_id) else { panic!() };
+    assert_eq!(response.status, 200);
+    core.stop();
+}

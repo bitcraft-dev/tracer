@@ -5,18 +5,28 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-11-03)
+## Where it stands (2026-11-03, late)
+
+GraphQL committed (7ff184a), then **realtime** built and driven (see
+Done), committed on `phase-1-core`. Not pushed. Phase 4 is done except
+the response viewer (waits on AW-037) and benchmarking's later parts.
+Open findings **AW-037 to AW-040**, none told to the Rux team yet (draft
+and ask). AW-037's report was due 2026-10-31.
+
+Left running, not this session's: the user's `rux run`, window and core on
+`~/Tracer` (PIDs 10280, 14864, 15456; the window relaunched itself at
+22:47 when this session edited `app/native`, see the gotchas), and four
+Python processes from 2026-10-30 23:39/23:49, one of them a
+`SimpleHTTP` server on port 8765. The user's core runs from
+`target/debug/tracer-running-2026-11-02.exe` (renamed so cargo could
+build).
+
+## Where it stood (2026-11-03)
 
 The 2026-10-31 session hit its usage limit after GraphQL's core, CLI, MCP
 and native exports, with the page's patch written but not run. This one
 applied it, fixed what driving it found, and drove GraphQL end to end
-(see Done). **Uncommitted** on `phase-1-core`, together with a reformat of
-`app/app.rux`'s CSS (one property per line, deeper template indent) that
-was already in the tree, likely an editor formatter. New findings:
-**AW-038, AW-039, AW-040**, all open and not yet told to the Rux team
-(draft and ask). AW-037's report, due 2026-10-31, still has to be drafted.
-A Tracer window, `rux run` and core on `~/Tracer` from 2026-11-02 22:33
-(PIDs 5816, 15456, 10280) were running and were left alone: the user's.
+(see Done). New findings: **AW-038, AW-039, AW-040**.
 
 ## Where it stood (2026-10-31)
 
@@ -427,17 +437,52 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   fixed too), and **AW-039** from `rux check` (`try`/`catch` that both
   return "returns none").
 
+- **Phase 4: realtime** (`crates/core/src/realtime.rs`, `ws.rs`,
+  2026-11-03). A stream is a request that stays open, so history, policy,
+  approvals, variables and secret redaction hold unchanged. `WEBSOCKET
+  ws(s)://…` (JetBrains' method; body = messages to send on open, split by
+  `===` lines, `=== wait-for-server`) does its own handshake over TCP and
+  `rustls` (already in the lock through ureq, ring + webpki roots), timed
+  like any request; a ping after 25 s quiet keeps it up. Any answer of
+  `text/event-stream` is read as SSE (spec parser: CR/LF/CRLF, multi-line
+  data, event, id, comments), on a reader thread so a close is prompt.
+  Events `stream_opened` (head), `stream_message` (n both ways, dir, text
+  cut at 64 KiB, binary as size + hex, SSE event/id), `stream_closed`
+  (reason, counts), then `request_finished` (101/200, total time open,
+  bytes in). `Cancel` on an open stream closes it ("closed by X"),
+  including the kill switch; `StreamSend`, `StreamMessages {after,
+  limit}`. A refused handshake (404…) is an ordinary answer. Benching a
+  WebSocket is refused. `ws.rs` now holds the framing, SHA-1 and base64
+  for the local API too. CLI `tracer ws URL [-m]…` (stdin lines sent, EOF
+  closes unless `--for`/`--count`), and `send`/`run` print a stream live
+  with `--for 10s` / `--count N`. MCP `open_stream`, `read_stream`
+  (waits for one still connecting), `send_stream_message`,
+  `close_stream`. Window: a **Realtime** rail item (method WEBSOCKET, URL
+  to ws(s)://, Body tab becomes Messages), a Messages tab on any stream
+  (↓/↑, n, time, event, sender; newest first, 500 shown), a composer on an
+  open WebSocket (Enter), Close in place of Cancel, the closed reason and
+  counts, palette commands. 73 tests, three runs clean. Driven: CLI and
+  window against wss://echo.websocket.org (TLS, echoes, 70 s idle held
+  with the ping; without it the server dropped it at 35–49 s, Node's
+  WebSocket too), Wikimedia's recentchange SSE (CLI), a local ticker at
+  5/s and a 1,000-event burst in the window (responsive, 0.6 s CPU),
+  and an MCP agent: open asked for approval, allowed with `tracer
+  approve`, read, sent, closed "closed by test-agent".
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Commit GraphQL (ask about the CSS reformat riding along), then draft
-   the Rux team's message for AW-037 to AW-040 and ask before sending.
-3. Phase 4, what doesn't need the viewer first: realtime (WebSocket, SSE).
-   GraphQL follow-ups, untried: a schema-aware query editor (completion
-   needs the viewer's line work), subscriptions (with realtime).
-   Benchmarking's later parts: two environments side by side,
+2. Draft the Rux team's message for AW-037 to AW-040 and ask before
+   sending.
+3. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
+   WebSocket); a `tracer` command to send on someone else's open
+   WebSocket (MCP and the window can); saving a WebSocket's messages as a
+   transcript; reconnecting SSE with `Last-Event-ID`; leaving the
+   Realtime mode keeps the WebSocket's body, which a GET then sends.
+   GraphQL follow-ups: a schema-aware query editor (needs the viewer's
+   line work). Benchmarking's later parts: two environments side by side,
    saved baselines with regression flags, rate-limit detection.
    Flows follow-up, untried: a flow step keeps its URL as written
    (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
@@ -532,6 +577,20 @@ Things that cost a round trip once. Check here before debugging them again.
   hot reload: restart it after `.rux` edits). Drive it with `drive.ps1 -Id
   <pid>`, which otherwise picks the first `tracer` window. A watchdog must
   skip PIDs that were already running.
+- **The user's `rux run` rebuilds and relaunches its window when
+  `app/native` changes**, even one started days ago: editing `tracer.rs`
+  replaced the user's window (2026-11-03 22:47). Expected, but say so.
+- **A running core of the user's holds `target/debug/tracer.exe`**: rename
+  it (`mv target/debug/tracer.exe target/debug/tracer-running-<date>.exe`;
+  Windows allows renaming a running exe) rather than stopping their core.
+  This session's own cores must be stopped before each `cargo build`
+  (`tracer stop -w <ws>`; `tracer mcp` starts one too).
+- **Port 8765 is taken** by a `SimpleHTTP` server from 2026-10-30, which
+  answers 127.0.0.1 although the scratch server bound it too; test servers
+  use 18765.
+- Public SSE for a check: `sse.dev` doesn't resolve on this network;
+  `https://stream.wikimedia.org/v2/stream/recentchange` (with a
+  User-Agent) works and is fast, so use `--count`.
 - **Patch scripts against `app.rux` break when a formatter reindents it**
   (2026-11-03: the template went from 2 to 4 spaces a level). The
   fix used then: match anchor lines by trimmed text (the last one as a

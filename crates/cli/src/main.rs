@@ -4,6 +4,7 @@
 //! tracer core                       run the core for this workspace
 //! tracer status                     who is connected, how far the journal goes
 //! tracer send GET https://…         send a request and print its answer
+//! tracer ws wss://…                 open a WebSocket: type to send, EOF closes
 //! tracer ls                         list the saved requests
 //! tracer save <PATH> GET https://…  save a request as requests/<PATH>.http
 //! tracer run <PATH>                 send a saved request
@@ -34,7 +35,8 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    BenchPlan, BenchStats, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, Timing, DISCOVERY_PATH,
+    BenchPlan, BenchStats, Direction, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, StreamKind,
+    Timing, DISCOVERY_PATH, WEBSOCKET,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -51,6 +53,17 @@ usage:
                                       --expect, check it (status 2xx, $.id == 1,
                                       header Content-Type contains json, time < 500)
                                       and fail if a check does
+  tracer ws <URL> [-H 'Name: value']... [-m <MESSAGE>]... [--env <NAME>]
+                                      open a WebSocket (ws:// or wss://), send each
+                                      -m once open, then each line typed; what comes
+                                      in goes to stdout; end of input closes it,
+                                      unless --for or --count says when
+  (send, run, ws) [--for <DURATION>] [--count <N>]
+                                      a stream (a WebSocket, or an answer of
+                                      text/event-stream) prints its messages as they
+                                      come and stays open until closed: by
+                                      `tracer cancel <ID>`, after DURATION (10s, 2m),
+                                      or after N messages have come in
   tracer ls                           list the saved requests
   tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--expect '…']...
                                       save a request as requests/<PATH>.http, its
@@ -117,6 +130,7 @@ fn main() -> ExitCode {
         Some("core") => core(workspace),
         Some("status") => status(workspace),
         Some("send") => send(workspace, args[1..].to_vec()),
+        Some("ws") => ws(workspace, args[1..].to_vec()),
         Some("ls") => ls(workspace),
         Some("save") => save(workspace, args[1..].to_vec()),
         Some("run") => run(workspace, args[1..].to_vec()),
@@ -296,8 +310,82 @@ fn cancel(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
 
 fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let env = take_value(&mut args, "--env");
+    let until = Until::take(&mut args, false)?;
     let request = request_from(args)?;
-    send_and_wait(&workspace, Command::Send { request, env }, "tracer send")
+    send_and_wait(&workspace, Command::Send { request, env }, "tracer send", until)
+}
+
+fn ws(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let env = take_value(&mut args, "--env");
+    let until = Until::take(&mut args, true)?;
+    let mut messages = Vec::new();
+    while let Some(m) = take_value(&mut args, "-m") {
+        messages.push(m);
+    }
+    let Some(url) = args.pop() else { return Err(io::Error::other(USAGE)) };
+    args.extend([WEBSOCKET.to_string(), url]);
+    let mut request = request_from(args)?;
+    if !messages.is_empty() {
+        request.body = Some(messages.iter().map(|m| format!("===\n{m}\n")).collect());
+    }
+    send_and_wait(&workspace, Command::Send { request, env }, "tracer ws", until)
+}
+
+/// When a stream the CLI opened is to be closed, besides by `tracer
+/// cancel`: after a time, after a number of messages in, or (for `tracer
+/// ws`) at the end of what's typed, each line typed being sent.
+#[derive(Clone, Copy, Default)]
+struct Until {
+    secs: Option<u64>,
+    count: Option<u64>,
+    stdin: bool,
+}
+
+impl Until {
+    fn take(args: &mut Vec<String>, stdin: bool) -> io::Result<Until> {
+        let secs = take_value(args, "--for").map(|t| seconds(&t)).transpose()?;
+        let count = take_value(args, "--count")
+            .map(|n| n.parse().map_err(|_| io::Error::other(format!("--count takes a number, not `{n}`"))))
+            .transpose()?;
+        Ok(Until { secs, count, stdin })
+    }
+
+    /// Once stream `request_id` is open: close it after the time, and send
+    /// what's typed. Each on a connection of its own, so the main one keeps
+    /// reading events.
+    fn start(self, workspace: &PathBuf, request_id: u64, websocket: bool) {
+        if let Some(secs) = self.secs {
+            let workspace = workspace.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                close(&workspace, request_id);
+            });
+        }
+        if self.stdin && websocket {
+            let workspace = workspace.clone();
+            std::thread::spawn(move || {
+                let Ok(mut c) = Client::connect(&workspace, ClientKind::Cli, "tracer ws") else { return };
+                for line in io::stdin().lines() {
+                    let Ok(text) = line else { break };
+                    if let Ok(Err(e)) = c.call(Command::StreamSend { request_id, text }) {
+                        eprintln!("tracer: {e}");
+                        break;
+                    }
+                }
+                // Unless told when to close it, which piped input needs.
+                if self.secs.is_none() && self.count.is_none() {
+                    let _ = c.call(Command::Cancel { request_id });
+                }
+            });
+        }
+    }
+}
+
+/// Close stream `request_id`, on a connection of its own.
+fn close(workspace: &PathBuf, request_id: u64) {
+    if let Ok(mut c) = Client::connect(workspace, ClientKind::Cli, "tracer") {
+        let _ = c.call(Command::Cancel { request_id });
+    }
 }
 
 fn history(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
@@ -370,7 +458,7 @@ fn rerun(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let env = if no_env { Some(String::new()) } else { env };
     let [id] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
     let request_id = id.trim_start_matches('#').parse().map_err(|_| io::Error::other(format!("`{id}` is not a request id")))?;
-    send_and_wait(&workspace, Command::Rerun { request_id, env }, "tracer rerun")
+    send_and_wait(&workspace, Command::Rerun { request_id, env }, "tracer rerun", Until::default())
 }
 
 fn diff(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
@@ -516,6 +604,7 @@ fn save(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
 
 fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let env = take_value(&mut args, "--env");
+    let until = Until::take(&mut args, false)?;
     let report = take_value(&mut args, "--report");
     if report.as_deref().is_some_and(|r| r != "json") {
         return Err(io::Error::other("--report takes json"));
@@ -534,7 +623,9 @@ fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let wanted = wanted.strip_suffix(".http").unwrap_or(wanted).trim_end_matches('/');
     let (requests, _) = saved(&workspace, "tracer run")?;
     match requests.into_iter().find(|r| r.path == wanted) {
-        Some(found) if report.is_none() => send_and_wait(&workspace, Command::Send { request: found.request, env }, "tracer run"),
+        Some(found) if report.is_none() => {
+            send_and_wait(&workspace, Command::Send { request: found.request, env }, "tracer run", until)
+        }
         // A folder, or one request wanted as a report: a flow.
         _ => flow(&workspace, wanted, env, keep_going, report.is_some()),
     }
@@ -911,8 +1002,9 @@ fn saved(workspace: &PathBuf, name: &str) -> io::Result<(Vec<SavedRequest>, Vec<
     }
 }
 
-/// Send a request (`Send` or `Rerun`) and print its answer when it comes.
-fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Result<ExitCode> {
+/// Send a request (`Send` or `Rerun`) and print its answer when it comes;
+/// a stream's messages as they come, until it's closed.
+fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str, until: Until) -> io::Result<ExitCode> {
     let mut client = Client::connect(workspace, ClientKind::Cli, name)?;
     // Subscribed before sending, so the answer cannot go past unseen.
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
@@ -926,8 +1018,54 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Resul
     let mut checked = false;
     // How it ended, kept while its checks are awaited.
     let mut ended: Option<io::Result<ExitCode>> = None;
+    // Whether it stayed open as a stream, and the messages in so far.
+    let mut streamed = false;
+    let mut received = 0u64;
     loop {
         let event = client.next_event()?;
+        match &event.kind {
+            EventKind::StreamOpened { request_id: id, kind, response } if *id == request_id => {
+                streamed = true;
+                let (what, how) = match kind {
+                    StreamKind::Websocket if until.stdin => ("WebSocket", "type a line to send it; end of input closes it"),
+                    StreamKind::Websocket => ("WebSocket", "`tracer cancel` closes it"),
+                    StreamKind::Sse => ("server-sent events", "`tracer cancel` closes it"),
+                };
+                eprintln!(
+                    "{} · TTFB {:.0} ms{} · {what} open; {how}",
+                    response.status,
+                    response.timing.ttfb_ms,
+                    phases(&response.timing)
+                );
+                until.start(workspace, request_id, *kind == StreamKind::Websocket);
+                continue;
+            }
+            EventKind::StreamMessage { request_id: id, message } if *id == request_id => {
+                match message.dir {
+                    Direction::In => {
+                        let tags: Vec<String> = [("event", &message.event), ("id", &message.id)]
+                            .iter()
+                            .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k} {v}")))
+                            .collect();
+                        if !tags.is_empty() {
+                            eprintln!("· {}", tags.join(" · "));
+                        }
+                        println!("{}", message.text);
+                        received += 1;
+                        if until.count == Some(received) {
+                            close(workspace, request_id);
+                        }
+                    }
+                    Direction::Out => eprintln!("↑ {}", message.text),
+                }
+                continue;
+            }
+            EventKind::StreamClosed { request_id: id, reason, received, sent } if *id == request_id => {
+                eprintln!("{reason} · {received} in, {sent} out");
+                continue;
+            }
+            _ => {}
+        }
         if let EventKind::RequestStarted { request_id: id, request, .. } = &event.kind {
             if *id == request_id {
                 checked = request.is_checked();
@@ -964,7 +1102,9 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str) -> io::Resul
                     response.timing.total_ms,
                     response.size
                 );
-                println!("{}", response.body);
+                if !streamed {
+                    println!("{}", response.body);
+                }
                 let outcome = Ok(if response.status < 400 { ExitCode::SUCCESS } else { ExitCode::FAILURE });
                 if !checked {
                     return outcome;
@@ -1077,6 +1217,19 @@ fn describe(event: &Event) -> String {
         EventKind::PolicyChanged { rules, error: None } => {
             let each: Vec<String> = rules.iter().map(describe_rules).collect();
             format!("agents.policy changed: {}", each.join("; "))
+        }
+        EventKind::StreamOpened { request_id, kind, response } => {
+            let what = if *kind == StreamKind::Websocket { "WebSocket" } else { "server-sent events" };
+            format!("#{request_id} {what} open ({})", response.status)
+        }
+        EventKind::StreamMessage { request_id, message } => {
+            let arrow = if message.dir == Direction::In { "↓" } else { "↑" };
+            let event = message.event.as_ref().map(|e| format!("[{e}] ")).unwrap_or_default();
+            let line: String = message.text.lines().next().unwrap_or("").chars().take(120).collect();
+            format!("#{request_id} {arrow}{} {event}{line}", message.n)
+        }
+        EventKind::StreamClosed { request_id, reason, received, sent } => {
+            format!("#{request_id} {reason} ({received} in, {sent} out)")
         }
         EventKind::CoreStopping => "stopped the core".to_string(),
     };

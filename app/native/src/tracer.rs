@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
-    BenchPlan, BenchStats, ClientKind, Command, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest, StepOutcome,
-    BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
+    BenchPlan, BenchStats, ClientKind, Command, Direction, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest,
+    StepOutcome, StreamKind, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
 };
 
 /// The most of a response body handed to the page. The core and its journal
@@ -58,7 +58,8 @@ pub struct CoreEvent {
     /// `client_joined`, `client_left`, `request_started`, `request_finished`,
     /// `request_failed`, `request_cancelled`, `request_saved`,
     /// `request_deleted`, `environment_changed`, `approval_asked`,
-    /// `approval_given`, `agents_switched`, `policy_changed` or
+    /// `approval_given`, `agents_switched`, `policy_changed`,
+    /// `stream_opened`, `stream_message`, `stream_closed` or
     /// `core_stopping`.
     pub kind: String,
     /// A saved request's path, for `request_saved` and `request_deleted`.
@@ -105,6 +106,20 @@ pub struct CoreEvent {
     /// How the bench stands, for those three; for `bench_finished`, `reason`
     /// says why it stopped early, or is "".
     pub stats: BenchNow,
+    /// A stream's kind (`websocket` or `sse`), for `stream_opened`; for
+    /// `stream_closed`, `reason` says why it closed.
+    pub stream: String,
+    /// A `stream_message`'s number in its stream, its way (`in` or `out`),
+    /// its server-sent event's name, and whether it's binary (then `body`
+    /// tells its size and first bytes). Its text is `body`, its whole size
+    /// `size`.
+    pub n: u64,
+    pub dir: String,
+    pub sse_event: String,
+    pub binary: bool,
+    /// Messages each way, for `stream_closed`.
+    pub received: u64,
+    pub sent: u64,
 }
 
 /// A GraphQL server's schema: its root types by name ("" where it has
@@ -496,6 +511,17 @@ pub fn cancel(request_id: u64) -> Result<(), CoreError> {
     }
 }
 
+/// Send `text` on open WebSocket `request_id`. It shows as an outgoing
+/// `stream_message` once it has gone. A stream is closed with [`cancel`].
+#[rux::export]
+pub fn stream_send(request_id: u64, text: String) -> Result<(), CoreError> {
+    match shared()?.call(Command::StreamSend { request_id, text }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// The workspace's saved requests, read from its files by the core.
 #[rux::export]
 pub async fn list_requests() -> Result<Collection, CoreError> {
@@ -797,6 +823,13 @@ fn to_page(event: Event) -> CoreEvent {
         flow: 0,
         bench: 0,
         stats: bench_now(None, &BenchStats::default()),
+        stream: String::new(),
+        n: 0,
+        dir: String::new(),
+        sse_event: String::new(),
+        binary: false,
+        received: 0,
+        sent: 0,
     };
     let headers = headers_of;
     match event.kind {
@@ -898,6 +931,32 @@ fn to_page(event: Event) -> CoreEvent {
         EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
         EventKind::PolicyChanged { error, .. } => {
             (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
+        }
+        EventKind::StreamOpened { request_id, kind, response } => {
+            (out.kind, out.request_id) = ("stream_opened".into(), request_id);
+            out.stream = match kind {
+                StreamKind::Websocket => "websocket",
+                StreamKind::Sse => "sse",
+            }
+            .into();
+            out.status = response.status as u32;
+            out.headers = headers(response.headers);
+            out.ttfb_ms = response.timing.ttfb_ms;
+            out.dns_ms = response.timing.dns_ms.unwrap_or(-1.0);
+            out.connect_ms = response.timing.connect_ms.unwrap_or(-1.0);
+            out.tls_ms = response.timing.tls_ms.unwrap_or(-1.0);
+        }
+        EventKind::StreamMessage { request_id, message } => {
+            (out.kind, out.request_id, out.n) = ("stream_message".into(), request_id, message.n);
+            out.dir = if message.dir == Direction::In { "in" } else { "out" }.into();
+            out.sse_event = message.event.unwrap_or_default();
+            out.binary = message.binary;
+            out.size = message.size;
+            out.body = message.text;
+        }
+        EventKind::StreamClosed { request_id, reason, received, sent } => {
+            (out.kind, out.request_id, out.reason) = ("stream_closed".into(), request_id, reason);
+            (out.received, out.sent) = (received, sent);
         }
         EventKind::CoreStopping => out.kind = "core_stopping".into(),
     }

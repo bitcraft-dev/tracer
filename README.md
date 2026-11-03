@@ -57,6 +57,37 @@ run`, `tracer send --expect '…'` and `tracer rerun` print each and exit 1
 if one fails; the window has a Checks tab on both sides; agents pass
 `expect` and get `checks` back.
 
+## Streams: WebSocket and server-sent events
+
+A `WEBSOCKET` request, as JetBrains writes it, opens a WebSocket; its body
+is the messages to send once it's open, each after a line of `===` (`===
+wait-for-server` waits for the server to say something first). Any request
+answered with `text/event-stream` is read as server-sent events.
+
+```http
+WEBSOCKET wss://echo.websocket.org
+
+===
+{"hello": "{{name}}"}
+=== wait-for-server
+second
+```
+
+A stream is a request like any other (history, policy, approvals,
+variables, secrets kept out) that stays open: every message, either way,
+is numbered and shows live in the window, the CLI and to agents. Closing
+it is cancelling it; it ends as finished, saying who closed it.
+
+```bash
+tracer ws wss://… -m hello -w <dir>          # type to send; end of input closes it
+tracer send GET https://…/events --count 10  # print 10 events, then close
+tracer cancel 12 -w <dir>                    # close stream #12, whoever opened it
+```
+
+Agents have `open_stream`, `read_stream`, `send_stream_message` and
+`close_stream`; opening a WebSocket counts as a write, so by default a
+person allows it.
+
 ## The local API
 
 Anything else (a script, a web page on this machine, another tool) talks

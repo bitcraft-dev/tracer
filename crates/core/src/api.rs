@@ -27,6 +27,7 @@ use tracer_protocol::{ClientKind, Outcome, ServerMessage, PROTOCOL_VERSION};
 
 use crate::conn;
 use crate::hub::Hub;
+use crate::ws::{accept_key, frame, CLOSE, PING, PONG, TEXT};
 use crate::Stop;
 
 /// The most a request's head or body, or a WebSocket message, may be.
@@ -209,7 +210,7 @@ fn websocket(reader: BufReader<TcpStream>, mut out: TcpStream, head: &Head, hub:
     let Some(key) = head.header("sec-websocket-key").filter(|_| upgrade) else {
         return respond(&mut out, 400, &json!({ "error": "/v1/ws is a WebSocket: send Upgrade: websocket" }));
     };
-    let accept = base64(&sha1(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()));
+    let accept = accept_key(key);
     let handshake = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
@@ -223,26 +224,8 @@ fn websocket(reader: BufReader<TcpStream>, mut out: TcpStream, head: &Head, hub:
     conn::serve(Frames { reader, out }, write_line, hub, token, stop);
 }
 
-const TEXT: u8 = 0x1;
-const CLOSE: u8 = 0x8;
-const PING: u8 = 0x9;
-const PONG: u8 = 0xA;
-
 fn write_frame(out: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
-    let mut frame = vec![0x80 | opcode];
-    match payload.len() {
-        n if n < 126 => frame.push(n as u8),
-        n if n <= u16::MAX as usize => {
-            frame.push(126);
-            frame.extend_from_slice(&(n as u16).to_be_bytes());
-        }
-        n => {
-            frame.push(127);
-            frame.extend_from_slice(&(n as u64).to_be_bytes());
-        }
-    }
-    frame.extend_from_slice(payload);
-    out.write_all(&frame)?;
+    out.write_all(&frame(opcode, payload, None))?;
     out.flush()
 }
 
@@ -317,72 +300,9 @@ impl Iterator for Frames {
     }
 }
 
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
-    for block in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
-        for (i, wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | (!b & d), 0x5A827999),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
-            (e, d, c, b, a) = (d, c, b.rotate_left(30), a, t);
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    let mut out = [0u8; 20];
-    for (i, x) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&x.to_be_bytes());
-    }
-    out
-}
-
-fn base64(data: &[u8]) -> String {
-    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_handshake_answers_as_rfc_6455_says() {
-        let key = "dGhlIHNhbXBsZSBub25jZQ==";
-        let accept = base64(&sha1(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()));
-        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-        assert_eq!(base64(b"ab"), "YWI=");
-        assert_eq!(base64(b"a"), "YQ==");
-    }
 
     #[test]
     fn only_this_machine_is_answered() {

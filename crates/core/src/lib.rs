@@ -23,6 +23,8 @@ mod guard;
 mod http;
 mod hub;
 mod policy;
+mod realtime;
+pub mod ws;
 
 use std::collections::hash_map::RandomState;
 use std::fs;

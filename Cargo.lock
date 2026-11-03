@@ -324,9 +324,11 @@ dependencies = [
 name = "tracer-core"
 version = "0.1.0"
 dependencies = [
+ "rustls",
  "serde_json",
  "tracer-protocol",
  "ureq",
+ "webpki-roots",
 ]
 
 [[package]]
