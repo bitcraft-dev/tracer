@@ -45,6 +45,10 @@ pub const SECRETS_DIR: &str = ".tracer/secrets";
 /// meant to be committed with the workspace.
 pub const POLICY_PATH: &str = "agents.policy";
 
+/// Where saved benches live, one `<name>.json` each ([`Baseline`]), beside
+/// `requests/` so they can be checked in and a CI run compared against them.
+pub const BASELINES_DIR: &str = "baselines";
+
 /// Where the core is listening and what it wants to hear first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
@@ -189,6 +193,24 @@ pub enum Command {
     /// Stop a running bench, whoever started it. It ends with
     /// `bench_finished`, naming who stopped it.
     StopBench { bench_id: u64 },
+    /// Keep finished bench `bench_id` as baseline `name`
+    /// (`baselines/<name>.json`, replacing one of that name).
+    SaveBaseline { bench_id: u64, name: String },
+    /// The workspace's baselines, by name.
+    ListBaselines,
+    /// How finished bench `bench_id` compares with `baseline`, or with
+    /// another finished bench, `other_bench` (one of the two): each latency,
+    /// the throughput, the error and rate-limited shares, each flagged worse
+    /// past `tolerance_pct` ([`BENCH_TOLERANCE_PCT`] if not given).
+    CompareBench {
+        bench_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        baseline: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other_bench: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tolerance_pct: Option<f64>,
+    },
     /// The GraphQL schema in finished request `request_id`'s answer: one
     /// sent with the introspection query ([`GRAPHQL_INTROSPECTION`]).
     GraphqlSchema { request_id: u64 },
@@ -423,9 +445,161 @@ pub struct BenchStats {
     pub per_sec: f64,
     /// Answers in each bucket of [`BENCH_BUCKETS_MS`], one more for slower.
     pub histogram: Vec<u64>,
+    /// What it saw of the server limiting its rate, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitSeen>,
 }
 
+/// A bench's view of a server's rate limiting: answers that said "slow
+/// down" (429, or 503 with `Retry-After`), when the first came, and what
+/// the server said of its limit in headers (`X-RateLimit-*`, `RateLimit-*`,
+/// `Retry-After`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitSeen {
+    pub limited: u64,
+    /// Requests answered before the first limited one, when that came (ms
+    /// into the bench), and the rate they came at: about what the server
+    /// lets through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_at_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_sec_before: Option<f64>,
+    /// The limit as the server last stated it (`X-RateLimit-Limit: 100`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// The least it said remained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_min: Option<u64>,
+    /// Its last `Retry-After`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
+}
+
+impl RateLimitSeen {
+    /// `limited 37 times, first after 120 requests (4.1 s in, 29.3 a
+    /// second); limit X-RateLimit-Limit: 100; retry after 30`
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.limited > 0 {
+            let mut first = format!("limited {} time{}", self.limited, if self.limited == 1 { "" } else { "s" });
+            if let (Some(n), Some(ms)) = (self.first_after, self.first_at_ms) {
+                first.push_str(&format!(", first after {n} requests ({:.1} s in", ms / 1000.0));
+                if let Some(rate) = self.per_sec_before {
+                    first.push_str(&format!(", {rate:.1} a second"));
+                }
+                first.push(')');
+            }
+            parts.push(first);
+        } else {
+            parts.push("not limited".to_string());
+        }
+        if let Some(limit) = &self.limit {
+            parts.push(format!("limit {limit}"));
+        }
+        if let Some(left) = self.remaining_min {
+            parts.push(format!("{left} left at the least"));
+        }
+        if let Some(after) = &self.retry_after {
+            parts.push(format!("retry after {after}"));
+        }
+        parts.join("; ")
+    }
+}
+
+/// The tolerance a bench comparison flags changes past, in percent.
+pub const BENCH_TOLERANCE_PCT: f64 = 20.0;
+/// A latency must also change by this much to count: 1 ms against 1.3 ms
+/// is noise, not a 30 % regression.
+pub const BENCH_LATENCY_FLOOR_MS: f64 = 2.0;
+/// The error and limited shares are flagged when they move by more than
+/// this many percentage points.
+pub const BENCH_SHARE_FLOOR_PCT: f64 = 1.0;
+
+/// A finished bench kept to compare later ones with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Baseline {
+    pub name: String,
+    pub bench_id: u64,
+    /// Milliseconds since the Unix epoch.
+    pub saved_at_ms: u64,
+    /// The request as written, with the environment it was sent with.
+    pub request: HttpRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    pub plan: BenchPlan,
+    pub stats: BenchStats,
+}
+
+/// One measure of two benches, before and after.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BenchDelta {
+    /// `p95_ms`, `per_sec`, `error_pct`, …
+    pub metric: String,
+    pub before: f64,
+    pub after: f64,
+    /// After against before, in percent (+25: a quarter more); for the
+    /// shares, the change in percentage points.
+    pub change: f64,
+    pub worse: bool,
+    pub better: bool,
+}
+
+/// Two benches compared: `after` against `before`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BenchComparison {
+    /// `baseline main`, `bench 3 (env staging)`.
+    pub before: String,
+    pub after: String,
+    pub tolerance_pct: f64,
+    pub deltas: Vec<BenchDelta>,
+    /// Whether any measure got worse past the tolerance.
+    pub regressed: bool,
+    /// What makes them less comparable: different plans, requests or
+    /// environments, a bench stopped early.
+    pub notes: Vec<String>,
+}
 impl BenchStats {
+    /// The share of requests that went wrong, in percent.
+    pub fn error_pct(&self) -> f64 {
+        if self.done == 0 { 0.0 } else { self.bad() as f64 * 100.0 / self.done as f64 }
+    }
+
+    /// The share answered "slow down", in percent.
+    pub fn limited_pct(&self) -> f64 {
+        let limited = self.rate_limit.as_ref().map_or(0, |r| r.limited);
+        if self.done == 0 { 0.0 } else { limited as f64 * 100.0 / self.done as f64 }
+    }
+
+    /// `after` measured against `self`: each latency (worse when slower by
+    /// more than `tolerance_pct` and [`BENCH_LATENCY_FLOOR_MS`]), the
+    /// throughput (worse when lower by more than `tolerance_pct`), and the
+    /// error and limited shares (worse when up by more than
+    /// [`BENCH_SHARE_FLOOR_PCT`] points).
+    pub fn deltas(&self, after: &BenchStats, tolerance_pct: f64) -> Vec<BenchDelta> {
+        let tol = tolerance_pct / 100.0;
+        let pct = |b: f64, a: f64| if b == 0.0 { if a == 0.0 { 0.0 } else { 100.0 } } else { (a - b) * 100.0 / b };
+        let mut out = Vec::new();
+        for (metric, b, a) in [
+            ("mean_ms", self.mean_ms, after.mean_ms),
+            ("p50_ms", self.p50_ms, after.p50_ms),
+            ("p95_ms", self.p95_ms, after.p95_ms),
+            ("p99_ms", self.p99_ms, after.p99_ms),
+        ] {
+            let moved = (a - b).abs() > BENCH_LATENCY_FLOOR_MS && (a - b).abs() > b * tol;
+            out.push(BenchDelta { metric: metric.into(), before: b, after: a, change: pct(b, a), worse: moved && a > b, better: moved && a < b });
+        }
+        let (b, a) = (self.per_sec, after.per_sec);
+        let moved = (a - b).abs() > b * tol;
+        out.push(BenchDelta { metric: "per_sec".into(), before: b, after: a, change: pct(b, a), worse: moved && a < b, better: moved && a > b });
+        for (metric, b, a) in [("error_pct", self.error_pct(), after.error_pct()), ("limited_pct", self.limited_pct(), after.limited_pct())] {
+            let moved = (a - b).abs() > BENCH_SHARE_FLOOR_PCT;
+            out.push(BenchDelta { metric: metric.into(), before: b, after: a, change: a - b, worse: moved && a > b, better: moved && a < b });
+        }
+        out
+    }
+
     /// Requests that went wrong in any way: no answer, a status of 400 or
     /// more, or a failed expectation.
     pub fn bad(&self) -> u64 {
@@ -898,6 +1072,9 @@ pub enum ReplyBody {
     FlowStarted { flow_id: u64, steps: Vec<String> },
     BenchStarted { bench_id: u64 },
     BenchStopped,
+    BaselineSaved { name: String, path: String },
+    Baselines { baselines: Vec<Baseline>, skipped: Vec<String> },
+    BenchCompared { comparison: BenchComparison },
     GraphqlSchema { schema: GqlSchema },
     StreamSent,
     StreamMessages {
@@ -999,6 +1176,8 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stopped: Option<String>,
     },
+    /// Finished bench `bench_id` was kept as baseline `name`.
+    BaselineSaved { name: String, bench_id: u64 },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The policy file changed. `rules` are what agents get from now on;

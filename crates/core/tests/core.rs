@@ -1691,3 +1691,98 @@ fn an_event_stream_is_read_as_it_comes_until_the_server_ends_it_or_someone_close
     assert_eq!(response.status, 200);
     core.stop();
 }
+
+/// `/limited` answers 200 twenty times with `X-RateLimit-*` headers, then
+/// 429 with `Retry-After`; anything else is always 200.
+fn limiting_server() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = Arc::new(AtomicU64::new(0));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let served = served.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut first = String::new();
+                    if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let head = if first.contains("/limited") {
+                        let n = served.fetch_add(1, Ordering::SeqCst);
+                        if n < 20 {
+                            format!("200 OK\r\nX-RateLimit-Limit: 20\r\nX-RateLimit-Remaining: {}", 19 - n)
+                        } else {
+                            "429 Too Many Requests\r\nRetry-After: 60\r\nX-RateLimit-Remaining: 0".to_string()
+                        }
+                    } else {
+                        "200 OK".to_string()
+                    };
+                    if write!(stream, "HTTP/1.1 {head}\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_bench_notices_rate_limiting_and_a_baseline_catches_the_regression() {
+    use tracer_protocol::BenchPlan;
+    let ws = workspace("baseline");
+    let base = limiting_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer bench").unwrap();
+    cli.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let plan = BenchPlan { total: Some(40), concurrency: 1, ..Default::default() };
+    let run = |cli: &mut Client, path: &str| {
+        let Ok(ReplyBody::BenchStarted { bench_id }) = cli.call(bench(format!("{base}{path}"), plan.clone())).unwrap() else { panic!() };
+        (bench_id, bench_end(cli, bench_id).0)
+    };
+
+    let (good, stats) = run(&mut cli, "/ok");
+    assert_eq!((stats.done, stats.bad(), stats.rate_limit), (40, 0, None));
+    let Ok(ReplyBody::BaselineSaved { name, path }) = cli.call(Command::SaveBaseline { bench_id: good, name: "main".into() }).unwrap() else {
+        panic!()
+    };
+    assert_eq!((name.as_str(), path.as_str()), ("main", "baselines/main.json"));
+    assert!(ws.join("baselines/main.json").exists());
+
+    let (limited, stats) = run(&mut cli, "/limited");
+    let seen = stats.rate_limit.clone().unwrap();
+    assert_eq!((seen.limited, seen.first_after, seen.remaining_min), (20, Some(20), Some(0)));
+    assert_eq!((seen.limit.as_deref(), seen.retry_after.as_deref()), (Some("x-ratelimit-limit: 20"), Some("60")));
+
+    // Against the baseline: half the answers were errors, all of them limits.
+    let compare = Command::CompareBench { bench_id: limited, baseline: Some("main".into()), other_bench: None, tolerance_pct: None };
+    let Ok(ReplyBody::BenchCompared { comparison }) = cli.call(compare).unwrap() else { panic!() };
+    assert!(comparison.regressed);
+    let worse: Vec<&str> = comparison.deltas.iter().filter(|d| d.worse).map(|d| d.metric.as_str()).collect();
+    assert!(worse.contains(&"error_pct") && worse.contains(&"limited_pct"), "{worse:?}");
+    assert_eq!(comparison.before, "baseline main");
+    assert!(comparison.notes.iter().any(|n| n.starts_with("different requests")));
+
+    // Side by side with the other bench, it's the same story; the good one
+    // against itself is no regression.
+    let side = Command::CompareBench { bench_id: limited, baseline: None, other_bench: Some(good), tolerance_pct: Some(50.0) };
+    let Ok(ReplyBody::BenchCompared { comparison }) = cli.call(side).unwrap() else { panic!() };
+    assert!(comparison.regressed && comparison.tolerance_pct == 50.0);
+    let same = Command::CompareBench { bench_id: good, baseline: Some("main".into()), other_bench: None, tolerance_pct: None };
+    let Ok(ReplyBody::BenchCompared { comparison }) = cli.call(same).unwrap() else { panic!() };
+    assert!(!comparison.regressed, "{:?}", comparison.deltas);
+
+    let Ok(ReplyBody::Baselines { baselines, .. }) = cli.call(Command::ListBaselines).unwrap() else { panic!() };
+    assert_eq!(baselines.iter().map(|b| b.bench_id).collect::<Vec<_>>(), vec![good]);
+    assert!(cli.call(Command::CompareBench { bench_id: 99, baseline: Some("main".into()), other_bench: None, tolerance_pct: None }).unwrap().is_err());
+    assert!(cli.call(Command::SaveBaseline { bench_id: good, name: "../x".into() }).unwrap().is_err());
+    core.stop();
+}

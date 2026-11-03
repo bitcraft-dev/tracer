@@ -149,6 +149,8 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::Diff { .. }
             | Command::GraphqlSchema { .. }
             | Command::StreamMessages { .. }
+            | Command::ListBaselines
+            | Command::CompareBench { .. }
             | Command::Status
     );
     if reads {

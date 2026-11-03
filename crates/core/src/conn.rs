@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, PROTOCOL_VERSION, STREAM_LIMIT,
+    Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
 };
 
+use crate::baselines::{self, Side};
 use crate::{bench, diff, envs, flows, graphql, guard, http, realtime};
 use crate::hub::Hub;
 use crate::Stop;
@@ -171,6 +172,16 @@ pub fn serve(
             },
             (Some((_, actor)), Command::RunBench { request, env, plan }) => {
                 bench::start(&hub, actor, request, env, plan).map(|bench_id| ReplyBody::BenchStarted { bench_id })
+            }
+            (Some((_, actor)), Command::SaveBaseline { bench_id, name }) => {
+                hub.save_baseline(actor.clone(), bench_id, &name).map(|(name, path)| ReplyBody::BaselineSaved { name, path })
+            }
+            (Some(_), Command::ListBaselines) => {
+                let (baselines, skipped) = hub.list_baselines();
+                Ok(ReplyBody::Baselines { baselines, skipped })
+            }
+            (Some(_), Command::CompareBench { bench_id, baseline, other_bench, tolerance_pct }) => {
+                compare_bench(&hub, bench_id, baseline, other_bench, tolerance_pct)
             }
             (Some((_, actor)), Command::StopBench { bench_id }) => {
                 if hub.stop_bench(actor, bench_id) {
@@ -373,6 +384,35 @@ fn approved(hub: &Hub, actor: &Actor, request_id: u64, reason: String) -> bool {
             false
         }
     }
+}
+
+/// Finished bench `bench_id` against a baseline or another finished bench.
+fn compare_bench(
+    hub: &Hub,
+    bench_id: u64,
+    baseline: Option<String>,
+    other_bench: Option<u64>,
+    tolerance_pct: Option<f64>,
+) -> Result<ReplyBody, String> {
+    let finished = |id: u64| match hub.bench_side(id) {
+        Some((side, true)) => Ok(side),
+        Some(_) => Err(format!("bench {id} is still running")),
+        None => Err(format!("there is no bench {id}")),
+    };
+    let after = finished(bench_id)?;
+    let before = match (baseline, other_bench) {
+        (Some(name), None) => {
+            let b = hub.baseline(&name)?;
+            Side { label: format!("baseline {}", b.name), request: b.request, env: b.env, plan: b.plan, stats: b.stats, stopped: None }
+        }
+        (None, Some(id)) => finished(id)?,
+        _ => return Err("compare with one of `baseline` and `other_bench`".into()),
+    };
+    let tolerance = tolerance_pct.unwrap_or(BENCH_TOLERANCE_PCT);
+    if !(0.0..=1000.0).contains(&tolerance) {
+        return Err(format!("a tolerance of {tolerance} % makes no sense; 20 is the default"));
+    }
+    Ok(ReplyBody::BenchCompared { comparison: baselines::compare(&before, &after, tolerance) })
 }
 
 fn reply(id: u64, outcome: Result<ReplyBody, String>) -> ServerMessage {

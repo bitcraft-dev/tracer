@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tracer_protocol::{Access, Actor, BenchPlan, BenchStats, CheckResult, HttpRequest, HttpResponse, BENCH_BUCKETS_MS};
+use tracer_protocol::{Access, Actor, BenchPlan, BenchStats, CheckResult, HttpRequest, HttpResponse, RateLimitSeen, BENCH_BUCKETS_MS};
 
 use crate::conn::{run_one, Ran};
 use crate::hub::Hub;
@@ -59,7 +59,7 @@ fn run(
         Ran::Stopped(why) => return (BenchStats::default(), Some(why)),
         Ran::Ended(outcome, checks) => {
             let took = outcome.as_ref().map_or(0.0, |r| r.timing.total_ms);
-            samples.lock().unwrap().add(outcome.as_ref().map_err(String::as_str), &checks);
+            samples.lock().unwrap().add(outcome.as_ref().map_err(String::as_str), &checks, Duration::from_secs_f64(took / 1000.0));
             took
         }
     };
@@ -132,7 +132,7 @@ impl Worker {
                 return;
             }
             let checks = graphql::checks(&self.written, outcome.as_ref().map_err(String::as_str));
-            samples.lock().unwrap().add(outcome.as_ref().map_err(String::as_str), &checks);
+            samples.lock().unwrap().add(outcome.as_ref().map_err(String::as_str), &checks, self.started.elapsed());
         }
     }
 
@@ -178,15 +178,28 @@ struct Samples {
     failed_checks: u64,
     statuses: BTreeMap<u16, u64>,
     errors: HashMap<String, u64>,
+    /// Answers that said "slow down", the first of them (requests answered
+    /// before it, when), and what the server said of its limit.
+    limited: u64,
+    first_limited: Option<(u64, Duration)>,
+    limit: Option<String>,
+    remaining_min: Option<u64>,
+    retry_after: Option<String>,
 }
+
+/// Headers a server states its limit in, as each common scheme names it.
+const LIMIT_HEADERS: [&str; 5] = ["x-ratelimit-limit", "ratelimit-limit", "x-rate-limit-limit", "ratelimit-policy", "ratelimit"];
+const REMAINING_HEADERS: [&str; 3] = ["x-ratelimit-remaining", "ratelimit-remaining", "x-rate-limit-remaining"];
 
 /// The most distinct errors a bench lists.
 const ERRORS_LISTED: usize = 5;
 
 impl Samples {
-    fn add(&mut self, outcome: Result<&HttpResponse, &str>, checks: &[CheckResult]) {
+    /// Count one request's end, `at` into the bench.
+    fn add(&mut self, outcome: Result<&HttpResponse, &str>, checks: &[CheckResult], at: Duration) {
         match outcome {
             Ok(response) => {
+                self.rate_limiting(response, at);
                 self.latencies.push(response.timing.total_ms);
                 *self.statuses.entry(response.status).or_default() += 1;
                 if response.status >= 400 {
@@ -200,6 +213,48 @@ impl Samples {
                 *self.errors.entry(error.to_string()).or_default() += 1;
             }
         }
+    }
+
+    fn rate_limiting(&mut self, response: &HttpResponse, at: Duration) {
+        let header = |names: &[&str]| {
+            response.headers.iter().find(|(n, _)| names.contains(&n.to_ascii_lowercase().as_str())).map(|(n, v)| (n.clone(), v.clone()))
+        };
+        let retry_after = header(&["retry-after"]).map(|(_, v)| v);
+        if response.status == 429 || (response.status == 503 && retry_after.is_some()) {
+            self.limited += 1;
+            if self.first_limited.is_none() {
+                let answered = self.latencies.len() as u64 + self.failed;
+                self.first_limited = Some((answered, at));
+            }
+        }
+        if let Some((name, value)) = header(&LIMIT_HEADERS) {
+            self.limit = Some(format!("{name}: {value}"));
+        }
+        if let Some(left) = header(&REMAINING_HEADERS).and_then(|(_, v)| v.trim().parse::<u64>().ok()) {
+            self.remaining_min = Some(self.remaining_min.map_or(left, |m| m.min(left)));
+        }
+        if retry_after.is_some() {
+            self.retry_after = retry_after;
+        }
+    }
+
+    fn rate_limit(&self) -> Option<RateLimitSeen> {
+        if self.limited == 0 && self.limit.is_none() && self.remaining_min.is_none() {
+            return None;
+        }
+        let (first_after, at) = match self.first_limited {
+            Some((n, at)) => (Some(n), Some(at)),
+            None => (None, None),
+        };
+        Some(RateLimitSeen {
+            limited: self.limited,
+            first_after,
+            first_at_ms: at.map(|a| a.as_secs_f64() * 1000.0),
+            per_sec_before: first_after.zip(at).filter(|(_, a)| !a.is_zero()).map(|(n, a)| n as f64 / a.as_secs_f64()),
+            limit: self.limit.clone(),
+            remaining_min: self.remaining_min,
+            retry_after: self.retry_after.clone(),
+        })
     }
 
     fn stats(&self, elapsed: Duration) -> BenchStats {
@@ -235,6 +290,7 @@ impl Samples {
             max_ms: sorted.last().copied().unwrap_or(0.0),
             per_sec: if secs > 0.0 { done as f64 / secs } else { 0.0 },
             histogram,
+            rate_limit: self.rate_limit(),
         }
     }
 }
@@ -253,14 +309,14 @@ mod tests {
     fn stats_count_every_way_a_request_ends() {
         let mut s = Samples::default();
         for ms in 1..=100 {
-            s.add(Ok(&answer(200, ms as f64)), &[]);
+            s.add(Ok(&answer(200, ms as f64)), &[], Duration::ZERO);
         }
-        s.add(Ok(&answer(503, 4000.0)), &[]);
+        s.add(Ok(&answer(503, 4000.0)), &[], Duration::ZERO);
         let failed_check = CheckResult { expect: "status 2xx".into(), pass: false, actual: "201".into() };
-        s.add(Ok(&answer(201, 3.0)), &[failed_check]);
-        s.add(Err("connection refused"), &[]);
-        s.add(Err("connection refused"), &[]);
-        s.add(Err("timed out"), &[]);
+        s.add(Ok(&answer(201, 3.0)), &[failed_check], Duration::ZERO);
+        s.add(Err("connection refused"), &[], Duration::ZERO);
+        s.add(Err("connection refused"), &[], Duration::ZERO);
+        s.add(Err("timed out"), &[], Duration::ZERO);
 
         let stats = s.stats(Duration::from_secs(2));
         assert_eq!((stats.done, stats.failed, stats.bad_status, stats.failed_checks, stats.bad()), (105, 3, 1, 1, 5));
@@ -273,6 +329,36 @@ mod tests {
         // 1 ms; 2 ms; 3 to 5 ms (with the 3 ms 201); 4000 ms under 5 s.
         assert_eq!(&stats.histogram[..3], &[1, 1, 4]);
         assert_eq!(stats.histogram[12], 1);
+    }
+
+    #[test]
+    fn a_rate_limit_is_noticed_with_when_it_began_and_what_the_server_said() {
+        let mut s = Samples::default();
+        let with = |status: u16, headers: &[(&str, &str)]| {
+            let mut r = answer(status, 5.0);
+            r.headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+            r
+        };
+        for i in 0..40u64 {
+            let left = (40 - i).to_string();
+            let r = with(200, &[("X-RateLimit-Limit", "40"), ("X-RateLimit-Remaining", &left)]);
+            s.add(Ok(&r), &[], Duration::from_millis(i * 50));
+        }
+        for i in 0..10u64 {
+            s.add(Ok(&with(429, &[("Retry-After", "30"), ("X-RateLimit-Remaining", "0")])), &[], Duration::from_millis(2000 + i * 10));
+        }
+        let seen = s.stats(Duration::from_secs(3)).rate_limit.unwrap();
+        assert_eq!((seen.limited, seen.first_after, seen.first_at_ms), (10, Some(40), Some(2000.0)));
+        assert_eq!(seen.per_sec_before, Some(20.0));
+        assert_eq!((seen.limit.as_deref(), seen.remaining_min, seen.retry_after.as_deref()), (Some("X-RateLimit-Limit: 40"), Some(0), Some("30")));
+        assert!(seen.describe().starts_with("limited 10 times, first after 40 requests (2.0 s in, 20.0 a second)"));
+
+        // A 503 is a limit only with Retry-After; no headers, no report.
+        let mut s = Samples::default();
+        s.add(Ok(&with(503, &[])), &[], Duration::ZERO);
+        assert_eq!(s.stats(Duration::from_secs(1)).rate_limit, None);
+        s.add(Ok(&with(503, &[("Retry-After", "5")])), &[], Duration::ZERO);
+        assert_eq!(s.stats(Duration::from_secs(1)).rate_limit.unwrap().limited, 1);
     }
 
     #[test]

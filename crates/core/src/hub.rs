@@ -21,6 +21,7 @@ use tracer_protocol::{
 };
 
 use crate::policy::Policy;
+use crate::baselines::{self, Side};
 use crate::{envs, files, guard};
 
 pub struct Hub {
@@ -352,6 +353,72 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let by = inner.benches.remove(&bench_id).and_then(|b| b.stopped);
         publish_locked(&mut inner, actor, EventKind::BenchFinished { bench_id, stats, stopped: by.or(stopped) });
+    }
+
+    /// Bench `bench_id` as it was started and, once finished, how it went;
+    /// `None` if there is no such bench.
+    pub fn bench_side(&self, bench_id: u64) -> Option<(Side, bool)> {
+        let inner = self.inner.lock().unwrap();
+        let mut side: Option<Side> = None;
+        let mut finished = false;
+        for e in &inner.events {
+            match &e.kind {
+                EventKind::BenchStarted { bench_id: id, request, env, plan } if *id == bench_id => {
+                    let label = match env {
+                        Some(env) => format!("bench {bench_id} (env {env})"),
+                        None => format!("bench {bench_id}"),
+                    };
+                    side = Some(Side {
+                        label,
+                        request: request.clone(),
+                        env: env.clone(),
+                        plan: plan.clone(),
+                        stats: BenchStats::default(),
+                        stopped: None,
+                    });
+                }
+                EventKind::BenchFinished { bench_id: id, stats, stopped } if *id == bench_id => {
+                    if let Some(side) = side.as_mut() {
+                        side.stats = stats.clone();
+                        side.stopped = stopped.clone();
+                        finished = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        side.map(|s| (s, finished))
+    }
+
+    /// Keep finished bench `bench_id` as baseline `name`, and publish it.
+    /// Gives its name and its file, relative to the workspace.
+    pub fn save_baseline(&self, actor: Actor, bench_id: u64, name: &str) -> Result<(String, String), String> {
+        let name = baselines::normalize(name)?;
+        let (side, finished) = self.bench_side(bench_id).ok_or_else(|| format!("there is no bench {bench_id}"))?;
+        if !finished {
+            return Err(format!("bench {bench_id} is still running; save it once it has finished"));
+        }
+        let baseline = tracer_protocol::Baseline {
+            name: name.clone(),
+            bench_id,
+            saved_at_ms: now_ms(),
+            request: side.request,
+            env: side.env,
+            plan: side.plan,
+            stats: side.stats,
+        };
+        baselines::write(&self.root, &baseline).map_err(|e| format!("could not save baseline {name}: {e}"))?;
+        let mut inner = self.inner.lock().unwrap();
+        publish_locked(&mut inner, actor, EventKind::BaselineSaved { name: name.clone(), bench_id });
+        Ok((name.clone(), format!("{}/{name}.json", tracer_protocol::BASELINES_DIR)))
+    }
+
+    pub fn list_baselines(&self) -> (Vec<tracer_protocol::Baseline>, Vec<String>) {
+        baselines::list(&self.root)
+    }
+
+    pub fn baseline(&self, name: &str) -> Result<tracer_protocol::Baseline, String> {
+        baselines::read(&self.root, name)
     }
 
     /// Request `request_id` as it was written, and the environment it was

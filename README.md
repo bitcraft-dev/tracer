@@ -57,6 +57,27 @@ run`, `tracer send --expect '…'` and `tracer rerun` print each and exit 1
 if one fails; the window has a Checks tab on both sides; agents pass
 `expect` and get `checks` back.
 
+## Benchmarks and baselines
+
+`tracer bench <PATH>` sends a saved request over and over (`-n` in all,
+`-c` at a time, `-t` for a time, `--rate` a second) and gives latencies,
+throughput, statuses, errors, a histogram, and what it saw of rate
+limiting (429s, `X-RateLimit-*`, `Retry-After`: when limiting began and at
+what rate).
+
+```bash
+tracer bench api/item --env staging --env prod     # both, then side by side
+tracer bench api/item --save-baseline main         # keep it: baselines/main.json
+tracer bench api/item --baseline main              # exit 1 if p50/p95/p99, throughput,
+                                                   # errors or limiting got worse past 20 %
+tracer bench compare 12 main --tolerance 10        # judge a past bench
+```
+
+Baselines are plain files beside `requests/`, so a CI run can compare
+against the one checked in. The window's Bench panel saves them and
+compares with a baseline or an earlier bench; agents have `compare_bench`,
+`save_baseline` and `list_baselines`, and `run_bench` takes `baseline`.
+
 ## Streams: WebSocket and server-sent events
 
 A `WEBSOCKET` request, as JetBrains writes it, opens a WebSocket; its body

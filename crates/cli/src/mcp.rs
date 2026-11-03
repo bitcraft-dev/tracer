@@ -463,12 +463,70 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                         if let Some(why) = stopped {
                             out["stopped"] = json!(why);
                         }
+                        if let Some(name) = str_arg(args, "baseline") {
+                            let tolerance_pct = args.get("tolerance_pct").and_then(Value::as_f64);
+                            let command = Command::CompareBench { bench_id, baseline: Some(name.into()), other_bench: None, tolerance_pct };
+                            out["comparison"] = match call(core, command)? {
+                                ReplyBody::BenchCompared { comparison } => serde_json::to_value(comparison).unwrap_or_default(),
+                                _ => return Err(unexpected()),
+                            };
+                        }
+                        if let Some(name) = str_arg(args, "save_baseline") {
+                            out["baseline_saved"] = match call(core, Command::SaveBaseline { bench_id, name: name.into() })? {
+                                ReplyBody::BaselineSaved { path, .. } => json!(path),
+                                _ => return Err(unexpected()),
+                            };
+                        }
                         return Ok(out);
                     }
                     _ => {}
                 }
             }
         }
+        "compare_bench" => {
+            let bench_id = args.get("bench_id").and_then(Value::as_u64).ok_or("`bench_id` is required")?;
+            let command = Command::CompareBench {
+                bench_id,
+                baseline: str_arg(args, "baseline").map(String::from),
+                other_bench: args.get("other_bench").and_then(Value::as_u64),
+                tolerance_pct: args.get("tolerance_pct").and_then(Value::as_f64),
+            };
+            match call(core, command)? {
+                ReplyBody::BenchCompared { comparison } => Ok(serde_json::to_value(comparison).unwrap_or_default()),
+                _ => Err(unexpected()),
+            }
+        }
+        "save_baseline" => {
+            let bench_id = args.get("bench_id").and_then(Value::as_u64).ok_or("`bench_id` is required")?;
+            let name = str_arg(args, "name").ok_or("`name` is required")?.to_string();
+            match call(core, Command::SaveBaseline { bench_id, name })? {
+                ReplyBody::BaselineSaved { name, path } => Ok(json!({ "name": name, "path": path })),
+                _ => Err(unexpected()),
+            }
+        }
+        "list_baselines" => match call(core, Command::ListBaselines)? {
+            ReplyBody::Baselines { baselines, skipped } => {
+                let list: Vec<Value> = baselines
+                    .iter()
+                    .map(|b| {
+                        json!({
+                            "name": b.name,
+                            "bench_id": b.bench_id,
+                            "request": request_json(&b.request),
+                            "env": b.env,
+                            "plan": b.plan,
+                            "p50_ms": b.stats.p50_ms,
+                            "p95_ms": b.stats.p95_ms,
+                            "p99_ms": b.stats.p99_ms,
+                            "per_sec": b.stats.per_sec,
+                            "error_pct": b.stats.error_pct(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "baselines": list, "skipped": skipped }))
+            }
+            _ => Err(unexpected()),
+        },
         "stop_bench" => {
             let bench_id = args.get("bench_id").and_then(Value::as_u64).ok_or("`bench_id` is required")?;
             call(core, Command::StopBench { bench_id })?;
@@ -1117,10 +1175,43 @@ fn tools() -> Value {
                     "concurrency": { "type": "integer" },
                     "duration_seconds": { "type": "integer" },
                     "rate": { "type": "number", "description": "The most requests to start a second." },
+                    "baseline": { "type": "string", "description": "Compare the finished bench with this baseline (list_baselines); `comparison.regressed` says whether anything got worse past the tolerance." },
+                    "tolerance_pct": { "type": "number", "description": "How much worse counts as a regression, in percent (default 20)." },
+                    "save_baseline": { "type": "string", "description": "Keep the finished bench as a baseline of this name (baselines/<name>.json)." },
                     "wait_seconds": { "type": "integer", "description": "How long to wait for the end (default 120, at most 600)." },
                 },
                 "required": ["path"],
             },
+        },
+        {
+            "name": "compare_bench",
+            "description": "Compare a finished bench with a baseline or with another finished bench (the same request against two environments, say): mean, p50, p95, p99, requests a second, and the shares of errors and of rate-limited answers, each flagged worse or better past the tolerance. `notes` says what makes them less comparable (different plans, environments, a bench stopped early).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bench_id": { "type": "integer", "description": "The bench to judge." },
+                    "baseline": { "type": "string", "description": "A baseline's name; or give other_bench." },
+                    "other_bench": { "type": "integer", "description": "The bench to judge it against." },
+                    "tolerance_pct": { "type": "number", "description": "In percent, default 20." },
+                },
+                "required": ["bench_id"],
+            },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "save_baseline",
+            "description": "Keep a finished bench as a baseline (baselines/<name>.json in the workspace, replacing one of that name), to compare later benches with.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "bench_id": { "type": "integer" }, "name": { "type": "string", "description": "One word: main, before-cache." } },
+                "required": ["bench_id", "name"],
+            },
+        },
+        {
+            "name": "list_baselines",
+            "description": "The workspace's baselines: each bench kept, its request, environment, plan and headline numbers.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true },
         },
         {
             "name": "stop_bench",

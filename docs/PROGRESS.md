@@ -7,11 +7,12 @@ file is about working on Tracer.
 
 ## Where it stands (2026-11-03, late)
 
-GraphQL committed (7ff184a), then **realtime** built and driven (see
-Done), committed on `phase-1-core`. Not pushed. Phase 4 is done except
-the response viewer (waits on AW-037) and benchmarking's later parts.
-Open findings **AW-037 to AW-040**, none told to the Rux team yet (draft
-and ask). AW-037's report was due 2026-10-31.
+GraphQL (7ff184a) and realtime (c81785a) committed, then benchmarking's
+later parts (2026-11-04: environments side by side, baselines, rate-limit
+detection; see Done), committed on `phase-1-core`. Not pushed. **Phase 4
+is done except the response viewer**, which waits on AW-037.
+Open findings **AW-037 to AW-040**: the user said (2026-11-03) the Rux
+team is working on them. Re-drive each when its fix is reported.
 
 Left running, not this session's: the user's `rux run`, window and core on
 `~/Tracer` (PIDs 10280, 14864, 15456; the window relaunched itself at
@@ -469,20 +470,51 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   and an MCP agent: open asked for approval, allowed with `tracer
   approve`, read, sent, closed "closed by test-agent".
 
+- **Phase 4: benchmarking finished** (`crates/core/src/baselines.rs`,
+  2026-11-04). **Rate limits:** a bench counts 429s (and 503s with
+  `Retry-After`) and reads `X-RateLimit-*` / `RateLimit-*` / `Retry-After`:
+  `BenchStats.rate_limit` says how many, after how many requests and how
+  far in the first came, the rate until then, the stated limit, the least
+  remaining. **Comparison:** `BenchStats::deltas` (protocol) judges mean,
+  p50, p95, p99 (worse past the tolerance, default 20 %, and 2 ms),
+  throughput (worse past the tolerance), errors and limited (worse past 1
+  point); `baselines::compare` adds notes (different request, env, plan;
+  stopped early; held to a rate; rate limited, whose fast refusals flatter
+  throughput). **Baselines:** `baselines/<name>.json` (request, env, plan,
+  stats), `SaveBaseline`, `ListBaselines`, `CompareBench { baseline |
+  other_bench, tolerance_pct }`, `baseline_saved` event. CLI `tracer bench
+  PATH --env a --env b` (side by side), `--save-baseline`, `--baseline
+  [--tolerance]` (exit 1 on a regression), `bench compare ID NAME|#ID`,
+  `bench baselines`, a `rate` line in the summary. MCP `compare_bench`,
+  `save_baseline`, `list_baselines`; `run_bench` takes `baseline`,
+  `save_baseline`. Window: Bench panel's rate line, Save as baseline (name
+  field), Compare with (baselines and earlier benches) and the comparison
+  table; the panel and the Schema view now scroll (their parts are
+  `flex-shrink: 0`; before, the panel's lower part was cut off and the
+  histogram squashed to nothing). 77 tests, three runs clean. Driven
+  against `bench_server.py` (fast 5 ms, slow 25 ms, limited 50 per 10 s):
+  fast vs slow side by side (+300 % latency, -60 % throughput flagged);
+  baseline from fast, same env "no regression" exit 0, slow exit 1;
+  limited "first after 50 requests"; the window's compare and save; an MCP
+  agent's list and compare.
+
 ### Next
 
 1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. Draft the Rux team's message for AW-037 to AW-040 and ask before
-   sending.
+2. When the Rux team reports fixes for AW-037 to AW-040, re-drive each
+   and add the measured result to its entry.
 3. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
    WebSocket); a `tracer` command to send on someone else's open
    WebSocket (MCP and the window can); saving a WebSocket's messages as a
    transcript; reconnecting SSE with `Last-Event-ID`; leaving the
    Realtime mode keeps the WebSocket's body, which a GET then sends.
    GraphQL follow-ups: a schema-aware query editor (needs the viewer's
-   line work). Benchmarking's later parts: two environments side by side,
+   line work). Benchmarking follow-ups: a bench's request-a-second line
+   is empty for a bench replayed from the journal (only live progress
+   draws it); comparing a flow's steps. Earlier list of benchmarking's
+   later parts, now done: two environments side by side,
    saved baselines with regression flags, rate-limit detection.
    Flows follow-up, untried: a flow step keeps its URL as written
    (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
@@ -585,6 +617,11 @@ Things that cost a round trip once. Check here before debugging them again.
   Windows allows renaming a running exe) rather than stopping their core.
   This session's own cores must be stopped before each `cargo build`
   (`tracer stop -w <ws>`; `tracer mcp` starts one too).
+- **`drive.ps1 -Do move` resizes the window** (to `-X2`×`-Y2`, so 0×0 if
+  left out); `hover` moves the pointer, `wheel -X -Y` scrolls at a point.
+- **The window launched straight from `.rux-build` still hot reloads**
+  `app.rux`, which resets page state (mode, scroll): re-navigate after an
+  edit before clicking.
 - **Port 8765 is taken** by a `SimpleHTTP` server from 2026-10-30, which
   answers 127.0.0.1 although the scratch server bound it too; test servers
   use 18765.

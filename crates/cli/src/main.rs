@@ -35,7 +35,7 @@ use std::process::ExitCode;
 use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
-    BenchPlan, BenchStats, Direction, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, StreamKind,
+    BenchComparison, BenchPlan, BenchStats, Direction, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, StreamKind,
     Timing, DISCOVERY_PATH, WEBSOCKET,
 };
 
@@ -80,6 +80,19 @@ usage:
                                       (30s, 2m), no faster than R a second; live
                                       p50/p95/p99, a histogram, statuses, errors;
                                       exits 1 if any went wrong
+  tracer bench <PATH> --env <A> --env <B> ...
+                                      the same bench against each environment in
+                                      turn, then side by side
+  tracer bench <PATH> --save-baseline <NAME>
+                                      keep the bench as baselines/<NAME>.json
+  tracer bench <PATH> --baseline <NAME> [--tolerance <PCT>]
+                                      compare with a baseline: each latency, the
+                                      throughput, errors, rate limiting; exits 1
+                                      if any is worse past PCT (default 20)
+  tracer bench compare <ID> <NAME | #ID> [--tolerance <PCT>]
+                                      compare a past bench with a baseline or
+                                      another bench
+  tracer bench baselines              list the baselines
   tracer bench stop <ID>              stop a running bench, whoever started it
   tracer schema <URL|PATH> [-H 'Name: value']... [--env <NAME>]
                                       a GraphQL server's schema as SDL, asked by
@@ -722,17 +735,43 @@ fn report_json(
 }
 
 fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
-    if args.first().map(String::as_str) == Some("stop") {
-        let id: u64 = args.get(1).and_then(|a| a.trim_start_matches('#').parse().ok()).ok_or_else(|| io::Error::other(USAGE))?;
-        let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
-        client.call(Command::StopBench { bench_id: id })?.map_err(io::Error::other)?;
-        eprintln!("bench {id} stopping");
-        return Ok(ExitCode::SUCCESS);
+    match args.first().map(String::as_str) {
+        Some("stop") => {
+            let id = bench_id(args.get(1))?;
+            let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+            client.call(Command::StopBench { bench_id: id })?.map_err(io::Error::other)?;
+            eprintln!("bench {id} stopping");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some("baselines") => return baselines(&workspace),
+        Some("compare") => {
+            args.remove(0);
+            let tolerance_pct = tolerance(&mut args)?;
+            let [after, against] = <[String; 2]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+            let (baseline, other_bench) = match against.strip_prefix('#') {
+                Some(id) => (None, Some(bench_id(Some(&id.to_string()))?)),
+                None => (Some(against), None),
+            };
+            let comparison = compare(&workspace, Command::CompareBench { bench_id: bench_id(Some(&after))?, baseline, other_bench, tolerance_pct })?;
+            eprint!("{}", comparison_table(&comparison));
+            return Ok(if comparison.regressed { ExitCode::FAILURE } else { ExitCode::SUCCESS });
+        }
+        _ => {}
     }
     let number = |flag: &str, value: Option<String>| -> io::Result<Option<f64>> {
         value.map(|v| v.parse::<f64>().map_err(|_| io::Error::other(format!("{flag} takes a number, not `{v}`")))).transpose()
     };
-    let env = take_value(&mut args, "--env");
+    // Each `--env` a bench of its own, one after the other, side by side.
+    let mut envs = Vec::new();
+    while let Some(env) = take_value(&mut args, "--env") {
+        envs.push(env);
+    }
+    let save_as = take_value(&mut args, "--save-baseline");
+    let baseline = take_value(&mut args, "--baseline");
+    let tolerance_pct = tolerance(&mut args)?;
+    if save_as.is_some() && envs.len() > 1 {
+        return Err(io::Error::other("--save-baseline keeps one bench; give one --env"));
+    }
     let report = take_value(&mut args, "--report");
     if report.as_deref().is_some_and(|r| r != "json") {
         return Err(io::Error::other("--report takes json"));
@@ -753,14 +792,79 @@ fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let total = if total.is_none() && duration_secs.is_none() { Some(100) } else { total };
     let plan = BenchPlan { total, concurrency, duration_secs, rate };
 
-    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer bench")?;
+    let runs: Vec<Option<String>> = if envs.is_empty() { vec![None] } else { envs.into_iter().map(Some).collect() };
+    let mut ok = true;
+    let mut ran = Vec::new();
+    for env in &runs {
+        let (bench_id, stats, stopped) = bench_once(&workspace, &found.request, env.clone(), &plan, wanted)?;
+        ok &= stopped.is_none() && stats.bad() == 0;
+        ran.push(serde_json::json!({ "bench_id": bench_id, "env": env, "stopped": stopped, "stats": stats }));
+    }
+    let ids: Vec<u64> = ran.iter().filter_map(|r| r["bench_id"].as_u64()).collect();
+    let mut comparisons = Vec::new();
+    // Side by side: each after the first against the first.
+    for &id in &ids[1..] {
+        let c = compare(&workspace, Command::CompareBench { bench_id: id, baseline: None, other_bench: Some(ids[0]), tolerance_pct })?;
+        eprint!("\n{}", comparison_table(&c));
+        comparisons.push(c);
+    }
+    if let Some(name) = &baseline {
+        for &id in &ids {
+            let c = compare(&workspace, Command::CompareBench { bench_id: id, baseline: Some(name.clone()), other_bench: None, tolerance_pct })?;
+            eprint!("\n{}", comparison_table(&c));
+            ok &= !c.regressed;
+            comparisons.push(c);
+        }
+    }
+    if let Some(name) = &save_as {
+        let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer bench")?;
+        match client.call(Command::SaveBaseline { bench_id: ids[0], name: name.clone() })? {
+            Ok(ReplyBody::BaselineSaved { name, path }) => eprintln!("saved bench {} as baseline {name} ({path})", ids[0]),
+            Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+            Err(e) => return Err(io::Error::other(e)),
+        }
+    }
+    if report.is_some() {
+        let json = serde_json::json!({
+            "path": wanted,
+            "plan": plan,
+            "benches": ran,
+            "comparisons": comparisons,
+            "histogram_bounds_ms": BENCH_BUCKETS_MS,
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+    }
+    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+fn bench_id(arg: Option<&String>) -> io::Result<u64> {
+    arg.and_then(|a| a.trim_start_matches('#').parse().ok()).ok_or_else(|| io::Error::other(USAGE))
+}
+
+fn tolerance(args: &mut Vec<String>) -> io::Result<Option<f64>> {
+    take_value(args, "--tolerance")
+        .map(|t| t.trim_end_matches('%').parse().map_err(|_| io::Error::other(format!("--tolerance takes a percentage, not `{t}`"))))
+        .transpose()
+}
+
+/// Run one bench and tell it as it goes: its id, its stats, and why it
+/// stopped early if it did.
+fn bench_once(
+    workspace: &PathBuf,
+    request: &HttpRequest,
+    env: Option<String>,
+    plan: &BenchPlan,
+    path: &str,
+) -> io::Result<(u64, BenchStats, Option<String>)> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, "tracer bench")?;
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
-    let bench_id = match client.call(Command::RunBench { request: found.request, env: env.clone(), plan: plan.clone() })? {
+    let bench_id = match client.call(Command::RunBench { request: request.clone(), env: env.clone(), plan: plan.clone() })? {
         Ok(ReplyBody::BenchStarted { bench_id }) => bench_id,
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),
     };
-    eprintln!("bench {bench_id}: {wanted}, {}; `tracer bench stop {bench_id}` stops it", plan.describe());
+    let with = env.as_ref().map(|e| format!(" (env {e})")).unwrap_or_default();
+    eprintln!("bench {bench_id}: {path}{with}, {}; `tracer bench stop {bench_id}` stops it", plan.describe());
     let live = io::stderr().is_terminal();
     loop {
         let event = client.next_event()?;
@@ -779,24 +883,82 @@ fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
                 if let Some(why) = &stopped {
                     eprintln!("stopped early: {why}");
                 }
-                if report.is_some() {
-                    let json = serde_json::json!({
-                        "bench_id": bench_id,
-                        "path": wanted,
-                        "env": env,
-                        "plan": plan,
-                        "stopped": stopped,
-                        "stats": stats,
-                        "histogram_bounds_ms": BENCH_BUCKETS_MS,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
-                }
-                let ok = stopped.is_none() && stats.bad() == 0;
-                return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+                return Ok((bench_id, stats, stopped));
             }
             _ => {}
         }
     }
+}
+
+fn compare(workspace: &PathBuf, command: Command) -> io::Result<BenchComparison> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, "tracer bench")?;
+    match client.call(command)? {
+        Ok(ReplyBody::BenchCompared { comparison }) => Ok(comparison),
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+fn baselines(workspace: &PathBuf) -> io::Result<ExitCode> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, "tracer bench")?;
+    let (baselines, skipped) = match client.call(Command::ListBaselines)? {
+        Ok(ReplyBody::Baselines { baselines, skipped }) => (baselines, skipped),
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    if baselines.is_empty() {
+        eprintln!("no baselines; `tracer bench <PATH> --save-baseline <NAME>` keeps one");
+    }
+    for b in &baselines {
+        let with = b.env.as_ref().map(|e| format!(" · env {e}")).unwrap_or_default();
+        println!(
+            "{:<16} {} {}{with} · {} · p50 {:.1} p95 {:.1} p99 {:.1} ms · {:.1} a second · bench {}",
+            b.name, b.request.method, b.request.url, b.plan.describe(), b.stats.p50_ms, b.stats.p95_ms, b.stats.p99_ms, b.stats.per_sec, b.bench_id
+        );
+    }
+    for s in skipped {
+        eprintln!("tracer: skipped {s}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Two benches in columns, each change marked ✗ when worse past the
+/// tolerance and ✓ when better.
+fn comparison_table(c: &BenchComparison) -> String {
+    let (wb, wa) = (c.before.chars().count().max(10), c.after.chars().count().max(10));
+    let mut out = format!("  {:<10}  {:>wb$}  {:>wa$}  change\n", "", c.before, c.after);
+    let mut worse = Vec::new();
+    for d in &c.deltas {
+        let (label, unit, points) = match d.metric.as_str() {
+            "mean_ms" => ("mean", " ms", false),
+            "p50_ms" => ("p50", " ms", false),
+            "p95_ms" => ("p95", " ms", false),
+            "p99_ms" => ("p99", " ms", false),
+            "per_sec" => ("a second", "", false),
+            "error_pct" => ("errors", " %", true),
+            "limited_pct" => ("limited", " %", true),
+            other => (other, "", false),
+        };
+        if points && d.before == 0.0 && d.after == 0.0 {
+            continue;
+        }
+        let mark = if d.worse { "✗" } else if d.better { "✓" } else { " " };
+        let change = if points { format!("{:+.1} pts", d.change) } else { format!("{:+.1} %", d.change) };
+        let (b, a) = (format!("{:.1}{unit}", d.before), format!("{:.1}{unit}", d.after));
+        out.push_str(&format!("  {label:<10}  {b:>wb$}  {a:>wa$}  {change} {mark}\n"));
+        if d.worse {
+            worse.push(label);
+        }
+    }
+    for note in &c.notes {
+        out.push_str(&format!("  note: {note}\n"));
+    }
+    if worse.is_empty() {
+        out.push_str(&format!("  no regression past {} %\n", c.tolerance_pct));
+    } else {
+        out.push_str(&format!("  regressed past {} %: {}\n", c.tolerance_pct, worse.join(", ")));
+    }
+    out
 }
 
 fn schema(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
@@ -922,6 +1084,9 @@ fn bench_summary(s: &BenchStats) -> String {
     }
     for (error, n) in &s.errors {
         out.push_str(&format!("  no answer × {n}: {error}\n"));
+    }
+    if let Some(limit) = &s.rate_limit {
+        out.push_str(&format!("  rate    {}\n", limit.describe()));
     }
     out
 }
@@ -1210,6 +1375,7 @@ fn describe(event: &Event) -> String {
             Some(why) => format!("bench {bench_id} {why}: {}", bench_line(stats)),
             None => format!("bench {bench_id} finished: {}", bench_line(stats)),
         },
+        EventKind::BaselineSaved { name, bench_id } => format!("saved bench {bench_id} as baseline {name}"),
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
         EventKind::PolicyChanged { rules, error: Some(error) } => {
             format!("agents.policy not taken, {} rules stand: {error}", rules.len())

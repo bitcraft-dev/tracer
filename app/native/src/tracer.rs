@@ -184,6 +184,33 @@ pub struct BenchNow {
     pub statuses: String,
     /// `3 × connection refused`, the commonest first.
     pub errors: Vec<String>,
+    /// What it saw of the server limiting its rate, or "".
+    pub rate: String,
+}
+
+/// Two benches compared, for the page: `after` against `before`.
+#[rux::export]
+#[derive(Clone)]
+pub struct Comparison {
+    pub before: String,
+    pub after: String,
+    pub tolerance_pct: f64,
+    pub rows: Vec<DeltaRow>,
+    pub regressed: bool,
+    pub notes: Vec<String>,
+}
+
+/// One measure of a comparison, ready to show: `p95`, `120.4 ms`,
+/// `96.0 ms`, `+25.4 %`.
+#[rux::export]
+#[derive(Clone)]
+pub struct DeltaRow {
+    pub label: String,
+    pub before: String,
+    pub after: String,
+    pub change: String,
+    pub worse: bool,
+    pub better: bool,
 }
 
 /// One expectation, checked.
@@ -454,6 +481,77 @@ pub fn graphql_schema(request_id: u64) -> Result<GSchema, CoreError> {
         })
         .collect();
     Ok(GSchema { query: schema.query, mutation: schema.mutation, types })
+}
+
+/// Keep finished bench `bench_id` as baseline `name`. Gives its file.
+#[rux::export]
+pub fn save_baseline(bench_id: u64, name: String) -> Result<String, CoreError> {
+    match shared()?.call(Command::SaveBaseline { bench_id, name }) {
+        Ok(Ok(ReplyBody::BaselineSaved { path, .. })) => Ok(path),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// The baselines' names.
+#[rux::export]
+pub async fn baseline_names() -> Result<Vec<String>, CoreError> {
+    match shared()?.call(Command::ListBaselines) {
+        Ok(Ok(ReplyBody::Baselines { baselines, .. })) => Ok(baselines.into_iter().map(|b| b.name).collect()),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Finished bench `bench_id` against `against`: `bench 3` for another
+/// bench, or a baseline's name.
+#[rux::export]
+pub async fn compare_bench(bench_id: u64, against: String) -> Result<Comparison, CoreError> {
+    let (baseline, other_bench) = match against.strip_prefix("bench ").and_then(|n| n.trim().parse().ok()) {
+        Some(id) => (None, Some(id)),
+        None => (Some(against), None),
+    };
+    let comparison = match shared()?.call(Command::CompareBench { bench_id, baseline, other_bench, tolerance_pct: None }) {
+        Ok(Ok(ReplyBody::BenchCompared { comparison })) => comparison,
+        Ok(Ok(other)) => return Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => return Err(CoreError(refused)),
+        Err(e) => return Err(CoreError(e.to_string())),
+    };
+    let rows = comparison
+        .deltas
+        .iter()
+        .filter(|d| !(d.metric.ends_with("_pct") && d.before == 0.0 && d.after == 0.0))
+        .map(|d| {
+            let (label, unit, points) = match d.metric.as_str() {
+                "mean_ms" => ("mean", " ms", false),
+                "p50_ms" => ("p50", " ms", false),
+                "p95_ms" => ("p95", " ms", false),
+                "p99_ms" => ("p99", " ms", false),
+                "per_sec" => ("a second", "", false),
+                "error_pct" => ("errors", " %", true),
+                "limited_pct" => ("limited", " %", true),
+                other => (other, "", false),
+            };
+            DeltaRow {
+                label: label.into(),
+                before: format!("{:.1}{unit}", d.before),
+                after: format!("{:.1}{unit}", d.after),
+                change: if points { format!("{:+.1} pts", d.change) } else { format!("{:+.1} %", d.change) },
+                worse: d.worse,
+                better: d.better,
+            }
+        })
+        .collect();
+    Ok(Comparison {
+        before: comparison.before,
+        after: comparison.after,
+        tolerance_pct: comparison.tolerance_pct,
+        rows,
+        regressed: comparison.regressed,
+        notes: comparison.notes,
+    })
 }
 
 /// Stop bench `bench_id`, whoever started it.
@@ -928,6 +1026,9 @@ fn to_page(event: Event) -> CoreEvent {
             (out.kind, out.bench, out.stats) = ("bench_finished".into(), bench_id, bench_now(None, &stats));
             out.reason = stopped.unwrap_or_default();
         }
+        EventKind::BaselineSaved { name, bench_id } => {
+            (out.kind, out.path, out.bench) = ("baseline_saved".into(), name, bench_id);
+        }
         EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
         EventKind::PolicyChanged { error, .. } => {
             (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
@@ -984,6 +1085,7 @@ fn bench_now(plan: Option<&BenchPlan>, stats: &BenchStats) -> BenchNow {
         buckets: BENCH_BUCKETS_MS.to_vec(),
         statuses: statuses.join(", "),
         errors: stats.errors.iter().map(|(e, n)| format!("{n} × {e}")).collect(),
+        rate: stats.rate_limit.as_ref().map(|r| r.describe()).unwrap_or_default(),
     }
 }
 
