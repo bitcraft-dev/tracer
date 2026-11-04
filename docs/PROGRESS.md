@@ -616,9 +616,14 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    Still unexplained: on `rows/`, replacing 5,000 rows with equal ones
    costs 0.3 s and clearing them 0.23 s; on `p2/` the same costs 2.1 s and
    1.5 s, and its profile shows every row's bindings re-run (25,000 to
-   75,000 `run` calls) on those frames. Next to try: swap the two pages'
-   row markup and data shapes outright (p2's rows into rows/, and back)
-   to pin which side carries it, then write the finding. Also seen: in
+   75,000 `run` calls) on those frames. Also ruled out: the window's size
+   (rows/ costs the same at 900x700 and 1600x900), rows/ clearing through
+   a function rather than inline (still 0.22 s), and the row markup: p2
+   with rows/'s exact rows still costs 2.9 s to replace and 2.1 s to
+   clear. So it's the rest of p2's page (heading, paragraph, the button
+   row holding `note`; `.page` padding and gap) or its data (every row's
+   `key` the same text; built in a nested loop from a parameter). Next:
+   move those into rows/ one at a time, then write the finding. Also seen: in
    `rows/`, a row whose fold text is "" is ~3 px taller than one with ▾.
 2. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
    WebSocket); a `tracer` command to send on someone else's open
