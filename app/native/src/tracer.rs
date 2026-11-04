@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
     BenchPlan, BenchStats, ClientKind, Command, Direction, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest,
-    StepOutcome, StreamKind, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
+    StepOutcome, StreamKind, UntilPlan, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
 };
 
 /// The most of a response body an event hands the page. The core and its
@@ -117,9 +117,16 @@ pub struct CoreEvent {
     pub dir: String,
     pub sse_event: String,
     pub binary: bool,
-    /// Messages each way, for `stream_closed`.
+    /// Messages each way, for `stream_closed`; `sent` is also how many a
+    /// run-until has sent.
     pub received: u64,
     pub sent: u64,
+    /// The run-until of `until_started`, `until_progress` and
+    /// `until_finished`; 0 for none. For those, `n` is the count in a row,
+    /// `allow` whether the answer counted (`until_progress`) or the streak
+    /// came (`until_finished`), and `reason` the plan (`until_started`) or
+    /// why it ended without the streak (`until_finished`).
+    pub until: u64,
 }
 
 /// A GraphQL server's schema: its root types by name ("" where it has
@@ -554,6 +561,51 @@ pub async fn compare_bench(bench_id: u64, against: String) -> Result<Comparison,
     })
 }
 
+/// Send the request being edited again and again, one at a time, until
+/// `streak` answers in a row count: ones `matching` passes on (an
+/// expectation such as `status == 401`), or with "" failures. At most `max`
+/// sends (0: the core's default), `gap_ms` apart. Gives its id.
+#[rux::export]
+#[allow(clippy::too_many_arguments)]
+pub fn run_until(
+    method: String,
+    url: String,
+    headers: Vec<Header>,
+    body: String,
+    env: String,
+    checks: String,
+    streak: u32,
+    matching: String,
+    max: u64,
+    gap_ms: u64,
+) -> Result<u64, CoreError> {
+    let request = request_of(method, url, headers, body, checks);
+    let env = if env.is_empty() { None } else { Some(env) };
+    let matching = matching.trim();
+    let plan = UntilPlan {
+        streak,
+        matching: (!matching.is_empty()).then(|| matching.to_string()),
+        max: (max > 0).then_some(max),
+        gap_ms: (gap_ms > 0).then_some(gap_ms),
+    };
+    match shared()?.call(Command::RunUntil { request, env, plan }) {
+        Ok(Ok(ReplyBody::UntilStarted { until_id })) => Ok(until_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Stop run-until `until_id`, whoever started it.
+#[rux::export]
+pub fn stop_until(until_id: u64) -> Result<(), CoreError> {
+    match shared()?.call(Command::StopUntil { until_id }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// Stop bench `bench_id`, whoever started it.
 #[rux::export]
 pub fn stop_bench(bench_id: u64) -> Result<(), CoreError> {
@@ -928,6 +980,7 @@ fn to_page(event: Event) -> CoreEvent {
         binary: false,
         received: 0,
         sent: 0,
+        until: 0,
     };
     let headers = headers_of;
     match event.kind {
@@ -1025,6 +1078,18 @@ fn to_page(event: Event) -> CoreEvent {
         EventKind::BenchFinished { bench_id, stats, stopped } => {
             (out.kind, out.bench, out.stats) = ("bench_finished".into(), bench_id, bench_now(None, &stats));
             out.reason = stopped.unwrap_or_default();
+        }
+        EventKind::UntilStarted { until_id, request, env, plan } => {
+            (out.kind, out.until, out.env) = ("until_started".into(), until_id, env.unwrap_or_default());
+            (out.method, out.url, out.reason) = (request.method, request.url, plan.describe());
+        }
+        EventKind::UntilProgress { until_id, request_id, counted, sent, streak } => {
+            (out.kind, out.until, out.request_id) = ("until_progress".into(), until_id, request_id);
+            (out.allow, out.sent, out.n) = (counted, sent, streak as u64);
+        }
+        EventKind::UntilFinished { until_id, sent, streak, reached, stopped } => {
+            (out.kind, out.until, out.allow) = ("until_finished".into(), until_id, reached);
+            (out.sent, out.n, out.reason) = (sent, streak as u64, stopped.unwrap_or_default());
         }
         EventKind::BaselineSaved { name, bench_id } => {
             (out.kind, out.path, out.bench) = ("baseline_saved".into(), name, bench_id);

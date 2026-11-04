@@ -193,6 +193,24 @@ pub enum Command {
     /// Stop a running bench, whoever started it. It ends with
     /// `bench_finished`, naming who stopped it.
     StopBench { bench_id: u64 },
+    /// Send `request` again and again, one at a time (the next once the
+    /// last has answered, `plan.gap_ms` after it), until `plan.streak`
+    /// answers in a row count: ones `plan.matching` passes on, or, without
+    /// it, failures (no answer, a failed check, or with no checks a status
+    /// of 400 or more). Any other answer starts the count again. At most
+    /// `plan.max` sends ([`UNTIL_MAX`] if not given). Each is an ordinary
+    /// request, in history, held to the policy and asked about as any
+    /// send. The reply gives the run's id; the run is `until_progress`
+    /// events, one an answer, then `until_finished`.
+    RunUntil {
+        request: HttpRequest,
+        #[serde(default)]
+        env: Option<String>,
+        plan: UntilPlan,
+    },
+    /// Stop a running run-until, whoever started it. It ends with
+    /// `until_finished`, naming who stopped it.
+    StopUntil { until_id: u64 },
     /// Keep finished bench `bench_id` as baseline `name`
     /// (`baselines/<name>.json`, replacing one of that name).
     SaveBaseline { bench_id: u64, name: String },
@@ -408,6 +426,43 @@ impl BenchPlan {
             out.push_str(&format!(" at {rate} a second"));
         }
         out.push_str(&format!(", {} at a time", self.concurrency));
+        out
+    }
+}
+
+/// The most a run-until sends when its plan doesn't say.
+pub const UNTIL_MAX: u64 = 1000;
+
+/// When a run-until stops ([`Command::RunUntil`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UntilPlan {
+    /// How many counted answers in a row end it.
+    pub streak: u32,
+    /// What counts: an expectation an answer passes (`status == 401`).
+    /// Without one, a failure counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching: Option<String>,
+    /// The most to send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
+    /// How long to wait after an answer before the next send, in
+    /// milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_ms: Option<u64>,
+}
+
+impl UntilPlan {
+    /// `4 failures in a row, at most 1000`,
+    /// `3 in a row of status == 401, at most 50, 500 ms apart`.
+    pub fn describe(&self) -> String {
+        let mut out = match &self.matching {
+            Some(m) => format!("{} in a row of {m}", self.streak),
+            None => format!("{} failure{} in a row", self.streak, if self.streak == 1 { "" } else { "s" }),
+        };
+        out.push_str(&format!(", at most {}", self.max.unwrap_or(UNTIL_MAX)));
+        if let Some(gap) = self.gap_ms.filter(|g| *g > 0) {
+            out.push_str(&format!(", {gap} ms apart"));
+        }
         out
     }
 }
@@ -1072,6 +1127,8 @@ pub enum ReplyBody {
     FlowStarted { flow_id: u64, steps: Vec<String> },
     BenchStarted { bench_id: u64 },
     BenchStopped,
+    UntilStarted { until_id: u64 },
+    UntilStopped,
     BaselineSaved { name: String, path: String },
     Baselines { baselines: Vec<Baseline>, skipped: Vec<String> },
     BenchCompared { comparison: BenchComparison },
@@ -1178,6 +1235,27 @@ pub enum EventKind {
     },
     /// Finished bench `bench_id` was kept as baseline `name`.
     BaselineSaved { name: String, bench_id: u64 },
+    /// A run-until began: `request` as written, sent with `env`, to `plan`.
+    UntilStarted {
+        until_id: u64,
+        request: HttpRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+        plan: UntilPlan,
+    },
+    /// A run-until's request `request_id` was answered (or not): whether it
+    /// `counted`, how many have been sent, and the count in a row.
+    UntilProgress { until_id: u64, request_id: u64, counted: bool, sent: u64, streak: u32 },
+    /// A run-until ended: `reached` when the streak came; otherwise
+    /// `stopped` says why it ended.
+    UntilFinished {
+        until_id: u64,
+        sent: u64,
+        streak: u32,
+        reached: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stopped: Option<String>,
+    },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The policy file changed. `rules` are what agents get from now on;

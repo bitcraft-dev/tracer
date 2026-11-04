@@ -28,6 +28,7 @@
 
 mod mcp;
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,7 +37,7 @@ use tracer_protocol::client::Client;
 use tracer_protocol::{
     Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
     BenchComparison, BenchPlan, BenchStats, Direction, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, StreamKind,
-    Timing, DISCOVERY_PATH, WEBSOCKET,
+    Timing, UntilPlan, DISCOVERY_PATH, WEBSOCKET,
 };
 
 /// `{{name}}` values are shown cut to this, so a long token doesn't fill the
@@ -94,6 +95,16 @@ usage:
                                       another bench
   tracer bench baselines              list the baselines
   tracer bench stop <ID>              stop a running bench, whoever started it
+  tracer until <PATH> [-n <STREAK>] [--match '<EXPECTATION>'] [--max <N>]
+             [--every <DURATION>] [--env <NAME>]
+                                      send a saved request again and again, one at
+                                      a time, until STREAK answers in a row (default
+                                      3) fail, or pass EXPECTATION (status == 401);
+                                      any other answer starts the count again; at
+                                      most N (default 1000), DURATION apart (500ms,
+                                      2s); a line an answer; exits 0 when the streak
+                                      came, 1 when it ended without it
+  tracer until stop <ID>              stop a running run-until, whoever started it
   tracer schema <URL|PATH> [-H 'Name: value']... [--env <NAME>]
                                       a GraphQL server's schema as SDL, asked by
                                       introspection (a request in history);
@@ -148,6 +159,7 @@ fn main() -> ExitCode {
         Some("save") => save(workspace, args[1..].to_vec()),
         Some("run") => run(workspace, args[1..].to_vec()),
         Some("bench") => bench(workspace, args[1..].to_vec()),
+        Some("until") => until(workspace, args[1..].to_vec()),
         Some("schema") => schema(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
@@ -837,6 +849,92 @@ fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
+fn until(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    if args.first().map(String::as_str) == Some("stop") {
+        let id = bench_id(args.get(1))?;
+        let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+        client.call(Command::StopUntil { until_id: id })?.map_err(io::Error::other)?;
+        eprintln!("run-until {id} stopping");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let whole = |flag: &str, value: Option<String>| -> io::Result<Option<u64>> {
+        value.map(|v| v.parse::<u64>().map_err(|_| io::Error::other(format!("{flag} takes a whole number, not `{v}`")))).transpose()
+    };
+    let env = take_value(&mut args, "--env");
+    let matching = take_value(&mut args, "--match");
+    let streak = whole("-n", take_value(&mut args, "-n"))?.map_or(3, |n| n as u32);
+    let max = whole("--max", take_value(&mut args, "--max"))?;
+    let gap_ms = take_value(&mut args, "--every").map(|t| millis(&t)).transpose()?;
+    let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let wanted = path.trim().replace('\\', "/");
+    let wanted = wanted.strip_prefix("requests/").unwrap_or(&wanted);
+    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted);
+    let (requests, _) = saved(&workspace, "tracer until")?;
+    let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
+        return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
+    };
+    let plan = UntilPlan { streak, matching, max, gap_ms };
+
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer until")?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    let until_id = match client.call(Command::RunUntil { request: found.request, env: env.clone(), plan: plan.clone() })? {
+        Ok(ReplyBody::UntilStarted { until_id }) => until_id,
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    let with = env.as_ref().map(|e| format!(" (env {e})")).unwrap_or_default();
+    eprintln!("run-until {until_id}: {wanted}{with}, {}; `tracer until stop {until_id}` stops it", plan.describe());
+    // How each request ended, for its line when the run tells whether it counted.
+    let mut ends: HashMap<u64, String> = HashMap::new();
+    loop {
+        let event = client.next_event()?;
+        match event.kind {
+            EventKind::RequestFinished { request_id, response } => {
+                ends.insert(request_id, format!("{} · {:.0} ms", response.status, response.timing.total_ms));
+            }
+            EventKind::RequestFailed { request_id, error } => {
+                ends.insert(request_id, format!("no answer: {error}"));
+            }
+            EventKind::ApprovalAsked { reason, request_id } => {
+                eprintln!("waits for a person: {reason}; `tracer approve {request_id}`");
+            }
+            EventKind::UntilProgress { until_id: id, request_id, counted, streak, .. } if id == until_id => {
+                let end = ends.remove(&request_id).unwrap_or_default();
+                let mark = if counted { "●" } else { "·" };
+                println!("#{request_id:<5} {mark} {end}  ({streak} in a row)");
+            }
+            EventKind::UntilFinished { until_id: id, sent, streak, reached, stopped } if id == until_id => {
+                if reached {
+                    eprintln!("{streak} in a row after {sent} sent");
+                } else {
+                    eprintln!("ended without {} in a row after {sent} sent: {}", plan.streak, stopped.unwrap_or_default());
+                }
+                return Ok(if reached { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `500ms`, `2s`, `1m` as milliseconds; a bare number is milliseconds.
+fn millis(text: &str) -> io::Result<u64> {
+    let t = text.trim().to_ascii_lowercase();
+    let (n, unit) = match t.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => (&t[..at], &t[at..]),
+        None => (t.as_str(), "ms"),
+    };
+    let per = match unit {
+        "ms" => 1,
+        "s" => 1000,
+        "m" | "min" => 60_000,
+        _ => 0,
+    };
+    match n.parse::<u64>() {
+        Ok(n) if per > 0 => Ok(n * per),
+        _ => Err(io::Error::other(format!("--every takes a duration such as 500ms or 2s, not `{text}`"))),
+    }
+}
+
 fn bench_id(arg: Option<&String>) -> io::Result<u64> {
     arg.and_then(|a| a.trim_start_matches('#').parse().ok()).ok_or_else(|| io::Error::other(USAGE))
 }
@@ -1376,6 +1474,18 @@ fn describe(event: &Event) -> String {
             None => format!("bench {bench_id} finished: {}", bench_line(stats)),
         },
         EventKind::BaselineSaved { name, bench_id } => format!("saved bench {bench_id} as baseline {name}"),
+        EventKind::UntilStarted { until_id, request, plan, .. } => {
+            format!("run-until {until_id} started: {} {}, {}", request.method, request.url, plan.describe())
+        }
+        EventKind::UntilProgress { until_id, request_id, counted, streak, .. } => {
+            format!("run-until {until_id}: #{request_id} {}, {streak} in a row", if *counted { "counts" } else { "doesn't count" })
+        }
+        EventKind::UntilFinished { until_id, sent, streak, reached: true, .. } => {
+            format!("run-until {until_id} reached {streak} in a row after {sent} sent")
+        }
+        EventKind::UntilFinished { until_id, sent, stopped, .. } => {
+            format!("run-until {until_id} ended after {sent} sent: {}", stopped.as_deref().unwrap_or(""))
+        }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
         EventKind::PolicyChanged { rules, error: Some(error) } => {
             format!("agents.policy not taken, {} rules stand: {error}", rules.len())

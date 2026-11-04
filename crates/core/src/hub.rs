@@ -17,7 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracer_protocol::{
     Actor, AgentRules, BenchPlan, BenchStats, CheckResult, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
-    HttpResponse, SavedRequest, ServerMessage, StreamItem, StreamKind, StreamMessage, HISTORY_LIMIT, JOURNAL_PATH, POLICY_PATH,
+    HttpResponse, SavedRequest, ServerMessage, StreamItem, StreamKind, StreamMessage, UntilPlan, HISTORY_LIMIT, JOURNAL_PATH,
+    POLICY_PATH,
 };
 
 use crate::policy::Policy;
@@ -36,6 +37,7 @@ struct Inner {
     next_request: u64,
     next_flow: u64,
     next_bench: u64,
+    next_until: u64,
     journal: File,
     /// Every event so far, for replay. Kept whole for now; a long-lived
     /// workspace will want this paged from the file instead.
@@ -49,6 +51,8 @@ struct Inner {
     /// Benches still running: the flag their workers check, and who stopped
     /// it once someone has.
     benches: HashMap<u64, Bench>,
+    /// Run-untils still running.
+    untils: HashMap<u64, Until>,
     /// Requests waiting for a person to allow them, each with where the
     /// answer goes.
     awaiting: HashMap<u64, mpsc::Sender<(bool, Actor)>>,
@@ -104,6 +108,16 @@ struct Bench {
     kind: ClientKind,
     /// Why it was stopped, once it has been.
     stopped: Option<String>,
+}
+
+/// A run-until running, for stopping it.
+struct Until {
+    stop: Arc<AtomicBool>,
+    kind: ClientKind,
+    /// Why it was stopped, once it has been.
+    stopped: Option<String>,
+    /// The request it's waiting on, which stopping it cancels.
+    current: Option<u64>,
 }
 
 #[derive(Default)]
@@ -164,6 +178,28 @@ impl Hub {
             })
             .max()
             .map_or(1, |id| id + 1);
+        let next_until = events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::UntilStarted { until_id, .. } => Some(until_id),
+                _ => None,
+            })
+            .max()
+            .map_or(1, |id| id + 1);
+        // Run-untils a previous core never finished, with how far they got.
+        let mut open_untils: Vec<(u64, Actor, u64, u32)> = Vec::new();
+        for e in &events {
+            match &e.kind {
+                EventKind::UntilStarted { until_id, .. } => open_untils.push((*until_id, e.actor.clone(), 0, 0)),
+                EventKind::UntilProgress { until_id, sent, streak, .. } => {
+                    if let Some(open) = open_untils.iter_mut().find(|(id, ..)| id == until_id) {
+                        (open.2, open.3) = (*sent, *streak);
+                    }
+                }
+                EventKind::UntilFinished { until_id, .. } => open_untils.retain(|(id, ..)| id != until_id),
+                _ => {}
+            }
+        }
         // Benches a previous core never finished, with how far they got.
         let mut open_benches: Vec<(u64, Actor, BenchStats)> = Vec::new();
         for e in &events {
@@ -219,12 +255,14 @@ impl Hub {
                 next_request,
                 next_flow,
                 next_bench,
+                next_until,
                 journal,
                 events,
                 clients: BTreeMap::new(),
                 subscribers: Vec::new(),
                 running: HashMap::new(),
                 benches: HashMap::new(),
+                untils: HashMap::new(),
                 awaiting: HashMap::new(),
                 agents_allowed,
                 policy,
@@ -248,6 +286,10 @@ impl Hub {
             for (bench_id, actor, stats) in open_benches {
                 let stopped = Some("the core stopped before it finished".to_string());
                 publish_locked(&mut inner, actor, EventKind::BenchFinished { bench_id, stats, stopped });
+            }
+            for (until_id, actor, sent, streak) in open_untils {
+                let stopped = Some("the core stopped before it finished".to_string());
+                publish_locked(&mut inner, actor, EventKind::UntilFinished { until_id, sent, streak, reached: false, stopped });
             }
         }
         Ok(hub)
@@ -359,6 +401,47 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap();
         let by = inner.benches.remove(&bench_id).and_then(|b| b.stopped);
         publish_locked(&mut inner, actor, EventKind::BenchFinished { bench_id, stats, stopped: by.or(stopped) });
+    }
+
+    /// Number a new run-until and publish that it started. Gives its id and
+    /// the flag that says to stop.
+    pub fn start_until(&self, actor: Actor, request: HttpRequest, env: Option<String>, plan: UntilPlan) -> (u64, Arc<AtomicBool>) {
+        let mut inner = self.inner.lock().unwrap();
+        let until_id = inner.next_until;
+        inner.next_until += 1;
+        let stop = Arc::new(AtomicBool::new(false));
+        inner.untils.insert(until_id, Until { stop: stop.clone(), kind: actor.kind.clone(), stopped: None, current: None });
+        publish_locked(&mut inner, actor, EventKind::UntilStarted { until_id, request, env, plan });
+        (until_id, stop)
+    }
+
+    /// Note that run-until `until_id` now waits on request `request_id`.
+    pub fn until_sending(&self, until_id: u64, request_id: u64) {
+        if let Some(until) = self.inner.lock().unwrap().untils.get_mut(&until_id) {
+            until.current = Some(request_id);
+        }
+    }
+
+    /// Stop run-until `until_id` on `actor`'s behalf, cancelling the request
+    /// it waits on. False when it isn't running.
+    pub fn stop_until(&self, actor: &Actor, until_id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        stop_until_locked(&mut inner, actor, until_id)
+    }
+
+    /// Publish how run-until `until_id` stands after request `request_id`.
+    pub fn until_progress(&self, actor: Actor, until_id: u64, request_id: u64, counted: bool, sent: u64, streak: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        publish_locked(&mut inner, actor, EventKind::UntilProgress { until_id, request_id, counted, sent, streak });
+    }
+
+    /// Publish how run-until `until_id` ended: `stopped` says why it ended
+    /// without its streak, unless someone stopped it, which says so instead.
+    pub fn end_until(&self, actor: Actor, until_id: u64, sent: u64, streak: u32, reached: bool, stopped: Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        let by = inner.untils.remove(&until_id).and_then(|u| u.stopped);
+        let stopped = if reached { None } else { by.or(stopped) };
+        publish_locked(&mut inner, actor, EventKind::UntilFinished { until_id, sent, streak, reached, stopped });
     }
 
     /// Bench `bench_id` as it was started and, once finished, how it went;
@@ -653,6 +736,12 @@ impl Hub {
             for bench_id in benches {
                 stop_bench_locked(&mut inner, &actor, bench_id);
             }
+            let mut untils: Vec<u64> =
+                inner.untils.iter().filter(|(_, u)| u.kind == ClientKind::Agent).map(|(id, _)| *id).collect();
+            untils.sort();
+            for until_id in untils {
+                stop_until_locked(&mut inner, &actor, until_id);
+            }
         }
         Ok(())
     }
@@ -897,6 +986,20 @@ fn take_rate_locked(inner: &mut Inner, actor: &Actor, rules: &AgentRules) -> Res
     }
     starts.push_back(now);
     Ok(())
+}
+
+fn stop_until_locked(inner: &mut Inner, actor: &Actor, until_id: u64) -> bool {
+    match inner.untils.get_mut(&until_id) {
+        Some(until) if until.stopped.is_none() => {
+            until.stop.store(true, Ordering::SeqCst);
+            until.stopped = Some(format!("stopped by {}", actor.name));
+            if let Some(request_id) = until.current.filter(|id| inner.running.contains_key(id)) {
+                cancel_locked(inner, actor.clone(), request_id);
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 fn stop_bench_locked(inner: &mut Inner, actor: &Actor, bench_id: u64) -> bool {

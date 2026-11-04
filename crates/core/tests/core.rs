@@ -10,7 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use tracer_protocol::client::{Client, Incoming};
-use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, DISCOVERY_PATH};
+use tracer_protocol::{ClientKind, Command, Event, EventKind, HttpRequest, ReplyBody, UntilPlan, DISCOVERY_PATH};
 
 /// A fresh workspace under the temp directory, per test.
 fn workspace(name: &str) -> PathBuf {
@@ -680,6 +680,92 @@ fn a_flow_step_sent_again_is_filled_with_the_captures_it_had() {
     let sent: Vec<&str> = journal.lines().filter(|l| l.contains("request_started")).collect();
     assert_eq!(sent.len(), 4);
     assert!(sent.iter().all(|l| !l.contains("/x/first")), "a capture's value reached the journal");
+    core.stop();
+}
+
+/// An HTTP server answering with `statuses` in turn, then the last one
+/// again. Gives its base URL.
+fn status_server(statuses: Vec<u16>) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { continue };
+            let status = statuses[n.min(statuses.len() - 1)];
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_run_until_stops_at_its_streak_in_a_row_or_its_most_or_when_stopped() {
+    let ws = workspace("until");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
+    let until = |url: String, plan: UntilPlan| Command::RunUntil {
+        request: HttpRequest { method: "GET".into(), url, ..Default::default() },
+        env: None,
+        plan,
+    };
+    let finished = |client: &mut Client, id: u64| {
+        wait_for(client, |e| match &e.kind {
+            EventKind::UntilFinished { until_id, sent, streak, reached, stopped } if *until_id == id => {
+                Some((*sent, *streak, *reached, stopped.clone()))
+            }
+            _ => None,
+        })
+    };
+
+    // Four 401s in a row; the 500 between them starts the count again.
+    let base = status_server(vec![200, 401, 401, 500, 401, 401, 401, 401, 200]);
+    let plan = UntilPlan { streak: 4, matching: Some("status == 401".into()), ..Default::default() };
+    let Ok(ReplyBody::UntilStarted { until_id }) = cli.call(until(base, plan)).unwrap() else { panic!() };
+    let mut streaks = Vec::new();
+    let end = wait_for(&mut window, |e| match &e.kind {
+        EventKind::UntilProgress { until_id: id, streak, .. } if *id == until_id => {
+            streaks.push(*streak);
+            None
+        }
+        EventKind::UntilFinished { until_id: id, sent, reached, stopped, .. } if *id == until_id => {
+            Some((*sent, *reached, stopped.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(streaks, vec![0, 1, 2, 0, 1, 2, 3, 4]);
+    assert_eq!(end, (8, true, None));
+    // Each send is in history.
+    let Ok(ReplyBody::History { matched, .. }) = cli.call(Command::History { filter: Default::default() }).unwrap() else { panic!() };
+    assert_eq!(matched, 8);
+
+    // Never failing, it stops at its most.
+    let base = status_server(vec![200]);
+    let plan = UntilPlan { streak: 2, max: Some(3), ..Default::default() };
+    let Ok(ReplyBody::UntilStarted { until_id }) = cli.call(until(base, plan)).unwrap() else { panic!() };
+    let (sent, streak, reached, stopped) = finished(&mut window, until_id);
+    assert_eq!((sent, streak, reached), (3, 0, false));
+    assert!(stopped.unwrap().contains("sent 3, its most"));
+
+    // Failing but slowly, a person stops it between sends.
+    let base = status_server(vec![500]);
+    let plan = UntilPlan { streak: 100, gap_ms: Some(10_000), ..Default::default() };
+    let Ok(ReplyBody::UntilStarted { until_id }) = cli.call(until(base, plan)).unwrap() else { panic!() };
+    wait_for(&mut window, |e| matches!(&e.kind, EventKind::UntilProgress { until_id: id, .. } if *id == until_id).then_some(()));
+    assert_eq!(window.call(Command::StopUntil { until_id }).unwrap(), Ok(ReplyBody::UntilStopped));
+    let (sent, streak, reached, stopped) = finished(&mut window, until_id);
+    assert_eq!((sent, streak, reached, stopped.as_deref()), (1, 1, false, Some("stopped by window")));
+    assert!(window.call(Command::StopUntil { until_id }).unwrap().is_err());
+
+    // A plan it can't run is refused up front.
+    let plan = UntilPlan { streak: 2, matching: Some("stauts 401".into()), ..Default::default() };
+    assert!(cli.call(until("http://127.0.0.1:1".into(), plan)).unwrap().unwrap_err().contains("can't read"));
     core.stop();
 }
 

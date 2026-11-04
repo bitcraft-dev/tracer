@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
     BenchPlan, ClientKind, Command, Direction, Ended, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
-    StatusClass, StreamItem, StreamKind, StreamMessage, WEBSOCKET,
+    StatusClass, StreamItem, StreamKind, StreamMessage, UntilPlan, WEBSOCKET,
 };
 
 /// MCP versions this server speaks, newest first. A client asking for
@@ -531,6 +531,88 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             let bench_id = args.get("bench_id").and_then(Value::as_u64).ok_or("`bench_id` is required")?;
             call(core, Command::StopBench { bench_id })?;
             Ok(json!({ "bench_id": bench_id, "state": "stopping" }))
+        }
+        "run_until" => {
+            let path = str_arg(args, "path").ok_or("`path` is required")?;
+            let wanted = path.trim().trim_start_matches("requests/").trim_end_matches(".http");
+            let ReplyBody::Requests { requests, .. } = call(core, Command::ListRequests)? else {
+                return Err(unexpected());
+            };
+            let found = requests
+                .into_iter()
+                .find(|r| r.path == wanted)
+                .ok_or_else(|| format!("there is no saved request `{wanted}`; list_requests lists them"))?;
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            let plan = UntilPlan {
+                streak: args.get("streak").and_then(Value::as_u64).unwrap_or(3) as u32,
+                matching: str_arg(args, "matching").filter(|m| !m.trim().is_empty()).map(String::from),
+                max: args.get("max").and_then(Value::as_u64),
+                gap_ms: args.get("gap_ms").and_then(Value::as_u64),
+            };
+            let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT * 2).min(WAIT_MAX);
+            while core.events.try_recv().is_ok() {}
+            let ReplyBody::UntilStarted { until_id } = call(core, Command::RunUntil { request: found.request, env, plan })? else {
+                return Err(unexpected());
+            };
+            let deadline = Instant::now() + Duration::from_secs(wait);
+            // Each answer as it came: its request, status or error, and whether it counted.
+            let mut ends: Vec<(u64, Value)> = Vec::new();
+            let mut answers: Vec<Value> = Vec::new();
+            let (mut sent, mut streak) = (0, 0);
+            let mut asked: Option<(u64, String)> = None;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let event = match core.events.recv_timeout(left) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let note = match asked {
+                            Some((request_id, reason)) => format!("request #{request_id} waits for a person to allow it ({reason}); stop_until withdraws the run"),
+                            None => format!("not finished after {wait} s; it carries on, and stop_until stops it"),
+                        };
+                        let last: Vec<&Value> = answers.iter().rev().take(20).rev().collect();
+                        return Ok(json!({ "until_id": until_id, "state": "running", "sent": sent, "streak": streak, "last_answers": last, "note": note }));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Err("the core hung up".into()),
+                };
+                match event.kind {
+                    EventKind::RequestFinished { request_id, response } => ends.push((request_id, json!(response.status))),
+                    EventKind::RequestFailed { request_id, error } => ends.push((request_id, json!(error))),
+                    EventKind::ApprovalAsked { request_id, reason } => asked = Some((request_id, reason)),
+                    EventKind::ApprovalGiven { .. } => asked = None,
+                    EventKind::UntilProgress { until_id: u, request_id, counted, sent: s, streak: k } if u == until_id => {
+                        (sent, streak) = (s, k);
+                        let end = ends.iter().position(|(id, _)| *id == request_id).map(|at| ends.remove(at).1);
+                        let mut answer = json!({ "request_id": request_id, "counted": counted, "streak": k });
+                        match end {
+                            Some(Value::Number(status)) => answer["status"] = Value::Number(status),
+                            Some(error) => answer["error"] = error,
+                            None => {}
+                        }
+                        answers.push(answer);
+                    }
+                    EventKind::UntilFinished { until_id: u, sent, streak, reached, stopped } if u == until_id => {
+                        // The last answers, which hold the streak; history has every one.
+                        let last: Vec<&Value> = answers.iter().rev().take(20).rev().collect();
+                        let mut out = json!({
+                            "until_id": until_id,
+                            "state": if reached { "reached" } else { "ended" },
+                            "sent": sent,
+                            "streak": streak,
+                            "last_answers": last,
+                        });
+                        if let Some(why) = stopped {
+                            out["stopped"] = json!(why);
+                        }
+                        return Ok(out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "stop_until" => {
+            let until_id = args.get("until_id").and_then(Value::as_u64).ok_or("`until_id` is required")?;
+            call(core, Command::StopUntil { until_id })?;
+            Ok(json!({ "until_id": until_id, "state": "stopping" }))
         }
         "read_policy" => {
             let ReplyBody::Policy { rules, error } = call(core, Command::Policy)? else {
@@ -1217,6 +1299,28 @@ fn tools() -> Value {
             "name": "stop_bench",
             "description": "Stop a running bench, whoever started it.",
             "inputSchema": { "type": "object", "properties": { "bench_id": { "type": "integer" } }, "required": ["bench_id"] },
+        },
+        {
+            "name": "run_until",
+            "description": "Send a saved request again and again, one at a time, until `streak` answers in a row count (default 3): answers `matching` passes on (an expectation such as `status == 401`), or without it, failures (no answer, a failed check, or with no checks a status of 400 or more). Any other answer starts the count again. At most `max` sends (default 1000), `gap_ms` apart. Every send is an ordinary request in the history, held to the policy and approvals like any send. Gives whether the streak came (`reached`), how many were sent, why it ended otherwise, and the last answers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A saved request's path, as list_requests gives it." },
+                    "env": env,
+                    "streak": { "type": "integer", "description": "How many counted answers in a row end it (default 3)." },
+                    "matching": { "type": "string", "description": "An expectation an answer must pass to count, as in a request's checks: status == 401, status 5xx, $.error == locked. Without it, failures count." },
+                    "max": { "type": "integer", "description": "The most to send (default 1000)." },
+                    "gap_ms": { "type": "integer", "description": "Milliseconds to wait after an answer before the next send." },
+                    "wait_seconds": { "type": "integer", "description": "How long to wait for the end (default 120, at most 600)." },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "stop_until",
+            "description": "Stop a running run-until, whoever started it.",
+            "inputSchema": { "type": "object", "properties": { "until_id": { "type": "integer" } }, "required": ["until_id"] },
         },
         {
             "name": "diff_responses",

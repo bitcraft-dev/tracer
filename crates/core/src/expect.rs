@@ -67,6 +67,11 @@ pub fn check(expect: &[String], response: Result<&HttpResponse, &str>) -> Vec<Ch
         .collect()
 }
 
+/// Whether `line` is an expectation that can be read, and if not, why.
+pub fn readable(line: &str) -> Result<(), String> {
+    parse(line).map(|_| ())
+}
+
 fn parse(line: &str) -> Result<Expect, String> {
     let line = line.trim();
     let (word, rest) = split_word(line);

@@ -17,7 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
-use crate::{bench, diff, envs, flows, graphql, guard, http, realtime};
+use crate::{bench, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -190,6 +190,16 @@ pub fn serve(
                     Ok(ReplyBody::BenchStopped)
                 } else {
                     Err(format!("bench {bench_id} is not running"))
+                }
+            }
+            (Some((_, actor)), Command::RunUntil { request, env, plan }) => {
+                until::start(&hub, actor, request, env, plan).map(|until_id| ReplyBody::UntilStarted { until_id })
+            }
+            (Some((_, actor)), Command::StopUntil { until_id }) => {
+                if hub.stop_until(actor, until_id) {
+                    Ok(ReplyBody::UntilStopped)
+                } else {
+                    Err(format!("run-until {until_id} is not running"))
                 }
             }
             (Some((_, actor)), Command::StreamSend { request_id, text }) => {
