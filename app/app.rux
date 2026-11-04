@@ -514,10 +514,13 @@
   .rail-item.on { background: #2b2540; }
   .rail-label { color: #e0e0e0; font-size: 11px; font-weight: 700; }
 
+  /* The remembered width gives way before the work area does: in a
+     narrow window the sidebar shrinks to 200px, the work area keeps 420px. */
   .side {
     display: flex;
     flex-direction: column;
-    flex-shrink: 0;
+    flex-shrink: 1;
+    min-width: 200px;
     background: #1b1b1b;
   }
 
@@ -733,7 +736,7 @@
     flex-direction: column;
     gap: 10px;
     padding: 16px 18px;
-    min-width: 0;
+    min-width: 420px;
   }
 
   .title {
@@ -760,9 +763,7 @@
     min-width: 0;
     color: #e8a54b;
     font-size: 12px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    overflow-wrap: break-word;
   }
 
   .save {
@@ -787,7 +788,7 @@
     border-radius: 6px;
   }
 
-  .method { width: 140px; }
+  .method { flex: 0 1 140px; min-width: 96px; }
   .url { flex: 1; min-width: 0; }
 
   .send {
@@ -817,9 +818,7 @@
     color: #8a8a8a;
     font-size: 12px;
     font-family: monospace;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    word-break: break-all;
   }
 
   .preview-warn { color: #e8a54b; font-size: 11px; white-space: nowrap; }
@@ -1069,14 +1068,18 @@
   .hdr { display: flex; gap: 12px; }
 
   .hdr-n {
+    flex: 0 1 220px;
+    min-width: 110px;
     color: #9d8ff5;
     font-size: 12px;
     font-family: monospace;
-    width: 220px;
+    overflow-wrap: break-word;
   }
 
   .hdr-v {
     flex: 1;
+    min-width: 0;
+    overflow-wrap: break-word;
     color: #d4d4d4;
     font-size: 12px;
     font-family: monospace;

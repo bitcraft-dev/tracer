@@ -1008,7 +1008,10 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** resolve `min-width: auto` to 0 for a flex item whose
   `overflow` is not `visible` (CSS Flexbox, "automatic minimum size"),
   and check `flex: 1` sets a 0 basis.
-- **Status:** open.
+- **Status:** fixed (the user, 2026-11-04; installed `rux` of 2026-11-04
+  00:17). The reproduction draws both rows' `.m` at 64 px, the long URL
+  ellipsised inside the side's padding; Tracer's history at 1000 px wide
+  with a 120-character URL keeps its method column and ellipsises.
 
 ## AW-037 An empty inline `<text>` after a non-empty one panics the window
 
@@ -1232,6 +1235,49 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Status:** open. The Rux checkout (7a2be84) had uncommitted changes in
   rux-layout, rux-runtime and rux-script when the installed `rux` was
   built.
+
+## AW-042 `margin: auto` is laid out as 0 in a flex container
+
+- **Found:** 2026-11-04, Tracer's Collections header (its `+` sits by the
+  count, not at the right edge) and the title row (Save sits by the
+  title), while driving the small layout fixes.
+- **Severity:** layout bug, no error. `margin-left: auto` is the usual CSS
+  way to push the last items of a row to its end, and `margin: 0 auto` to
+  centre one; Tracer uses the first twice. `rux check` accepts both.
+- **Limit:** in a `display: flex` container, an `auto` margin takes no
+  space. In CSS, auto margins take the free space on their axis before
+  `justify-content`, and on the cross axis they keep the item from
+  stretching and place it.
+- **Reproduction:** (installed `rux` of 2026-11-04 00:17, no native crate)
+  ```html
+  <template>
+    <view class="page">
+      <view class="row"><text class="a">left</text><view class="push"><text>margin-left: auto</text></view></view>
+      <view class="row"><view class="both"><text>margin: 0 auto</text></view></view>
+      <view class="col"><view class="push"><text>column, margin-left: auto</text></view></view>
+    </view>
+  </template>
+
+  <style>
+    .page { background: #202020; height: 100%; display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+    .row { width: 400px; display: flex; gap: 8px; background: #333333; }
+    .col { width: 400px; display: flex; flex-direction: column; background: #333333; }
+    .a { background: #2e6b4f; color: #ffffff; }
+    .push { margin-left: auto; background: #4a3a8a; }
+    .both { margin: 0 auto; background: #4a3a8a; }
+    text { color: #ffffff; }
+  </style>
+  ```
+  Draws the first purple box right after "left" (CSS: at the row's right
+  end), the second at the left (CSS: centred), and the third stretched
+  the column's full width (CSS: its own width, at the right).
+- **Workaround:** none taken in Tracer (a spacer with `flex: 1`, or
+  `justify-content: space-between`, would place them).
+- **Suggested fix:** resolve auto margins in flex layout as CSS Flexbox
+  §8.1 says: main axis, share the positive free space among them before
+  `justify-content`; cross axis, an auto margin turns off `stretch` and
+  aligns the item. Tests for a row's end, a centred item and a column.
+- **Status:** open.
 
 ## Phase 0 results
 
