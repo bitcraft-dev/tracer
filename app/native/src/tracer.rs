@@ -26,8 +26,8 @@ use tracer_protocol::{
     StepOutcome, StreamKind, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
 };
 
-/// The most of a response body handed to the page. The core and its journal
-/// keep the whole body; a viewer for large ones is Phase 4.
+/// The most of a response body an event hands the page. The core and its
+/// journal keep the whole body, which the viewer fetches (`view.rs`).
 const BODY_SHOWN: usize = 64 * 1024;
 
 /// How long a core that this window started gets to answer.
@@ -293,7 +293,7 @@ pub static EVENTS: rux::Channel<CoreEvent> = rux::Channel::new();
 pub static LINK: rux::Signal<Link> = rux::Signal::new();
 
 #[derive(Debug)]
-pub struct CoreError(String);
+pub struct CoreError(pub(crate) String);
 
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -834,7 +834,7 @@ fn tracer_bin() -> PathBuf {
     PathBuf::from(name)
 }
 
-fn shared() -> Result<Arc<Shared>, CoreError> {
+pub(crate) fn shared() -> Result<Arc<Shared>, CoreError> {
     match SESSION.lock().unwrap().as_ref() {
         Some(session) => Ok(session.shared.clone()),
         None => Err(CoreError("not connected to a core".into())),
