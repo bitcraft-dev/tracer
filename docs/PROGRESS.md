@@ -14,9 +14,9 @@ auto` is 0 in flex, which is why the Collections `+` and Save don't sit
 at their row's end); the small layout fixes (652b9df); Realtime's body
 no longer leaks into a GET (808af61); a flow step's re-run gets its
 captures (62f1a93); a bench picked later shows its numbers and line
-(ea0d60e); and **run-until** (02783e2, de4fe95), the first of the user's
-three features. Next: cookies and the CORS preflight (Next, item 5),
-then Show more (item 1).
+(ea0d60e); **run-until** (02783e2, de4fe95); and **browser behaviour**,
+cookies and CORS (6f6a1d1): all three of the user's features. Next: Show
+more (item 1).
 
 ## Where it stood (2026-11-04, evening)
 
@@ -574,6 +574,22 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   bench. A test (`a_run_until_stops_at…`), and driven from the CLI, an
   MCP agent and the window against `status_server.py` (scratchpad;
   port 18766, `/reset` restarts its 200, 401, 401, 500, 401 x4).
+- **Browser behaviour, opt in** (6f6a1d1). `Browser { cookies, origin }`
+  in `.tracer/browser.json`, set by a person (`SetBrowser`; window chip
+  in the status bar, `tracer browser cookies on origin URL`). Cookies:
+  `cookies.rs`, an RFC 6265 jar in `.tracer/cookies.json`; with it on,
+  `run_one` follows redirects itself a hop at a time
+  (`send_keeping_cookies`, 20 at most) so a 302's `Set-Cookie` is kept.
+  Values stay out of the journal and away from agents (`Cookies` gives a
+  person values; `list_cookies` over MCP gives names). CORS: `cors.rs`;
+  with an origin, cross-origin requests carry `Origin`, ones a browser
+  would preflight get their `OPTIONS` first as a request of their own
+  (it takes the next number, so it lists above the request it preceded),
+  a refusal fails the request "blocked by CORS: preflight #n: why", and
+  each cross-origin answer gets a "CORS from <origin>" check. Tested
+  (`browser_behaviour_…` and unit tests) and driven against httpbin.
+  Not done: SameSite isn't enforced (no notion of a top-level site), and
+  a browser's own headers (User-Agent) count as script-set ones.
 
 ### Next
 
@@ -604,19 +620,10 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    Benchmarking follow-up: comparing a flow's steps.
 4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
    wants it.
-5. New features the user asked for (2026-11-04). **Run-until is done**
-   (see Done; my reading, told to the user: with a named kind, any other
-   answer, a 500 too, resets the streak). Not started:
-   - **Browser behaviour, opt in:** a CORS preflight (`OPTIONS` with
-     `Access-Control-Request-Method`/`-Headers` and an `Origin`) before a
-     request a browser would preflight, its answer checked as a browser
-     would and shown beside the request. Tracer sends nothing it wasn't
-     asked to, so nothing preflights today.
-   - **Cookies:** a cookie jar per workspace (and environment) that keeps
-     `Set-Cookie` answers and attaches them to later requests as a browser
-     does: domain, path, expiry, and `Secure` cookies only over https;
-     viewable and clearable (the plan's Cookies tab). Nothing keeps
-     cookies today.
+5. The user's three features (2026-11-04) are done (see Done). My
+   reading of run-until, told to the user: with a named kind, any other
+   answer, a 500 too, resets the streak. Follow-ups: a per-environment
+   jar; a response's own Cookies tab (the plan's).
 6. Small: the Bench panel's baseline name field is drawn taller than
    its row (seen 2026-11-04, not looked into).
 
