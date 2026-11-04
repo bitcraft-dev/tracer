@@ -576,12 +576,17 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    wants it.
 5. New features the user asked for (2026-11-04), none started; checked
    against the core, none of it exists:
-   - **Repeat until failures:** send a request again and again, one after
-     the other, each only after the last succeeded, stopping at the nth
-     failure (a failure being a failed send, or a response that fails its
-     checks or status). Today a bench never stops on failures (it counts
-     them), and a flow stops at the first failed step or, with
-     `--keep-going`, never. CLI, MCP and the window, like bench.
+   - **Run until n failures in a row:** send a request again and again,
+     one after the other (the next only once the last has answered), and
+     stop when the last n answers in a row all failed; any success in
+     between resets the count. "Failed" is either any failure (a failed
+     send, or a response that fails its status or checks) or one specific
+     kind the user names, such as `status 401`: with n = 4, four 401s one
+     after the other stop it, and a 500 or a 200 between them starts the
+     count again. Show the run's answers, the current streak, and why it
+     stopped. Today a bench never stops on failures (it counts them), and
+     a flow stops at the first failed step or, with `--keep-going`,
+     never. CLI, MCP and the window, like bench.
    - **Browser behaviour, opt in:** a CORS preflight (`OPTIONS` with
      `Access-Control-Request-Method`/`-Headers` and an `Origin`) before a
      request a browser would preflight, its answer checked as a browser
