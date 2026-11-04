@@ -5,7 +5,20 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-11-04, evening)
+## Where it stands (2026-11-04, night)
+
+The user went to sleep and asked for development to go on, committing as
+it goes. Done since the evening, all on `phase-1-core` (not pushed;
+a922dfd onwards): AW-036 re-driven, fixed; **AW-042** found (`margin:
+auto` is 0 in flex, which is why the Collections `+` and Save don't sit
+at their row's end); the small layout fixes (652b9df); Realtime's body
+no longer leaks into a GET (808af61); a flow step's re-run gets its
+captures (62f1a93); a bench picked later shows its numbers and line
+(ea0d60e); and **run-until** (02783e2, de4fe95), the first of the user's
+three features. Next: cookies and the CORS preflight (Next, item 5),
+then Show more (item 1).
+
+## Where it stood (2026-11-04, evening)
 
 `phase-1-core` pushed (59f0cd2), then the response viewer merged
 (a922dfd, not pushed): **Phase 4 is done.** Driving it found **AW-041**
@@ -534,6 +547,33 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   0.45 s CPU, no stall over 17 ms. **Show more grows with what is shown**
   (release build: 1.5, 2.3, 3.4, 4.5 s of CPU for 2k, 3k, 4k, 5k lines;
   about 110 MB per 1,000 lines); see Next, item 1.
+- **Small layout fixes** (652b9df). The sidebar's remembered width gives
+  way (to 200 px) before the work area (420 px); the method picker
+  shrinks to 96 px; the title row's notice and the URL preview wrap; a
+  response header's name column is `flex: 0 1 220px` down to 110 px.
+  Driven at 1000 px wide with the sidebar at its 560 px. The Collections
+  `+` and Save placement is AW-042, left as it is.
+- **Follow-ups fixed.** Realtime keeps its messages and REST its body
+  across the switch (`otherBody`), and the URL goes back to http(s)
+  (808af61). A flow step's re-run is sent with the captures it had: the
+  hub keeps them by request id, in memory only (62f1a93, with a test).
+  A bench picked later (replayed, or from a request's chip) shows its
+  tiles and its rate line: the window keeps each bench's last report and
+  each report's count and time (ea0d60e).
+- **Run-until** (02783e2 core/CLI/MCP, de4fe95 window). `RunUntil {
+  request, env, plan: { streak, matching, max, gap_ms } }`: one at a
+  time until `streak` answers in a row count (failures, or with
+  `matching` an expectation they pass, so `status == 401`); any other
+  answer resets; at most 1000 by default (100,000 cap); every send is an
+  ordinary request in history. Events `until_started`, `until_progress`
+  (names each request, `counted`, `streak`), `until_finished` (`reached`
+  or `stopped`). Stop: `StopUntil`, and the kill switch stops an agent's;
+  a restarted core closes a run it left. CLI `tracer until <PATH> -n 4
+  --match 'status == 401' --every 500ms` (exit 0 when the streak came);
+  MCP `run_until`/`stop_until`; window: "Until n in a row" under the
+  bench. A test (`a_run_until_stops_at…`), and driven from the CLI, an
+  MCP agent and the window against `status_server.py` (scratchpad;
+  port 18766, `/reset` restarts its 200, 401, 401, 500, 401 x4).
 
 ### Next
 
@@ -559,34 +599,14 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 2. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
    WebSocket); a `tracer` command to send on someone else's open
    WebSocket (MCP and the window can); saving a WebSocket's messages as a
-   transcript; reconnecting SSE with `Last-Event-ID`; leaving the
-   Realtime mode keeps the WebSocket's body, which a GET then sends.
-   GraphQL follow-ups: a schema-aware query editor (needs the viewer's
-   line work). Benchmarking follow-ups: a bench's request-a-second line
-   is empty for a bench replayed from the journal (only live progress
-   draws it); comparing a flow's steps. Earlier list of benchmarking's
-   later parts, now done: two environments side by side,
-   saved baselines with regression flags, rate-limit detection.
-   Flows follow-up, untried: a flow step keeps its URL as written
-   (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
-   Decide whether a step's re-run gets the flow's captures.
-3. AW-036 is fixed (the user, 2026-11-04): re-drive its reproduction
-   and Tracer's history with a long URL in a narrow sidebar.
+   transcript; reconnecting SSE with `Last-Event-ID`. GraphQL follow-ups:
+   a schema-aware query editor (needs the viewer's line work).
+   Benchmarking follow-up: comparing a flow's steps.
 4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
    wants it.
-5. New features the user asked for (2026-11-04), none started; checked
-   against the core, none of it exists:
-   - **Run until n failures in a row:** send a request again and again,
-     one after the other (the next only once the last has answered), and
-     stop when the last n answers in a row all failed; any success in
-     between resets the count. "Failed" is either any failure (a failed
-     send, or a response that fails its status or checks) or one specific
-     kind the user names, such as `status 401`: with n = 4, four 401s one
-     after the other stop it, and a 500 or a 200 between them starts the
-     count again. Show the run's answers, the current streak, and why it
-     stopped. Today a bench never stops on failures (it counts them), and
-     a flow stops at the first failed step or, with `--keep-going`,
-     never. CLI, MCP and the window, like bench.
+5. New features the user asked for (2026-11-04). **Run-until is done**
+   (see Done; my reading, told to the user: with a named kind, any other
+   answer, a 500 too, resets the streak). Not started:
    - **Browser behaviour, opt in:** a CORS preflight (`OPTIONS` with
      `Access-Control-Request-Method`/`-Headers` and an `Origin`) before a
      request a browser would preflight, its answer checked as a browser
@@ -597,12 +617,8 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
      does: domain, path, expiry, and `Secure` cookies only over https;
      viewable and clearable (the plan's Cookies tab). Nothing keeps
      cookies today.
-3. Small: the Collections `+` doesn't sit at the right edge; the title row's
-   notice is cut short; the preview cuts long URLs; the
-   remembered sidebar width
-   isn't capped by the window, so at 1000 px wide a 400 px sidebar
-   collapses the URL field; the response header name column is a fixed
-   220 px, which squeezes values in a narrow pane.
+6. Small: the Bench panel's baseline name field is drawn taller than
+   its row (seen 2026-11-04, not looked into).
 
 ## Gotchas and how they were solved
 
