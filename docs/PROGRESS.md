@@ -608,9 +608,17 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    frames each lay the whole list out again (210 to 240 ms) with nothing
    patched. In Tracer, frames account for only ~0.65 s of a 4.9 s click.
    `content-visibility: auto` on the rows changed nothing (tried,
-   removed). To do: find what makes probe 2's equal replace re-run its
-   rows (`:class="l.kind"`? the `note` write?), and where Tracer's other
-   ~4 s go outside frames; then write the finding(s). Also seen: in
+   removed). Ruled out since (2026-11-04 night, on the no-native copy of
+   probe 2, scratchpad `p2/`, bisected by `bisect.sh`): where the pointer
+   rests (hover), the list box's radius, border, padding, background and
+   overflow, the per-row `:style` and `:class`, and the `note` writes.
+   What moves it: text elements a row (one fewer text, about 40 % less).
+   Still unexplained: on `rows/`, replacing 5,000 rows with equal ones
+   costs 0.3 s and clearing them 0.23 s; on `p2/` the same costs 2.1 s and
+   1.5 s, and its profile shows every row's bindings re-run (25,000 to
+   75,000 `run` calls) on those frames. Next to try: swap the two pages'
+   row markup and data shapes outright (p2's rows into rows/, and back)
+   to pin which side carries it, then write the finding. Also seen: in
    `rows/`, a row whose fold text is "" is ~3 px taller than one with ▾.
 2. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
    WebSocket); a `tracer` command to send on someone else's open
