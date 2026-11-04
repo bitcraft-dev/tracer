@@ -430,10 +430,41 @@
             <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
             <text class="status-t flow-t" r-if="lastBench != &quot;&quot;" :class="{ bad: !benchOk }" @tap="showBench(benchId)">{{ lastBench }}</text>
             <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
+            <view class="browser-chip" :class="{ on: browserOn || browserOrigin != &quot;&quot; }" @tap="openBrowser()">
+                <text class="browser-t">{{ browserLabel() }}</text>
+            </view>
             <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
                 <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
             </view>
             <text class="status-t key">Ctrl+K</text>
+        </view>
+
+        <view class="scrim" r-if="browserOpen" @tap="browserOpen = false">
+        <view class="palette" @tap="noop()">
+            <text class="prompt-h">Browser behaviour</text>
+            <text class="sub">Off, Tracer sends what it's given and nothing else. For the whole workspace, whoever sends.</text>
+            <view class="b-row" @tap="bCookies = !bCookies">
+                <text class="b-box">{{ if bCookies { "☑" } else { "☐" } }}</text>
+                <text class="b-t">Keep cookies and send them back, as a browser does</text>
+            </view>
+            <text class="sub">Page origin, blank for none</text>
+            <view class="pal-field small"><input r-model="bOrigin" placeholder="https://app.example.com" /></view>
+            <text class="sub">As from a page there: Origin is sent to other origins, a request a browser would preflight goes after its OPTIONS (in History), and the answer gets a CORS check.</text>
+            <view class="b-actions">
+                <text class="mono err" r-if="browserError != &quot;&quot;">{{ browserError }}</text>
+                <view class="save" @tap="saveBrowser()"><text class="save-t">Save</text></view>
+            </view>
+            <text class="prompt-h">Cookies · {{ jar.length }}</text>
+            <text class="empty" r-if="jar.length == 0">The jar is empty.</text>
+            <view class="c-row" r-for="c in jar" r-key="`${c.domain}${c.path} ${c.name}`">
+                <text class="c-where">{{ c.domain }}{{ c.path }}</text>
+                <text class="c-kv">{{ c.name }}={{ c.value }}</text>
+                <text class="c-meta">{{ c.flags }} {{ cookieEnds(c.expiresMs) }}</text>
+            </view>
+            <view class="b-actions" r-if="jar.length > 0">
+                <view class="link danger" @tap="clearJar()"><text class="link-t">Clear all</text></view>
+            </view>
+        </view>
         </view>
 
         <view class="scrim" r-if="naming" @tap="naming = false">
@@ -1174,6 +1205,25 @@
   .allow-t { color: #ffffff; font-size: 12px; font-weight: 700; }
   .warn-t { color: #e8a54b; }
 
+  .browser-chip {
+    padding: 1px 8px;
+    border: 1px solid #333333;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .browser-t { color: #8a8a8a; font-size: 11px; }
+  .browser-chip.on { border: 1px solid #3a3550; }
+  .browser-chip.on .browser-t { color: #c8c0f8; }
+  .b-row { display: flex; gap: 8px; align-items: center; padding: 8px 2px; cursor: pointer; }
+  .b-box { color: #c8c0f8; font-size: 16px; }
+  .b-t { color: #d4d4d4; font-size: 13px; }
+  .b-actions { display: flex; gap: 10px; align-items: center; justify-content: flex-end; padding: 6px 0; }
+  .c-row { display: flex; gap: 10px; padding: 3px 2px; }
+  .c-where { width: 170px; flex-shrink: 0; color: #7a7a7a; font-size: 12px; font-family: monospace; overflow-wrap: break-word; }
+  .c-kv { flex: 1; min-width: 0; color: #d4d4d4; font-size: 12px; font-family: monospace; word-break: break-all; }
+  .c-meta { flex-shrink: 0; color: #7a7a7a; font-size: 11px; }
+
   .agents {
     padding: 1px 8px;
     border: 1px solid #2e5a43;
@@ -1469,6 +1519,7 @@
   use type native::tracer::Comparison;
   use type native::tracer::GSchema;
   use type native::tracer::GType;
+  use type native::tracer::CookieRow;
   use native::view;
   use type native::view::BodyLine;
 
@@ -1745,6 +1796,77 @@
   let hStatus = signal(ANY_STATUS);
 
   computed connected = (tracer.link?.state ?? "") == "connected";
+
+  // How requests behave like a browser's, as the core has it, the jar, and
+  // the panel's draft of the setting.
+  let browserOn = signal(false);
+  let browserOrigin = signal("");
+  let jar: CookieRow[] = signal([]);
+  let browserOpen = signal(false);
+  let bCookies = signal(false);
+  let bOrigin = signal("");
+  let browserError = signal("");
+
+  effect {
+    if connected { loadBrowser(); }
+  }
+
+  async fn loadBrowser() {
+    try {
+      let b = tracer.browserState();
+      browserOn = b.cookies;
+      browserOrigin = b.origin;
+      jar = b.jar;
+    } catch e {
+      browserError = e.message;
+    }
+  }
+
+  fn browserLabel(): string {
+    let host = browserOrigin.replace("https://", "").replace("http://", "");
+    if browserOn && browserOrigin != "" {
+      `cookies · ${host}`
+    } else if browserOn {
+      "cookies"
+    } else if browserOrigin != "" {
+      `page ${host}`
+    } else {
+      "browser off"
+    }
+  }
+
+  fn openBrowser() {
+    bCookies = browserOn;
+    bOrigin = browserOrigin;
+    browserError = "";
+    loadBrowser();
+    browserOpen = true;
+  }
+
+  fn saveBrowser() {
+    try {
+      tracer.setBrowser(bCookies, bOrigin);
+      browserError = "";
+      browserOpen = false;
+    } catch e {
+      browserError = e.message;
+    }
+  }
+
+  fn clearJar() {
+    try {
+      tracer.clearCookies("");
+    } catch e {
+      browserError = e.message;
+    }
+  }
+
+  // `session`, or how long until it expires.
+  fn cookieEnds(at: int): string {
+    if at == 0 { return "session"; }
+    let left = intDiv(at - Date.now(), 1000);
+    if left < 90 { `ends in ${left} s` } else if left < 5400 { `ends in ${intDiv(left, 60)} min` } else if left < 172800 { `ends in ${intDiv(left, 3600)} h` } else { `ends in ${intDiv(left, 86400)} d` }
+  }
   computed compareOptions = ["—", ...baselineList, ...benches.filter(b => b.id != benchId).map(b => `bench ${b.id}`).toReversed()];
   computed cmpRows = cmp?.rows ?? [];
   computed cmpNotes = cmp?.notes ?? [];
@@ -1924,6 +2046,8 @@
       } else if e.kind == "flow_finished" {
         lastFlow = if e.allow { `flow ${e.flow} passed` } else { `flow ${e.flow} failed: ${e.reason}` };
         flowOk = e.allow;
+      } else if e.kind == "browser_changed" || e.kind == "cookies_changed" {
+        loadBrowser();
       } else if e.kind == "until_started" {
         untilId = e.until;
         untilMethod = e.method;

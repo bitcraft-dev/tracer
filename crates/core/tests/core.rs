@@ -769,6 +769,115 @@ fn a_run_until_stops_at_its_streak_in_a_row_or_its_most_or_when_stopped() {
     core.stop();
 }
 
+/// A server for browser behaviour: `/login` sets a cookie, `/me` answers
+/// with the `Cookie` it was sent, `OPTIONS /api` allows PUT and X-Token
+/// from https://app.test, `PUT /api` allows that origin, and `/open`
+/// allows none. Gives its base URL.
+fn browser_server() -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            let mut cookie = String::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("cookie:") {
+                    cookie = v.trim().to_string();
+                }
+                line.clear();
+            }
+            let mut words = first.split_whitespace();
+            let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+            let allow = "Access-Control-Allow-Origin: https://app.test\r\n";
+            let (head, body) = match (method, path) {
+                (_, "/login") => ("Set-Cookie: sid=abc; Path=/; HttpOnly\r\n".to_string(), String::new()),
+                (_, "/me") => (String::new(), cookie),
+                ("OPTIONS", "/api") => (format!("{allow}Access-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: X-Token\r\n"), String::new()),
+                ("PUT", "/api") => (allow.to_string(), "put".into()),
+                _ => (String::new(), "open".into()),
+            };
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn browser_behaviour_keeps_cookies_and_preflights_as_a_browser_would_once_switched_on() {
+    let ws = workspace("browser");
+    let base = browser_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut agent = Client::connect(&ws, ClientKind::Agent, "agent").unwrap();
+    let send = |client: &mut Client, method: &str, path: &str, headers: Vec<(String, String)>| {
+        let request = HttpRequest { method: method.into(), url: format!("{base}{path}"), headers, ..Default::default() };
+        let Ok(ReplyBody::Accepted { request_id }) = client.call(Command::Send { request, env: None }).unwrap() else { panic!() };
+        request_id
+    };
+
+    // Off by default: a cookie isn't kept.
+    let id = send(&mut window, "GET", "/login", vec![]);
+    end_of(&mut window, id);
+    let id = send(&mut window, "GET", "/me", vec![]);
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, id) else { panic!() };
+    assert_eq!(response.body, "");
+
+    // On, it's kept and sent back; an agent may not switch it, nor see values.
+    let on = tracer_protocol::Browser { cookies: true, origin: None };
+    assert!(agent.call(Command::SetBrowser { browser: on.clone() }).unwrap().is_err());
+    assert_eq!(window.call(Command::SetBrowser { browser: on }).unwrap(), Ok(ReplyBody::BrowserSet));
+    let id = send(&mut window, "GET", "/login", vec![]);
+    end_of(&mut window, id);
+    let id = send(&mut window, "GET", "/me", vec![]);
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, id) else { panic!() };
+    assert_eq!(response.body, "sid=abc");
+    let Ok(ReplyBody::Cookies { cookies, .. }) = window.call(Command::Cookies).unwrap() else { panic!() };
+    assert_eq!((cookies[0].name.as_str(), cookies[0].value.as_deref(), cookies[0].http_only), ("sid", Some("abc"), true));
+    let Ok(ReplyBody::Cookies { cookies, .. }) = agent.call(Command::Cookies).unwrap() else { panic!() };
+    assert_eq!(cookies[0].value, None);
+    // Kept out of the journal: sent as written, and the jar's event has no values.
+    let journal = std::fs::read_to_string(ws.join(tracer_protocol::JOURNAL_PATH)).unwrap();
+    assert!(journal.lines().filter(|l| !l.contains("request_finished")).all(|l| !l.contains("abc")), "a cookie's value reached the journal");
+    assert_eq!(window.call(Command::ClearCookies { domain: None }).unwrap(), Ok(ReplyBody::CookiesCleared { removed: 1 }));
+
+    // With a page's origin: PUT with X-Token is preflighted (a request of
+    // its own), allowed, and its answer passes the CORS check.
+    let page = tracer_protocol::Browser { cookies: false, origin: Some("HTTPS://app.test:443/index.html".into()) };
+    window.call(Command::SetBrowser { browser: page }).unwrap().unwrap();
+    let Ok(ReplyBody::Cookies { browser, .. }) = window.call(Command::Cookies).unwrap() else { panic!() };
+    assert_eq!(browser.origin.as_deref(), Some("https://app.test"));
+    let id = send(&mut window, "PUT", "/api", vec![("X-Token".into(), "1".into())]);
+    let preflight = id + 1;
+    let (started, _) = ended(&mut window, preflight);
+    let EventKind::RequestStarted { request, .. } = started.kind else { panic!() };
+    assert_eq!(request.method, "OPTIONS");
+    assert!(request.headers.contains(&("Access-Control-Request-Headers".into(), "x-token".into())));
+    let checks = wait_for(&mut window, |e| match &e.kind {
+        EventKind::RequestChecked { request_id, results } if *request_id == id => Some(results.clone()),
+        _ => None,
+    });
+    assert!(checks[0].pass, "{checks:?}");
+
+    // A header the preflight doesn't allow: blocked, nothing sent.
+    let id = send(&mut window, "PUT", "/api", vec![("X-Other".into(), "1".into())]);
+    let EventKind::RequestFailed { error, .. } = end_of(&mut window, id) else { panic!() };
+    assert!(error.contains("blocked by CORS") && error.contains("x-other"), "{error}");
+    // A simple GET goes without a preflight, but a browser keeps the answer from the page.
+    let id = send(&mut window, "GET", "/open", vec![]);
+    let checks = wait_for(&mut window, |e| match &e.kind {
+        EventKind::RequestChecked { request_id, results } if *request_id == id => Some(results.clone()),
+        EventKind::RequestStarted { request, .. } if request.method == "OPTIONS" => panic!("a simple GET was preflighted"),
+        _ => None,
+    });
+    assert!(!checks[0].pass && checks[0].actual.contains("no Access-Control-Allow-Origin"), "{checks:?}");
+    core.stop();
+}
+
 #[test]
 fn history_gives_the_newest_first_filtered_and_survives_a_restart() {
     use tracer_protocol::{Ended, HistoryFilter, StatusClass};

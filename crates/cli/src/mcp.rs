@@ -609,6 +609,10 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 }
             }
         }
+        "list_cookies" => match call(core, Command::Cookies)? {
+            ReplyBody::Cookies { browser, cookies } => Ok(json!({ "browser": browser, "cookies": cookies })),
+            _ => Err(unexpected()),
+        },
         "stop_until" => {
             let until_id = args.get("until_id").and_then(Value::as_u64).ok_or("`until_id` is required")?;
             call(core, Command::StopUntil { until_id })?;
@@ -1316,6 +1320,12 @@ fn tools() -> Value {
                 },
                 "required": ["path"],
             },
+        },
+        {
+            "name": "list_cookies",
+            "description": "How the workspace's requests behave like a browser's (`cookies`: the jar is kept and sent back; `origin`: requests go as from a page there, with a CORS preflight where a browser sends one and a `CORS` check on the answer), and the cookies in the jar: names, domains, paths, expiry and flags, never values. A person switches these on (`tracer browser`).",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true },
         },
         {
             "name": "stop_until",

@@ -152,6 +152,7 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::ListBaselines
             | Command::CompareBench { .. }
             | Command::Status
+            | Command::Cookies
     );
     if reads {
         return None;
@@ -161,6 +162,8 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
         Command::DeleteEnvironment { .. } => Some("deleting an environment"),
         Command::Decide { .. } => Some("approving a request"),
         Command::SetAgents { .. } => Some("switching agents on or off"),
+        Command::SetBrowser { .. } => Some("changing how requests behave like a browser's"),
+        Command::ClearCookies { .. } => Some("clearing cookies"),
         Command::Shutdown => Some("stopping the core"),
         _ => None,
     };

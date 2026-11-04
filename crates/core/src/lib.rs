@@ -14,6 +14,8 @@ mod api;
 mod baselines;
 mod bench;
 mod conn;
+mod cookies;
+mod cors;
 mod diff;
 mod envs;
 mod expect;

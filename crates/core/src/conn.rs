@@ -13,11 +13,11 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, BenchPlan, CheckResult, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
+    Access, Actor, BenchPlan, CheckResult, ClientKind, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
 };
 
 use crate::baselines::{self, Side};
-use crate::{bench, diff, envs, flows, graphql, guard, http, realtime, until};
+use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
 
@@ -192,6 +192,25 @@ pub fn serve(
                     Err(format!("bench {bench_id} is not running"))
                 }
             }
+            (Some((_, actor)), Command::SetBrowser { mut browser }) => {
+                // An origin as a browser writes it: scheme, host, a port that isn't the default.
+                let origin = browser.origin.take().map(|o| o.trim().to_string()).filter(|o| !o.is_empty());
+                match origin.map(|o| cors::origin_of(&o).ok_or(o)).transpose() {
+                    Err(o) => Err(format!("`{o}` isn't an origin such as https://app.example.com")),
+                    Ok(origin) => {
+                        browser.origin = origin;
+                        hub.set_browser(actor.clone(), browser).map(|_| ReplyBody::BrowserSet)
+                    }
+                }
+            }
+            (Some((_, actor)), Command::Cookies) => {
+                let (browser, cookies) = hub.cookies(actor.kind != ClientKind::Agent);
+                Ok(ReplyBody::Cookies { browser, cookies })
+            }
+            (Some((_, actor)), Command::ClearCookies { domain }) => {
+                let removed = hub.clear_cookies(actor.clone(), domain.as_deref());
+                Ok(ReplyBody::CookiesCleared { removed: removed as u64 })
+            }
             (Some((_, actor)), Command::RunUntil { request, env, plan }) => {
                 until::start(&hub, actor, request, env, plan).map(|until_id| ReplyBody::UntilStarted { until_id })
             }
@@ -339,6 +358,32 @@ pub(crate) fn run_one(
     }
     // A local agent's request mustn't be redirected off the machine.
     let redirects = rules.as_ref().is_none_or(|r| r.access != Access::Local);
+    // A browser's ways, if the workspace takes them on: the jar's cookies,
+    // and for a page's origin, `Origin` and a preflight where a browser
+    // would send one. Added only now, so the journal keeps it as written.
+    let browser = hub.browser();
+    let mut credentials = false;
+    let mut cors_origin: Option<String> = None;
+    let resolved = resolved.and_then(|mut sending| {
+        if browser.cookies {
+            if let Some(jar) = hub.cookie_header(&sending.url) {
+                add_cookies(&mut sending, &jar);
+                credentials = true;
+            }
+        }
+        let origin = browser.origin.as_deref().filter(|o| !realtime::is_websocket(&sending) && cors::cross_origin(o, &sending.url));
+        if let Some(origin) = origin {
+            cors_origin = Some(origin.to_string());
+            if !sending.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("origin")) {
+                sending.headers.push(("Origin".into(), origin.into()));
+            }
+            if let Some((method, headers)) = cors::needs_preflight(&sending) {
+                let ask = Ask { written: request, env, origin, method: &method, headers: &headers, credentials };
+                preflight(hub, actor, &ask, &sending, &secrets)?;
+            }
+        }
+        Ok(sending)
+    });
     // Secret values that come back are replaced by their names before
     // anything is published or journalled.
     // A WebSocket, or an answer of server-sent events, stays open as a
@@ -349,6 +394,8 @@ pub(crate) fn run_one(
         .and_then(|sending| {
             if realtime::is_websocket(&sending) {
                 realtime::websocket(&link, &sending)
+            } else if browser.cookies {
+                send_keeping_cookies(hub, actor, sending, redirects, cancelled, &read_events)
             } else {
                 http::execute(&sending, redirects, cancelled, Some(&read_events))
             }
@@ -356,7 +403,10 @@ pub(crate) fn run_one(
         .map(|response| envs::redact_response(response, &secrets))
         .map_err(|error| envs::redact(&error, &secrets));
     // Checked on what clients see, secrets already taken out.
-    let results = graphql::checks(request, outcome.as_ref().map_err(String::as_str));
+    let mut results = graphql::checks(request, outcome.as_ref().map_err(String::as_str));
+    if let (Some(origin), Ok(response)) = (&cors_origin, &outcome) {
+        results.push(cors::answer_check(response, origin, credentials));
+    }
     let kind = match &outcome {
         Ok(response) => EventKind::RequestFinished { request_id, response: response.clone() },
         Err(error) => EventKind::RequestFailed { request_id, error: error.clone() },
@@ -367,6 +417,105 @@ pub(crate) fn run_one(
     } else {
         Ran::Stopped("cancelled".into())
     }
+}
+
+/// The most redirects followed one at a time, as a browser's limit is.
+const MAX_REDIRECTS: usize = 20;
+
+/// Send `sending` as a browser with cookies does: each answer's
+/// `Set-Cookie` kept, and redirects followed a hop at a time so a cookie set
+/// on the way (a login's 302) is kept and the next hop gets the jar's
+/// cookies for its own URL. A 303, or a 301 or 302 to a POST, goes on as a
+/// GET without the body. The last hop's answer and timing are the answer.
+fn send_keeping_cookies(
+    hub: &Hub,
+    actor: &Actor,
+    mut sending: HttpRequest,
+    redirects: bool,
+    cancelled: &AtomicBool,
+    read_events: http::EventsReader,
+) -> Result<HttpResponse, String> {
+    for _ in 0..=MAX_REDIRECTS {
+        let response = http::execute(&sending, false, cancelled, Some(read_events))?;
+        hub.keep_cookies(actor.clone(), &sending.url, &response.headers);
+        let location = response.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).map(|(_, v)| v.trim());
+        let next = match location {
+            Some(to) if redirects && (300..400).contains(&response.status) && response.status != 304 => {
+                join(&sending.url, to).ok_or_else(|| format!("a redirect to `{to}`, which isn't a URL"))?
+            }
+            _ => return Ok(response),
+        };
+        let method = sending.method.to_ascii_uppercase();
+        if response.status == 303 && method != "HEAD" || matches!(response.status, 301 | 302) && method == "POST" {
+            sending.method = "GET".into();
+            sending.body = None;
+            sending.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-type") && !n.eq_ignore_ascii_case("content-length"));
+        }
+        sending.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("cookie"));
+        if let Some(jar) = hub.cookie_header(&next) {
+            sending.headers.push(("Cookie".into(), jar));
+        }
+        sending.url = next;
+    }
+    Err(format!("more than {MAX_REDIRECTS} redirects"))
+}
+
+/// `to`, a redirect's `Location`, as a whole URL against `from`.
+fn join(from: &str, to: &str) -> Option<String> {
+    if to.contains("://") {
+        return Some(to.to_string());
+    }
+    let uri: ureq::http::Uri = from.parse().ok()?;
+    let base = format!("{}://{}", uri.scheme_str()?, uri.authority()?);
+    if let Some(rest) = to.strip_prefix("//") {
+        return Some(format!("{}://{rest}", uri.scheme_str()?));
+    }
+    if to.starts_with('/') {
+        return Some(format!("{base}{to}"));
+    }
+    let dir = uri.path().rsplit_once('/').map_or("", |(dir, _)| dir);
+    Some(format!("{base}{dir}/{to}"))
+}
+
+/// Add the jar's cookies to `sending`, after any it carries itself.
+fn add_cookies(sending: &mut HttpRequest, jar: &str) {
+    match sending.headers.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case("cookie")) {
+        Some((_, value)) => *value = format!("{value}; {jar}"),
+        None => sending.headers.push(("Cookie".into(), jar.into())),
+    }
+}
+
+/// What a preflight asks, for the request `written` (as written, sent with
+/// `env`) from a page at `origin`.
+struct Ask<'a> {
+    written: &'a HttpRequest,
+    env: Option<&'a str>,
+    origin: &'a str,
+    method: &'a str,
+    headers: &'a [String],
+    credentials: bool,
+}
+
+/// Send the `OPTIONS` a browser sends before `sending`, as a request of
+/// its own in history, and say why the request may not go if it may not.
+fn preflight(hub: &Hub, actor: &Actor, ask: &Ask, sending: &HttpRequest, secrets: &[(String, String)]) -> Result<(), String> {
+    let as_written = cors::preflight_of(ask.written, ask.origin, ask.method, ask.headers);
+    let (pre_id, cancelled) = hub.start_request(actor.clone(), as_written, ask.env.map(String::from), None, None, None);
+    let to_send = cors::preflight_of(sending, ask.origin, ask.method, ask.headers);
+    // A browser doesn't follow a preflight's redirect.
+    let outcome = http::execute(&to_send, false, &cancelled, None)
+        .map(|r| envs::redact_response(r, secrets))
+        .map_err(|e| envs::redact(&e, secrets));
+    let verdict = match &outcome {
+        Ok(response) => cors::preflight_allows(response, ask.origin, ask.method, ask.headers, ask.credentials),
+        Err(e) => Err(format!("no answer: {e}")),
+    };
+    let kind = match outcome {
+        Ok(response) => EventKind::RequestFinished { request_id: pre_id, response },
+        Err(error) => EventKind::RequestFailed { request_id: pre_id, error },
+    };
+    hub.end_request(actor.clone(), pre_id, kind);
+    verdict.map_err(|why| format!("blocked by CORS: preflight #{pre_id}: {why}"))
 }
 
 /// Ask a person to allow request `request_id` and wait for them. True if

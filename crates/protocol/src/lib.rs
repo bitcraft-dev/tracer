@@ -164,6 +164,18 @@ pub enum Command {
     /// The kill switch. Off, every agent is refused anything but reading,
     /// and their running requests are cancelled. Only a person may switch it.
     SetAgents { allowed: bool },
+    /// How the workspace's requests behave like a browser's, from now on.
+    /// A person's to change. Published as `browser_changed`.
+    SetBrowser { browser: Browser },
+    /// The browser behaviour and the cookies in the jar. Values are given
+    /// to a person, never to an agent.
+    Cookies,
+    /// Empty the jar, or only `domain`'s cookies (and its subdomains').
+    /// A person's to do. Published as `cookies_changed`.
+    ClearCookies {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        domain: Option<String>,
+    },
     /// Run the saved requests under folder `path` (or the one at `path`),
     /// in the order of their paths, as one flow: each step's captures fill
     /// `{{name}}` in the steps after it, over `env`'s variables. A step
@@ -428,6 +440,43 @@ impl BenchPlan {
         out.push_str(&format!(", {} at a time", self.concurrency));
         out
     }
+}
+
+/// What of a browser's behaviour the workspace's requests take on. Off by
+/// default: Tracer sends what it's given and nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Browser {
+    /// Keep `Set-Cookie` answers in the workspace's jar and send them back
+    /// as a browser would: by domain and path, `Secure` ones only over
+    /// https, until they expire.
+    #[serde(default)]
+    pub cookies: bool,
+    /// The page's origin (`https://app.example.com`) a browser would send
+    /// from. Given, a request to another origin carries it as `Origin`, a
+    /// request a browser would preflight is preceded by its `OPTIONS`
+    /// (a request of its own in history), and an answer a browser would
+    /// keep from the page fails a `CORS` check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// A cookie in the jar, as clients see it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CookieSeen {
+    pub name: String,
+    /// Given to a person; never to an agent or in an event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub domain: String,
+    pub path: String,
+    /// When it expires, in milliseconds since the epoch; none for a
+    /// session cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_ms: Option<u64>,
+    pub secure: bool,
+    pub http_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_site: Option<String>,
 }
 
 /// The most a run-until sends when its plan doesn't say.
@@ -1129,6 +1178,9 @@ pub enum ReplyBody {
     BenchStopped,
     UntilStarted { until_id: u64 },
     UntilStopped,
+    BrowserSet,
+    Cookies { browser: Browser, cookies: Vec<CookieSeen> },
+    CookiesCleared { removed: u64 },
     BaselineSaved { name: String, path: String },
     Baselines { baselines: Vec<Baseline>, skipped: Vec<String> },
     BenchCompared { comparison: BenchComparison },
@@ -1258,6 +1310,10 @@ pub enum EventKind {
     },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
+    /// The workspace's browser behaviour changed; this event's actor is who.
+    BrowserChanged { browser: Browser },
+    /// The jar changed: what's in it now, without values.
+    CookiesChanged { cookies: Vec<CookieSeen> },
     /// The policy file changed. `rules` are what agents get from now on;
     /// with an `error`, the file was not taken and they are the old rules.
     PolicyChanged {

@@ -105,6 +105,12 @@ usage:
                                       2s); a line an answer; exits 0 when the streak
                                       came, 1 when it ended without it
   tracer until stop <ID>              stop a running run-until, whoever started it
+  tracer browser [cookies on|off] [origin <URL>|none]
+                                      how requests behave like a browser's (off
+                                      unless set): keep cookies and send them back;
+                                      as a page at URL, send Origin, preflight what
+                                      a browser would, and check the answer's CORS
+  tracer cookies [clear [DOMAIN]]     the cookie jar, or empty it (a domain's part)
   tracer schema <URL|PATH> [-H 'Name: value']... [--env <NAME>]
                                       a GraphQL server's schema as SDL, asked by
                                       introspection (a request in history);
@@ -160,6 +166,8 @@ fn main() -> ExitCode {
         Some("run") => run(workspace, args[1..].to_vec()),
         Some("bench") => bench(workspace, args[1..].to_vec()),
         Some("until") => until(workspace, args[1..].to_vec()),
+        Some("browser") => browser(workspace, args[1..].to_vec()),
+        Some("cookies") => cookies(workspace, args[1..].to_vec()),
         Some("schema") => schema(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
@@ -849,6 +857,90 @@ fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
+fn browser(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+    let Ok(ReplyBody::Cookies { mut browser, .. }) = client.call(Command::Cookies)? else {
+        return Err(io::Error::other("unexpected answer"));
+    };
+    if !args.is_empty() {
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            match (word.as_str(), words.next().map(String::as_str)) {
+                ("cookies", Some("on")) => browser.cookies = true,
+                ("cookies", Some("off")) => browser.cookies = false,
+                ("origin", Some("none")) => browser.origin = None,
+                ("origin", Some(url)) => browser.origin = Some(url.to_string()),
+                _ => return Err(io::Error::other(USAGE)),
+            }
+        }
+        client.call(Command::SetBrowser { browser })?.map_err(io::Error::other)?;
+        let Ok(ReplyBody::Cookies { browser: now, .. }) = client.call(Command::Cookies)? else {
+            return Err(io::Error::other("unexpected answer"));
+        };
+        browser = now;
+    }
+    println!("cookies  {}", if browser.cookies { "kept and sent back" } else { "off" });
+    match &browser.origin {
+        Some(origin) => println!("origin   {origin}: Origin sent, preflights as a browser's, answers checked for CORS"),
+        None => println!("origin   none: no CORS"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cookies(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
+    if args.first().map(String::as_str) == Some("clear") {
+        let domain = args.get(1).cloned();
+        let Ok(ReplyBody::CookiesCleared { removed }) = client.call(Command::ClearCookies { domain })?.map_err(io::Error::other) else {
+            return Err(io::Error::other("unexpected answer"));
+        };
+        eprintln!("removed {removed} cookie{}", if removed == 1 { "" } else { "s" });
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !args.is_empty() {
+        return Err(io::Error::other(USAGE));
+    }
+    let Ok(ReplyBody::Cookies { browser, cookies }) = client.call(Command::Cookies)? else {
+        return Err(io::Error::other("unexpected answer"));
+    };
+    if !browser.cookies {
+        eprintln!("cookies are off; `tracer browser cookies on` keeps them");
+    }
+    for c in &cookies {
+        let mut flags = Vec::new();
+        if c.secure {
+            flags.push("Secure".to_string());
+        }
+        if c.http_only {
+            flags.push("HttpOnly".to_string());
+        }
+        if let Some(s) = &c.same_site {
+            flags.push(format!("SameSite={s}"));
+        }
+        let ends = match c.expires_ms {
+            Some(ms) => format!("ends in {}", short_span(ms.saturating_sub(now_ms()))),
+            None => "session".into(),
+        };
+        println!("{}{}  {}={}  {ends}  {}", c.domain, c.path, c.name, c.value.as_deref().unwrap_or("…"), flags.join(" "));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `45 s`, `12 min`, `3 h`, `2 d`.
+fn short_span(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=89 => format!("{s} s"),
+        90..=5399 => format!("{} min", s / 60),
+        5400..=172_799 => format!("{} h", s / 3600),
+        _ => format!("{} d", s / 86_400),
+    }
+}
+
 fn until(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     if args.first().map(String::as_str) == Some("stop") {
         let id = bench_id(args.get(1))?;
@@ -1487,6 +1579,14 @@ fn describe(event: &Event) -> String {
             format!("run-until {until_id} ended after {sent} sent: {}", stopped.as_deref().unwrap_or(""))
         }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
+        EventKind::BrowserChanged { browser } => format!(
+            "browser behaviour: cookies {}, origin {}",
+            if browser.cookies { "on" } else { "off" },
+            browser.origin.as_deref().unwrap_or("none")
+        ),
+        EventKind::CookiesChanged { cookies } => {
+            format!("cookie jar: {} cookie{}", cookies.len(), if cookies.len() == 1 { "" } else { "s" })
+        }
         EventKind::PolicyChanged { rules, error: Some(error) } => {
             format!("agents.policy not taken, {} rules stand: {error}", rules.len())
         }

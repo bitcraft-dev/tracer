@@ -18,8 +18,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracer_protocol::{
     Actor, AgentRules, BenchPlan, BenchStats, CheckResult, ClientKind, Command, Ended, Environment, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest,
     HttpResponse, SavedRequest, ServerMessage, StreamItem, StreamKind, StreamMessage, UntilPlan, HISTORY_LIMIT, JOURNAL_PATH,
-    POLICY_PATH,
+    POLICY_PATH, Browser, CookieSeen,
 };
+
+use crate::cookies::Jar;
+
+/// The workspace's browser behaviour and its cookie jar, beside the journal.
+const BROWSER_PATH: &str = ".tracer/browser.json";
+const COOKIES_PATH: &str = ".tracer/cookies.json";
 
 use crate::policy::Policy;
 use crate::baselines::{self, Side};
@@ -77,6 +83,9 @@ struct Inner {
     /// fills them as the flow did. Kept in memory only: a capture is often a
     /// token, and resolved values stay out of the journal.
     step_vars: HashMap<u64, Vec<(String, String)>>,
+    /// How requests behave like a browser's, and the cookies kept for it.
+    browser: Browser,
+    jar: Jar,
 }
 
 /// A request in flight: the flag its worker checks to stop early, and what
@@ -271,6 +280,8 @@ impl Hub {
                 starts: HashMap::new(),
                 disk: Disk::read(workspace),
                 step_vars: HashMap::new(),
+                browser: read_json(&workspace.join(BROWSER_PATH)),
+                jar: read_json(&workspace.join(COOKIES_PATH)),
             }),
             workspace: workspace.display().to_string(),
             root: workspace.to_path_buf(),
@@ -512,6 +523,63 @@ impl Hub {
 
     /// Request `request_id` as it was written, and the environment it was
     /// sent with.
+    /// How the workspace's requests behave like a browser's.
+    pub fn browser(&self) -> Browser {
+        self.inner.lock().unwrap().browser.clone()
+    }
+
+    /// Change the browser behaviour on `actor`'s word, keep it, and tell
+    /// every client.
+    pub fn set_browser(&self, actor: Actor, browser: Browser) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        write_json(&self.root.join(BROWSER_PATH), &browser)?;
+        inner.browser = browser.clone();
+        publish_locked(&mut inner, actor, EventKind::BrowserChanged { browser });
+        Ok(())
+    }
+
+    /// The `Cookie` header the jar gives `url`, if any.
+    pub fn cookie_header(&self, url: &str) -> Option<String> {
+        self.inner.lock().unwrap().jar.header_for(url, now_ms())
+    }
+
+    /// Keep the `Set-Cookie` headers of an answer from `url`, in `actor`'s
+    /// name if that changes the jar.
+    pub fn keep_cookies(&self, actor: Actor, url: &str, headers: &[(String, String)]) {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.jar.clone();
+        let now = now_ms();
+        for (_, value) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie")) {
+            inner.jar.store(url, value, now);
+        }
+        if inner.jar != before {
+            self.jar_changed(&mut inner, actor);
+        }
+    }
+
+    /// The browser behaviour and the jar, with values if `values`.
+    pub fn cookies(&self, values: bool) -> (Browser, Vec<CookieSeen>) {
+        let inner = self.inner.lock().unwrap();
+        (inner.browser.clone(), inner.jar.seen(now_ms(), values))
+    }
+
+    /// Empty the jar, or `domain`'s part of it. Gives how many went.
+    pub fn clear_cookies(&self, actor: Actor, domain: Option<&str>) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let removed = inner.jar.clear(domain);
+        if removed > 0 {
+            self.jar_changed(&mut inner, actor);
+        }
+        removed
+    }
+
+    fn jar_changed(&self, inner: &mut Inner, actor: Actor) {
+        // A jar that can't be written still serves this core's life.
+        let _ = write_json(&self.root.join(COOKIES_PATH), &inner.jar);
+        let cookies = inner.jar.seen(now_ms(), false);
+        publish_locked(inner, actor, EventKind::CookiesChanged { cookies });
+    }
+
     /// Keep `vars`, the captures request `request_id` is sent with, for
     /// sending it again. Nothing is kept for none.
     pub fn remember_vars(&self, request_id: u64, vars: &[(String, String)]) {
@@ -1100,6 +1168,16 @@ fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {
         .retain(|(_, out)| out.send(ServerMessage::Event(event.clone())).is_ok());
     inner.events.push(event);
     seq
+}
+
+/// A JSON file's value, or the default when it's missing or unreadable.
+fn read_json<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> T {
+    fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 fn now_ms() -> u64 {

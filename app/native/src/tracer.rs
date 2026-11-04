@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
     BenchPlan, BenchStats, ClientKind, Command, Direction, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest,
-    StepOutcome, StreamKind, UntilPlan, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
+    StepOutcome, StreamKind, UntilPlan, Browser, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
 };
 
 /// The most of a response body an event hands the page. The core and its
@@ -596,6 +596,90 @@ pub fn run_until(
     }
 }
 
+/// A cookie in the jar, as the page shows it.
+#[rux::export]
+#[derive(Clone)]
+pub struct CookieRow {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    /// When it expires, in milliseconds since the epoch; 0 for a session cookie.
+    pub expires_ms: u64,
+    /// `Secure HttpOnly SameSite=Lax`, those it has.
+    pub flags: String,
+}
+
+/// How the workspace's requests behave like a browser's, and the jar.
+#[rux::export]
+#[derive(Clone)]
+pub struct BrowserState {
+    pub cookies: bool,
+    /// The page's origin, or "".
+    pub origin: String,
+    pub jar: Vec<CookieRow>,
+}
+
+/// The browser behaviour and the cookies in the jar, values too.
+#[rux::export]
+pub fn browser_state() -> Result<BrowserState, CoreError> {
+    match shared()?.call(Command::Cookies) {
+        Ok(Ok(ReplyBody::Cookies { browser, cookies })) => Ok(BrowserState {
+            cookies: browser.cookies,
+            origin: browser.origin.unwrap_or_default(),
+            jar: cookies
+                .into_iter()
+                .map(|c| {
+                    let mut flags = Vec::new();
+                    if c.secure {
+                        flags.push("Secure".to_string());
+                    }
+                    if c.http_only {
+                        flags.push("HttpOnly".to_string());
+                    }
+                    if let Some(s) = c.same_site {
+                        flags.push(format!("SameSite={s}"));
+                    }
+                    CookieRow {
+                        name: c.name,
+                        value: c.value.unwrap_or_default(),
+                        domain: c.domain,
+                        path: c.path,
+                        expires_ms: c.expires_ms.unwrap_or(0),
+                        flags: flags.join(" "),
+                    }
+                })
+                .collect(),
+        }),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Keep cookies or not, and send as a page at `origin` ("" for none).
+#[rux::export]
+pub fn set_browser(cookies: bool, origin: String) -> Result<(), CoreError> {
+    let origin = (!origin.trim().is_empty()).then(|| origin.trim().to_string());
+    match shared()?.call(Command::SetBrowser { browser: Browser { cookies, origin } }) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Empty the jar, or only `domain`'s cookies ("" for all).
+#[rux::export]
+pub fn clear_cookies(domain: String) -> Result<u64, CoreError> {
+    let domain = (!domain.trim().is_empty()).then(|| domain.trim().to_string());
+    match shared()?.call(Command::ClearCookies { domain }) {
+        Ok(Ok(ReplyBody::CookiesCleared { removed })) => Ok(removed),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// Stop run-until `until_id`, whoever started it.
 #[rux::export]
 pub fn stop_until(until_id: u64) -> Result<(), CoreError> {
@@ -1091,6 +1175,10 @@ fn to_page(event: Event) -> CoreEvent {
             (out.kind, out.until, out.allow) = ("until_finished".into(), until_id, reached);
             (out.sent, out.n, out.reason) = (sent, streak as u64, stopped.unwrap_or_default());
         }
+        EventKind::BrowserChanged { browser } => {
+            (out.kind, out.allow, out.url) = ("browser_changed".into(), browser.cookies, browser.origin.unwrap_or_default());
+        }
+        EventKind::CookiesChanged { cookies } => (out.kind, out.n) = ("cookies_changed".into(), cookies.len() as u64),
         EventKind::BaselineSaved { name, bench_id } => {
             (out.kind, out.path, out.bench) = ("baseline_saved".into(), name, bench_id);
         }
