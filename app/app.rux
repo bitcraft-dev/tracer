@@ -1637,6 +1637,12 @@
   // Every bench seen, for showing an older one again.
   type BenchSeen = { id: int, method: string, url: string, env: string, by: string, plan: string, total: int, durMs: float };
   let benches: BenchSeen[] = signal([]);
+  // Every bench's latest report and how it ended, and each report's count
+  // and time, so one picked later shows its numbers and its line again.
+  type BenchLast = { id: int, s: BenchNow, ended: bool, reason: string };
+  let benchLast: BenchLast[] = signal([]);
+  type Mark = { id: int, done: int, ms: float };
+  let marks: Mark[] = signal([]);
   // The latest bench, for the status bar.
   let lastBench = signal("");
   let benchOk = signal(true);
@@ -1853,8 +1859,10 @@
         lastBench = `bench ${e.bench} running`;
         benchOk = true;
       } else if e.kind == "bench_progress" {
+        noteBench(e.bench, e.stats, false, "");
         if e.bench == benchId { tick(e.stats); }
       } else if e.kind == "bench_finished" {
+        noteBench(e.bench, e.stats, true, e.reason);
         if e.bench == benchId {
           tick(e.stats);
           benchRunning = false;
@@ -2605,8 +2613,7 @@
     }
   }
 
-  // Put bench `id` on show. Its numbers so far come with its next report;
-  // one that has ended keeps the last it had when it was on show.
+  // Put bench `id` on show, with what its reports so far said.
   fn pickBench(id: int) {
     let b = benches.find(x => x.id == id);
     if b == none || id == benchId { return; }
@@ -2623,19 +2630,38 @@
     rps = [];
     prevDone = 0;
     prevMs = 0.0;
+    for m in marks {
+      if m.id == id { rate(m.done, m.ms); }
+    }
+    let last = benchLast.find(x => x.id == id);
+    if last != none {
+      bn = last.s;
+      benchRunning = !last.ended;
+      benchStopped = last.reason;
+    }
+  }
+
+  fn noteBench(id: int, s: BenchNow, ended: bool, reason: string) {
+    benchLast = benchLast.filter(x => x.id != id) + [{ id: id, s: s, ended: ended, reason: reason }];
+    marks.push({ id: id, done: s.done, ms: s.elapsedMs });
+    if marks.length > 4000 { marks = marks.slice(marks.length - 4000); }
   }
 
   // A report on the bench on show: its numbers, and requests a second since
   // the one before.
   fn tick(s: BenchNow) {
-    let dt = s.elapsedMs - prevMs;
-    if dt >= 100.0 {
-      rps.push((s.done - prevDone) * 1000.0 / dt);
-      if rps.length > 120 { rps = rps.slice(rps.length - 120); }
-      prevDone = s.done;
-      prevMs = s.elapsedMs;
-    }
+    rate(s.done, s.elapsedMs);
     bn = s;
+  }
+
+  fn rate(done: int, ms: float) {
+    let dt = ms - prevMs;
+    if dt >= 100.0 {
+      rps.push((done - prevDone) * 1000.0 / dt);
+      if rps.length > 120 { rps = rps.slice(rps.length - 120); }
+      prevDone = done;
+      prevMs = ms;
+    }
   }
 
   fn benchState(): string {
