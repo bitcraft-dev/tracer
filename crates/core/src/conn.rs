@@ -96,7 +96,7 @@ pub fn serve(
                 continue;
             }
             (Some((_, actor)), Command::Send { request, env }) => {
-                send(&hub, actor, request, env, None, |request_id| {
+                send(&hub, actor, request, env, None, Vec::new(), |request_id| {
                     let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
                 });
                 continue;
@@ -108,7 +108,9 @@ pub fn serve(
                         Some(name) => Some(name),
                         None => was,
                     };
-                    send(&hub, actor, request, env, Some(request_id), |request_id| {
+                    // A flow's step is sent with the captures it had then.
+                    let vars = hub.vars_of(request_id);
+                    send(&hub, actor, request, env, Some(request_id), vars, |request_id| {
                         let _ = out.send(reply(id, Ok(ReplyBody::Accepted { request_id })));
                     });
                     continue;
@@ -250,21 +252,25 @@ pub fn serve(
 }
 
 /// Publish that `request` started, have `accepted` answer the sender with
-/// its id, then send it on a thread of its own and publish how it ended.
+/// its id, then send it on a thread of its own, with `vars` over its
+/// environment, and publish how it ended.
 fn send(
     hub: &Arc<Hub>,
     actor: &Actor,
     request: HttpRequest,
     env: Option<String>,
     rerun_of: Option<u64>,
+    vars: Vec<(String, String)>,
     accepted: impl FnOnce(u64),
 ) {
     let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), rerun_of, None, None);
+    // Kept for this one too, so sending it again works the same.
+    hub.remember_vars(request_id, &vars);
     // Before the thread starts, so the sender hears its id before the end.
     accepted(request_id);
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
-        run_one(&hub, &actor, request_id, &cancelled, &request, env.as_deref(), &[], None);
+        run_one(&hub, &actor, request_id, &cancelled, &request, env.as_deref(), &vars, None);
     });
 }
 

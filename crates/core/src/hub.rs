@@ -68,6 +68,11 @@ struct Inner {
     /// changed behind it. Its own saves and deletes update this under the
     /// same lock, so they aren't echoed back as disk changes.
     disk: Disk,
+    /// The variables a flow's step was sent with beyond its environment (the
+    /// captures of the steps before it), by request id, so sending it again
+    /// fills them as the flow did. Kept in memory only: a capture is often a
+    /// token, and resolved values stay out of the journal.
+    step_vars: HashMap<u64, Vec<(String, String)>>,
 }
 
 /// A request in flight: the flag its worker checks to stop early, and what
@@ -227,6 +232,7 @@ impl Hub {
                 policy_text,
                 starts: HashMap::new(),
                 disk: Disk::read(workspace),
+                step_vars: HashMap::new(),
             }),
             workspace: workspace.display().to_string(),
             root: workspace.to_path_buf(),
@@ -423,6 +429,20 @@ impl Hub {
 
     /// Request `request_id` as it was written, and the environment it was
     /// sent with.
+    /// Keep `vars`, the captures request `request_id` is sent with, for
+    /// sending it again. Nothing is kept for none.
+    pub fn remember_vars(&self, request_id: u64, vars: &[(String, String)]) {
+        if !vars.is_empty() {
+            self.inner.lock().unwrap().step_vars.insert(request_id, vars.to_vec());
+        }
+    }
+
+    /// The captures request `request_id` was sent with, if it was a flow's
+    /// step (or sent again from one) since the core started.
+    pub fn vars_of(&self, request_id: u64) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().step_vars.get(&request_id).cloned().unwrap_or_default()
+    }
+
     pub fn written(&self, request_id: u64) -> Option<(HttpRequest, Option<String>)> {
         let inner = self.inner.lock().unwrap();
         inner.events.iter().find_map(|e| match &e.kind {

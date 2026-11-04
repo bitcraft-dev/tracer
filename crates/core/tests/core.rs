@@ -645,6 +645,45 @@ fn a_rerun_sends_the_request_as_written_with_its_environment_unless_told_otherwi
 }
 
 #[test]
+fn a_flow_step_sent_again_is_filled_with_the_captures_it_had() {
+    let ws = workspace("flow-rerun");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
+    let step = |url: String, capture: Vec<String>| HttpRequest { method: "GET".into(), url, capture, ..Default::default() };
+    let first = step(format!("{base}/first"), vec!["p = $.path".into()]);
+    cli.call(Command::SaveRequest { path: "f/1 first".into(), request: first }).unwrap().unwrap();
+    cli.call(Command::SaveRequest { path: "f/2 second".into(), request: step(format!("{base}/x{{{{p}}}}"), vec![]) }).unwrap().unwrap();
+
+    cli.call(Command::RunFlow { path: "f".into(), env: None, keep_going: false }).unwrap().unwrap();
+    let steps = wait_for(&mut window, |e| match &e.kind {
+        EventKind::FlowFinished { passed: true, steps, .. } => Some(steps.clone()),
+        EventKind::FlowFinished { steps, .. } => panic!("the flow failed: {steps:?}"),
+        _ => None,
+    });
+    let second = steps[1].request_id.unwrap();
+
+    // Sent again, the step has `p` as the flow had it; and so does a
+    // request sent again from that one.
+    let Ok(ReplyBody::Accepted { request_id: again }) = window.call(Command::Rerun { request_id: second, env: None }).unwrap() else { panic!() };
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, again) else { panic!() };
+    assert_eq!(response.body, r#"{"path":"/x/first","got":0}"#);
+    let Ok(ReplyBody::Accepted { request_id: twice }) = window.call(Command::Rerun { request_id: again, env: None }).unwrap() else { panic!() };
+    let EventKind::RequestFinished { response, .. } = end_of(&mut window, twice) else { panic!() };
+    assert_eq!(response.body, r#"{"path":"/x/first","got":0}"#);
+
+    // The captured value stays out of what the journal says was sent: the
+    // URL as written. (The stub's answers echo it, as answers may.)
+    let journal = std::fs::read_to_string(ws.join(tracer_protocol::JOURNAL_PATH)).unwrap();
+    let sent: Vec<&str> = journal.lines().filter(|l| l.contains("request_started")).collect();
+    assert_eq!(sent.len(), 4);
+    assert!(sent.iter().all(|l| !l.contains("/x/first")), "a capture's value reached the journal");
+    core.stop();
+}
+
+#[test]
 fn history_gives_the_newest_first_filtered_and_survives_a_restart() {
     use tracer_protocol::{Ended, HistoryFilter, StatusClass};
     let ws = workspace("history");
