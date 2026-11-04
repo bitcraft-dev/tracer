@@ -5,6 +5,20 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
+## Where it stands (2026-11-04, evening)
+
+`phase-1-core` pushed (59f0cd2), then the response viewer merged
+(a922dfd, not pushed): **Phase 4 is done.** Driving it found **AW-041**
+(a release build fails: a closure capturing a parameter of a handler
+that calls an `async fn`; the viewer's `toggleFold` is one), and an open
+question on Show more's cost (Next, item 1). The user says **AW-036 is
+fixed too**: not yet re-driven. The user asked for three features
+(Next, item 5).
+
+Left running by this session: none at the end (check
+`Get-Process tracer,rux,python`); the scratch workspace and test bodies
+are in the session's scratchpad.
+
 ## Where it stands (2026-11-04)
 
 The user installed a new `rux` (built 2026-11-04 00:17 from the Rux
@@ -509,11 +523,39 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   limited "first after 50 requests"; the window's compare and save; an MCP
   agent's list and compare.
 
+- **Phase 4: the response viewer, merged and driven** (a922dfd,
+  2026-11-04). The body pane was merged by hand (the template had been
+  reindented). Driven on a local server (`python -m http.server 18765`
+  over generated bodies): `small.json` numbered, coloured, folds give
+  `[ … ],  2 items` / `{ … }  7 keys` with line numbers skipping, inner
+  folds kept while the root folds and unfolds; a 3,000-record body
+  (58,505 lines, 686 KB) shows "1000 of 58505 lines · Show 1000 more";
+  an HTML page as its own lines. Scrolling 1,000 lines: 30 wheel steps,
+  0.45 s CPU, no stall over 17 ms. **Show more grows with what is shown**
+  (release build: 1.5, 2.3, 3.4, 4.5 s of CPU for 2k, 3k, 4k, 5k lines;
+  about 110 MB per 1,000 lines); see Next, item 1.
+
 ### Next
 
-1. AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
-   nested body of about 40k lines, an HTML page; folding, Show more,
-   scroll cost in a release build), then merge `phase-4-response-tools`.
+1. **Why Show more costs more each time** (not settled, 2026-11-04).
+   Each click re-sends every shown line from `view.bodyView` and replaces
+   `bodyLines`. Measured so far: the cost is the same in debug and
+   release, and the same in probe 2 (`probes/pages/json-probe.rux`, now
+   with 5k buttons) whether the 5,000 lines come from script, a sync
+   export or an async one (2 to 4 s each). A bare page in `rux.exe`
+   (scratchpad `rows/`) creates 5,000 rows in about 1.6 s of CPU, but
+   replacing them with an equal list costs nothing (no frame) and
+   appending 1,000 costs 0.3 to 0.5 s; probe 2's equal replace instead
+   re-runs every row's bindings (25,000 calls) and costs 1.9 s.
+   `RUX_PROFILE=each`: the frame that adds 5,000 rows is ~1.15 s (patch
+   0.36 to 0.54 s, layout 0.54 to 0.78 s), and the next two or three
+   frames each lay the whole list out again (210 to 240 ms) with nothing
+   patched. In Tracer, frames account for only ~0.65 s of a 4.9 s click.
+   `content-visibility: auto` on the rows changed nothing (tried,
+   removed). To do: find what makes probe 2's equal replace re-run its
+   rows (`:class="l.kind"`? the `note` write?), and where Tracer's other
+   ~4 s go outside frames; then write the finding(s). Also seen: in
+   `rows/`, a row whose fold text is "" is ~3 px taller than one with ▾.
 2. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
    WebSocket); a `tracer` command to send on someone else's open
    WebSocket (MCP and the window can); saving a WebSocket's messages as a
@@ -528,10 +570,28 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    Flows follow-up, untried: a flow step keeps its URL as written
    (`/users/{{uid}}`), so Re-run of one step likely has no `uid` to fill.
    Decide whether a step's re-run gets the flow's captures.
-3. When AW-036 is fixed: re-drive Tracer's history with a long URL in a
-   narrow sidebar.
+3. AW-036 is fixed (the user, 2026-11-04): re-drive its reproduction
+   and Tracer's history with a long URL in a narrow sidebar.
 4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
    wants it.
+5. New features the user asked for (2026-11-04), none started; checked
+   against the core, none of it exists:
+   - **Repeat until failures:** send a request again and again, one after
+     the other, each only after the last succeeded, stopping at the nth
+     failure (a failure being a failed send, or a response that fails its
+     checks or status). Today a bench never stops on failures (it counts
+     them), and a flow stops at the first failed step or, with
+     `--keep-going`, never. CLI, MCP and the window, like bench.
+   - **Browser behaviour, opt in:** a CORS preflight (`OPTIONS` with
+     `Access-Control-Request-Method`/`-Headers` and an `Origin`) before a
+     request a browser would preflight, its answer checked as a browser
+     would and shown beside the request. Tracer sends nothing it wasn't
+     asked to, so nothing preflights today.
+   - **Cookies:** a cookie jar per workspace (and environment) that keeps
+     `Set-Cookie` answers and attaches them to later requests as a browser
+     does: domain, path, expiry, and `Secure` cookies only over https;
+     viewable and clearable (the plan's Cookies tab). Nothing keeps
+     cookies today.
 3. Small: the Collections `+` doesn't sit at the right edge; the title row's
    notice is cut short; the preview cuts long URLs; the
    remembered sidebar width

@@ -10,6 +10,9 @@
       <view class="btn" @tap="loadLines(100)"><text class="btn-label">1k lines</text></view>
       <view class="btn alt" @tap="loadNow(100)"><text class="btn-label">1k · sync Rust</text></view>
       <view class="btn alt" @tap="loadScript(100)"><text class="btn-label">1k · script</text></view>
+      <view class="btn" @tap="loadLines(500)"><text class="btn-label">5k lines</text></view>
+      <view class="btn alt" @tap="loadNow(500)"><text class="btn-label">5k · sync Rust</text></view>
+      <view class="btn alt" @tap="loadScript(500)"><text class="btn-label">5k · script</text></view>
       <view class="btn ghost" @tap="clear()"><text class="btn-label">clear</text></view>
       <text class="note">{{ note }}</text>
     </view>

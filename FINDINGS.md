@@ -1182,6 +1182,57 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   the text `${x}`, and a backslash ending a line joins the next one on
   (`one \` + `two` is `one two`). Tracer's joins are template strings again.
 
+## AW-041 A release build fails when a handler that calls an `async fn` passes a closure capturing one of its parameters
+
+- **Found:** 2026-11-04, building Tracer's window with `rux build
+  --release` to measure the response viewer.
+- **Severity:** bug, blocking: the app can't be built for release at all,
+  and only the release build finds it. `rux check` finds no problems, and
+  `rux run` (the interpreter) runs the same code correctly.
+- **Limit:** in a function that calls an `async fn`, the AOT compiler keeps
+  the parameters in the frame (`cx.get(0)`) instead of Rust locals. A
+  closure passed as an argument that captures one of them is generated as
+  `vec![t!(cx.closure(1, 0, vec![cx.get(0)]), …)]`, which borrows `cx`
+  mutably twice, and rustc stops with `error[E0499]: cannot borrow *cx
+  as mutable more than once at a time`; `rux` then says "the generated
+  crate did not build". With a plain `fn` instead of `async fn`, the
+  parameter is a local (`l0`), the closure gets `l0.clone()`, and it builds.
+  The `if` around the `filter` doesn't matter.
+- **Reproduction:** (installed `rux` of 2026-11-04 00:17, no native crate;
+  `rux build --release`)
+  ```html
+  <view><text @tap="drop(1)">{{ xs.length }} {{ note }}</text></view>
+
+  <script>
+    let xs: int[] = signal([1, 2]);
+    let note = signal("");
+
+    async fn load() {
+      note = `${xs.length}`;
+    }
+
+    fn drop(n: int) {
+      xs = xs.filter(x => x != n);
+      load();
+    }
+  </script>
+  ```
+  Fails with E0499 in `src/rux_aot.rs`, in the `_ =>` arm (a receiver
+  that isn't an array) of the generated `drop`. Without `async` on `load`
+  it builds. In Tracer it is the viewer's `toggleFold`, which filters the
+  folded line numbers by its `no` and then calls `loadView()`.
+- **Workaround:** none taken in Tracer. To measure the viewer, its release
+  build was made once from a working tree whose `toggleFold` didn't
+  capture `no`, then restored.
+- **Suggested fix:** in the generated code, read captured frame slots into
+  locals before the call that builds the closure (`let __c = cx.get(0);
+  cx.closure(…, vec![__c])`), as the array arm already does with
+  `__c1_0`; and a release-build test of a closure capturing a parameter in
+  an async-calling function.
+- **Status:** open. The Rux checkout (7a2be84) had uncommitted changes in
+  rux-layout, rux-runtime and rux-script when the installed `rux` was
+  built.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,
