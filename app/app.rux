@@ -1486,7 +1486,10 @@
   let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WEBSOCKET"];
   let method = signal("GET");
   let url = signal("https://jsonplaceholder.typicode.com/todos/1");
-    let body = signal("");
+  let body = signal("");
+  // The body the other side of the Realtime switch had: a WebSocket's
+  // messages are not a request body, so each mode keeps its own.
+  let otherBody = signal("");
   let headerText = signal("Accept: application/json");
   // Expectations, one a line; saved as `# @expect` lines.
   let checksText = signal("");
@@ -1993,6 +1996,7 @@
   fn toGraphql() {
     mode = "rest";
     if gql { return; }
+    if wsMode { leaveRealtime(); }
     method = "GRAPHQL";
     splitGql(body);
     reqTab = "query";
@@ -2001,6 +2005,7 @@
   fn toRest() {
     mode = "rest";
     if wsMode {
+      leaveRealtime();
       method = "GET";
       return;
     }
@@ -2048,10 +2053,26 @@
     if wsMode { return; }
     method = "WEBSOCKET";
     reqTab = "body";
+    let messages = otherBody;
+    otherBody = body;
+    body = messages;
     if url.startsWith("https://") {
       url = "wss://" + url.slice(8);
     } else if url.startsWith("http://") {
       url = "ws://" + url.slice(7);
+    }
+  }
+
+  // Out of Realtime: the messages are put aside, the request body the
+  // editor had comes back, and the URL is http(s) again.
+  fn leaveRealtime() {
+    let requestBody = otherBody;
+    otherBody = body;
+    body = requestBody;
+    if url.startsWith("wss://") {
+      url = "https://" + url.slice(6);
+    } else if url.startsWith("ws://") {
+      url = "http://" + url.slice(5);
     }
   }
 
@@ -2156,6 +2177,7 @@
     method = s.method;
     url = s.url;
     body = s.body;
+    otherBody = "";
     headerText = headerLines(s.headers);
     checksText = s.checks;
     afterLoad();
@@ -2301,6 +2323,7 @@
     method = "GET";
     url = "";
     body = "";
+    otherBody = "";
     headerText = "";
     checksText = "";
     notice = "";
@@ -2718,6 +2741,7 @@
     method = r.method;
     url = r.url;
     body = r.reqBody;
+    otherBody = "";
     headerText = headerLines(r.reqHeaders);
     checksText = r.reqChecks;
     afterLoad();
