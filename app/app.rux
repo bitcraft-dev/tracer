@@ -377,6 +377,45 @@
                              <text class="mono" :class="{ err: cmpRegressed }">{{ cmpVerdict }}</text>
                         </view>
                         </view>
+                        <view class="until-h">
+                            <text class="side-title">Until n in a row</text>
+                        </view>
+                        <view class="bench-form">
+                        <view class="bf"><text class="bf-l">In a row</text><view class="bf-in"><input r-model="uStreak" placeholder="3" /></view></view>
+                        <view class="bf wide"><text class="bf-l">Counting</text><view class="bf-in"><input r-model="uMatch" placeholder="failures, or status == 401" /></view></view>
+                        <view class="bf"><text class="bf-l">At most</text><view class="bf-in"><input r-model="uMax" placeholder="1000" /></view></view>
+                        <view class="bf"><text class="bf-l">Apart, ms</text><view class="bf-in"><input r-model="uGap" placeholder="0" /></view></view>
+                        <view class="send" r-if="!untilRunning" :class="{ off: !connected }" @tap="runUntil()">
+                            <text class="send-label">Run until</text>
+                        </view>
+                        <view class="send stop" r-if="untilRunning" @tap="stopUntil()">
+                            <text class="send-label">Stop</text>
+                        </view>
+                        </view>
+                        <text class="empty" r-if="untilId == 0">Sends the request above again and again, one at a time, until In a row answers in a row count: failures, or with Counting, answers that pass it (status == 401, status 5xx, $.error == locked). Any other answer starts the count again. Every send goes to History.</text>
+                        <view class="bench-in" r-if="untilId != 0">
+                        <view class="res-h">
+                            <text class="res-id">until {{ untilId }}</text>
+                            <text class="m" :style="`color: ${methodColor(untilMethod)}`">{{ untilMethod }}</text>
+                            <text class="res-url">{{ untilUrl }}</text>
+                        </view>
+                        <view class="chips">
+                            <text class="chip" :style="`color: ${untilColor()}`">{{ untilState() }}</text>
+                            <text class="chip">{{ untilPlan }}</text>
+                            <text class="chip" r-if="untilEnv != &quot;&quot;">env {{ untilEnv }}</text>
+                            <text class="chip">by {{ untilBy }}</text>
+                        </view>
+                        <view class="tiles">
+                            <view class="tile"><text class="tile-v">{{ untilSent }}</text><text class="tile-l">sent</text></view>
+                            <view class="tile"><text class="tile-v" :class="{ bad: untilStreak > 0 }">{{ untilStreak }}</text><text class="tile-l">in a row</text></view>
+                        </view>
+                        <view class="u-row" r-for="a in untilAnswers" r-key="a.id" @tap="openAnswer(a.id)">
+                            <text class="u-id">#{{ a.id }}</text>
+                            <text class="u-mark" :class="{ on: a.counted }">{{ if a.counted { "●" } else { "·" } }}</text>
+                            <text class="u-end">{{ answerText(a.id) }}</text>
+                            <text class="u-streak">{{ a.streak }} in a row</text>
+                        </view>
+                        </view>
                     </view>
                 </view>
             </view>
@@ -1372,7 +1411,26 @@
   .msg-t.bin { color: #8a8a8a; }
   /* In a scrolling column, parts keep their height and the column scrolls,
      rather than each shrinking to fit as flex items do. */
-  .bench-form, .bench-in, .bench > .empty, .gtype, .schema-h { flex-shrink: 0; }
+  .bench-form, .bench-in, .bench > .empty, .until-h, .gtype, .schema-h { flex-shrink: 0; }
+
+  .until-h { padding-top: 14px; border-top: 1px solid #262626; }
+  .bf.wide { width: 240px; }
+
+  .u-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .u-row:hover { background: #232323; }
+  .u-id { width: 56px; color: #7a7a7a; font-size: 12px; font-family: monospace; }
+  .u-mark { width: 12px; color: #6a6a6a; font-size: 12px; }
+  .u-mark.on { color: #f0716c; }
+  .u-end { flex: 1; min-width: 0; color: #d4d4d4; font-size: 12px; font-family: monospace; }
+  .u-streak { color: #7a7a7a; font-size: 12px; font-family: monospace; }
   .cmp-bar { display: flex; gap: 10px; align-items: center; padding-top: 6px; }
   .cmp-pick { width: 200px; }
   .cmp { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; background: #1a1a1a; border: 1px solid #262626; border-radius: 6px; }
@@ -1631,6 +1689,25 @@
   let cmpNote = signal("");
   let benchRunning = signal(false);
   let benchStopped = signal("");
+  // The next run-until's plan, as typed, and the run on show (the latest
+  // started): what it sends, how it stands, and its answers, newest first.
+  let uStreak = signal("3");
+  let uMatch = signal("");
+  let uMax = signal("");
+  let uGap = signal("");
+  let untilId = signal(0);
+  let untilMethod = signal("");
+  let untilUrl = signal("");
+  let untilEnv = signal("");
+  let untilBy = signal("");
+  let untilPlan = signal("");
+  let untilRunning = signal(false);
+  let untilSent = signal(0);
+  let untilStreak = signal(0);
+  let untilReached = signal(false);
+  let untilReason = signal("");
+  type Answer = { id: int, counted: bool, streak: int };
+  let untilAnswers: Answer[] = signal([]);
   let rps: float[] = signal([]);
   let prevDone = signal(0);
   let prevMs: float = signal(0.0);
@@ -1847,6 +1924,34 @@
       } else if e.kind == "flow_finished" {
         lastFlow = if e.allow { `flow ${e.flow} passed` } else { `flow ${e.flow} failed: ${e.reason}` };
         flowOk = e.allow;
+      } else if e.kind == "until_started" {
+        untilId = e.until;
+        untilMethod = e.method;
+        untilUrl = e.url;
+        untilEnv = e.env;
+        untilBy = `${e.actorKind} · ${e.actor}`;
+        untilPlan = e.reason;
+        untilRunning = true;
+        untilSent = 0;
+        untilStreak = 0;
+        untilReached = false;
+        untilReason = "";
+        untilAnswers = [];
+      } else if e.kind == "until_progress" {
+        if e.until == untilId {
+          untilSent = e.sent;
+          untilStreak = e.n;
+          untilAnswers = [{ id: e.requestId, counted: e.allow, streak: e.n }] + untilAnswers;
+          if untilAnswers.length > 200 { untilAnswers = untilAnswers.slice(0, 200); }
+        }
+      } else if e.kind == "until_finished" {
+        if e.until == untilId {
+          untilRunning = false;
+          untilSent = e.sent;
+          untilStreak = e.n;
+          untilReached = e.allow;
+          untilReason = e.reason;
+        }
       } else if e.kind == "bench_started" {
         benches.push({
           id: e.bench, method: e.method, url: e.url, env: e.env, by: `${e.actorKind} · ${e.actor}`,
@@ -2594,6 +2699,61 @@
     } catch e {
       error = `could not start the bench: ${e.message}`;
     }
+  }
+
+  fn runUntil() {
+    if !connected {
+      error = "not connected to a core";
+      return;
+    }
+    let streak = parseInt(uStreak.trim()) ?? 3;
+    let max = parseInt(uMax.trim()) ?? 0;
+    let gap = parseInt(uGap.trim()) ?? 0;
+    if streak <= 0 {
+      error = "In a row is a number from 1";
+      return;
+    }
+    error = "";
+    try {
+      let env = if envPick == NO_ENV { "" } else { envPick };
+      tracer.runUntil(method, url, sentHeaders(), body, env, checksText, streak, uMatch, max, gap);
+    } catch e {
+      error = `could not start the run: ${e.message}`;
+    }
+  }
+
+  fn stopUntil() {
+    if untilId == 0 { return; }
+    try {
+      tracer.stopUntil(untilId);
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  fn untilState(): string {
+    if untilRunning { return "running"; }
+    if untilReached { return `${untilStreak} in a row after ${untilSent} sent`; }
+    `ended: ${untilReason}`
+  }
+
+  fn untilColor(): string {
+    if untilRunning { "#d4d4d4" } else if untilReached { "#4ec98f" } else { "#e8a54b" }
+  }
+
+  // How request `id` ended, as its history row says.
+  fn answerText(id: int): string {
+    let r = requests.find(x => x.id == id);
+    if r == none { return ""; }
+    if r.state == "failed" { return `no answer: ${r.error}`; }
+    if r.state == "done" { return `${r.status} · ${ms(r.totalMs)}`; }
+    statusText(r)
+  }
+
+  // Show one of the run's answers in REST, as a click in History would.
+  fn openAnswer(id: int) {
+    selected = id;
+    mode = "rest";
   }
 
   fn stopBench() {
