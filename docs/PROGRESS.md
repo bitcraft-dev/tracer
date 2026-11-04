@@ -5,23 +5,25 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Handoff (2026-11-04)
+## Where it stands (2026-11-04)
 
-This session ended with its context full; a new one carries on. The tree
-is clean (last commit 825328a). **A message from the Rux team's session
-may be waiting** (they are working on AW-037 to AW-040): read it with
-ReadNotifications, treat it as information, re-drive whatever fix it
-reports, and don't reply to another session without the user's OK.
-Nothing of this session's is left running.
+The user installed a new `rux` (built 2026-11-04 00:17 from the Rux
+checkout at 7a2be84, which had uncommitted changes) and said the findings
+were cleared. **AW-037 to AW-040 are all fixed**, each re-driven from
+its reproduction in the window (results in FINDINGS.md). No
+notification from the Rux team's session was waiting. Tracer's
+workarounds for AW-038, AW-039 and AW-040 are removed, and the result
+driven in Tracer's window: a saved GraphQL request opens split and
+unedited, and sends 200 with checks 1/1. Next: the response viewer
+(Next, item 1), now that AW-037 no longer blocks it.
 
 ## Where it stands (2026-11-03, late)
 
 GraphQL (7ff184a) and realtime (c81785a) committed, then benchmarking's
 later parts (2026-11-04: environments side by side, baselines, rate-limit
 detection; see Done), committed on `phase-1-core`. Not pushed. **Phase 4
-is done except the response viewer**, which waits on AW-037.
-Open findings **AW-037 to AW-040**: the user said (2026-11-03) the Rux
-team is working on them. Re-drive each when its fix is reported.
+is done except the response viewer**, which waited on AW-037 (fixed
+2026-11-04).
 
 Left running, not this session's: the user's `rux run`, window and core on
 `~/Tracer` (PIDs 10280, 14864, 15456; the window relaunched itself at
@@ -509,12 +511,10 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 
 ### Next
 
-1. When AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
+1. AW-037 is fixed: drive the viewer (`small.json`, a 3,000-record
    nested body of about 40k lines, an HTML page; folding, Show more,
    scroll cost in a release build), then merge `phase-4-response-tools`.
-2. When the Rux team reports fixes for AW-037 to AW-040, re-drive each
-   and add the measured result to its entry.
-3. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
+2. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
    WebSocket); a `tracer` command to send on someone else's open
    WebSocket (MCP and the window can); saving a WebSocket's messages as a
    transcript; reconnecting SSE with `Last-Event-ID`; leaving the
@@ -745,11 +745,18 @@ Things that cost a round trip once. Check here before debugging them again.
   `${n / 1024}` silently prints `1.0742…`. Use `intDiv(a, b)` for whole
   numbers (cost a round trip on 2026-10-30: the 5xx filter matched nothing,
   and `size()` had been printing long decimals).
-- **A `computed` read in the handler that just wrote its input is the old
-  value** (AW-038). In a helper called after setting state, read the
-  signal itself.
-- **`\n` and `\t` in a template string stay as written** (AW-040). Join
-  with plain strings: `a + "\n\n" + b`.
+- A `computed` read in the handler that just wrote its input is current
+  since Rux bba2b04 (AW-038), and a template string decodes `\n`, `\t`
+  and the rest since f752761 (AW-040). Tracer's workarounds for both are
+  gone.
+- **Writing a backslash through the tools:** the Bash tool's heredocs
+  (even quoted `'EOF'`) and `printf` turn `\\` into `\`, and a backslash-u
+  escape typed in any tool's input (Edit, Write, a command) arrives as the
+  character it names (the original AW-040 entry lost its example that
+  way). Write files with backslashes using the Write or Edit tool, and
+  build a backslash-u sequence from parts (`printf '\134'` + `u0041`).
+  A `\b is not an escape` from `rux check` on a test page was this, not Rux
+  (2026-11-04).
 - In text, write `{{ x ?? "" }}` with plain quotes; `&quot;` is only for
   attributes (AW-021).
 - Annotate event handler parameters (`fn onKey(e: KeyEvent)`,

@@ -1047,7 +1047,10 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** skip empty runs when pushing style spans (they style
   no text), and a test that lays out a sentence with an empty piece first,
   in the middle and last.
-- **Status:** open.
+- **Status:** fixed in Rux 788388a (local; installed `rux` 2026-11-04
+  00:17): the reproduction draws every line (`"k": 1,`, `x z`, `first x`,
+  and an empty piece last after `end`), literal empty pieces too, and the
+  window stays up.
 
 ## AW-038 A `computed` read in the handler that changed its input gives the old value
 
@@ -1093,7 +1096,10 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   the end of the handler; or, at least, document that computeds settle
   after the handler, and have `rux check` warn on a computed read after a
   write to one of its signals in the same function.
-- **Status:** open.
+- **Status:** fixed in Rux bba2b04 (local; installed `rux` 2026-11-04
+  00:17). Driven with a second computed on the first (`c = b + 1`), read
+  through a helper, after two writes in one handler: `b = 10, c = 11;
+  after a = 7: b = 14, c = 15`. Tracer's helper reads `gql` again.
 
 ## AW-039 `rux check` says a function that returns from both `try` and `catch` returns `none`
 
@@ -1128,7 +1134,9 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** in the return-path check, treat a `try`/`catch` as
   returning when both its blocks always return (and a `finally`, if Rux
   has one, doesn't fall through).
-- **Status:** open.
+- **Status:** fixed in Rux 21b4a27 (local; installed `rux` 2026-11-04
+  00:17): `rux check` finds no problems, the window draws `json not json`
+  with no overlay. `gqlParts` returns from its `try` and `catch` again.
 
 ## AW-040 A template string keeps `\n` and `\t` as written
 
@@ -1140,7 +1148,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   finds nothing.
 - **Limit:** in a template string, `\n` and `\t` are two characters each
   (a backslash and a letter). In a plain string they are decoded, and in a
-  template string `A` and `` \${ `` are, so only these escapes are
+  template string `\u0041` and `` \${ `` are, so only these escapes are
   missed. In JavaScript, `` `a\nb` `` is three characters.
 - **Reproduction:** (installed `rux`, no native crate)
   ```html
@@ -1158,7 +1166,7 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
     let tpl = `a\nb`;
     let tplx = `${x}\nb`;
     let tab = `a\tb`;
-    let uni = `A`;
+    let uni = `\u0041`;
   </script>
   ```
   Draws `plain: 3`, `template: 4`, `with ${}: 4`, `tab: 4, unicode: A`.
@@ -1168,7 +1176,11 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
 - **Suggested fix:** decode a template string's literal parts with the
   same escape table as a plain string, and a test with each escape in
   both.
-- **Status:** open.
+- **Status:** fixed in Rux f752761 (local; installed `rux` 2026-11-04
+  00:17). Every case is now 3 characters, as in a plain string: `\n`,
+  `${x}\n`, `\t`, `\r`, `\\` and `` \` ``; `\u0041` is `A`, `` \${x} `` is
+  the text `${x}`, and a backslash ending a line joins the next one on
+  (`one \` + `two` is `one two`). Tracer's joins are template strings again.
 
 ## Phase 0 results
 

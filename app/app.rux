@@ -1817,8 +1817,7 @@
   }
 
   fn joinGql(q: string, v: string): string {
-    // Not a template string: one keeps `\n` as written (AW-040).
-    if v.trim() == "" { q.trimEnd() } else { q.trimEnd() + "\n\n" + v.trim() }
+    if v.trim() == "" { q.trimEnd() } else { `${q.trimEnd()}\n\n${v.trim()}` }
   }
 
   // A GraphQL body as [query, variables]: the variables are the last
@@ -1829,13 +1828,12 @@
     if at < 0 { return [all, ""]; }
     let rest = all.slice(at).trim();
     if !rest.startsWith("{") { return [all, ""]; }
-    let json = true;
     try {
       JSON.parse(rest);
+      return [all.slice(0, at).trimEnd(), rest];
     } catch e {
-      json = false;
+      return [all, ""];
     }
-    if json { [all.slice(0, at).trimEnd(), rest] } else { [all, ""] }
   }
 
   fn splitGql(b: string) {
@@ -2016,10 +2014,9 @@
   }
 
   // A request just put in the editor: a GraphQL one is split for editing,
-  // and the tabs are the ones its kind has. `method`, not `gql`: a computed
-  // read in the handler that set its input is still the old value (AW-038).
+  // and the tabs are the ones its kind has.
   fn afterLoad() {
-    if method == "GRAPHQL" {
+    if gql {
       splitGql(body);
       if reqTab == "body" { reqTab = "query"; }
       mode = "rest";
@@ -2640,9 +2637,7 @@
     if r.body == "" {
       "(empty body)"
     } else if r.body.length < r.size {
-      // A plain string for the newlines: a template string keeps `\n` as
-      // written (AW-040).
-      r.body + "\n\n" + `… showing the first 64 KiB of ${size(r.size)}`
+      `${r.body}\n\n… showing the first 64 KiB of ${size(r.size)}`
     } else {
       r.body
     }
