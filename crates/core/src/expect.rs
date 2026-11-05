@@ -2,7 +2,7 @@
 //! by the core when the answer arrives.
 //!
 //! ```text
-//! status 2xx                       status == 201, status < 400
+//! status 2xx                       status 201, status == 201, status < 400
 //! time < 500                       ttfb < 200, size < 10000 (ms, ms, bytes)
 //! header Content-Type contains json
 //! header X-Request-Id exists       missing, ==, !=
@@ -94,6 +94,12 @@ fn parse(line: &str) -> Result<Expect, String> {
         w => return Err(format!("`{w}` isn't something to check: status, time, ttfb, size, header, body, $.path or len($.path)")),
     };
     let (op_word, value) = split_word(rest);
+    // `status 200` as people write it: `status == 200`.
+    if matches!(subject, Subject::Status) && value.trim().is_empty() {
+        if let Ok(code @ 100..=599) = op_word.parse::<u16>() {
+            return Ok(Expect { subject, op: Op::Eq, value: Some(Value::from(code)) });
+        }
+    }
     let op = match op_word {
         "==" => Op::Eq,
         "!=" => Op::Ne,
@@ -303,6 +309,7 @@ mod tests {
         let lines = [
             "status 2xx",
             "status == 201",
+            "status 201",
             "status < 400",
             "time < 500",
             "ttfb <= 40",

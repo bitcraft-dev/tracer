@@ -69,12 +69,15 @@ usage:
   tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--expect '…']...
                                       save a request as requests/<PATH>.http, its
                                       expectations as `# @expect` lines
-  tracer run <PATH> [--env <NAME>] [--keep-going] [--report json] [--watch]
+  tracer run <PATH> [--env <NAME>] [--keep-going] [--report json] [--data <FILE>] [--watch]
                                       send a saved request and print its answer;
                                       a folder runs as a flow, in path order, each
                                       step's `# @capture name = $.path` filling
                                       {{name}} after it; stops at a failed step
                                       unless --keep-going; exits 1 if it fails.
+                                      --data: a CSV (header line) or JSON array
+                                      of objects; the flow runs once per row,
+                                      its columns filling {{name}}
                                       --watch: run it again whenever its file
                                       (or one under the folder) or its env
                                       changes, until Ctrl+C
@@ -666,6 +669,7 @@ fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let env = take_value(&mut args, "--env");
     let until = Until::take(&mut args, false)?;
     let report = take_value(&mut args, "--report");
+    let data = take_value(&mut args, "--data");
     if report.as_deref().is_some_and(|r| r != "json") {
         return Err(io::Error::other("--report takes json"));
     }
@@ -687,11 +691,11 @@ fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let once = || -> io::Result<ExitCode> {
         let (requests, _) = saved(&workspace, "tracer run")?;
         match requests.into_iter().find(|r| r.path == wanted) {
-            Some(found) if report.is_none() => {
+            Some(found) if report.is_none() && data.is_none() => {
                 send_and_wait(&workspace, Command::Send { request: found.request, env: env.clone() }, "tracer run", until)
             }
             // A folder, or one request wanted as a report: a flow.
-            _ => flow(&workspace, &wanted, env.clone(), keep_going, report.is_some()),
+            _ => flow(&workspace, &wanted, env.clone(), keep_going, report.is_some(), data.clone()),
         }
     };
     if !watch {
@@ -724,11 +728,11 @@ fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
 
 /// Run a flow, telling its steps as they go on stderr; with `json`, a
 /// report on stdout at the end. Fails when the flow does.
-fn flow(workspace: &PathBuf, path: &str, env: Option<String>, keep_going: bool, json: bool) -> io::Result<ExitCode> {
+fn flow(workspace: &PathBuf, path: &str, env: Option<String>, keep_going: bool, json: bool, data: Option<String>) -> io::Result<ExitCode> {
     let mut client = Client::connect(workspace, ClientKind::Cli, "tracer run")?;
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
     let started = std::time::Instant::now();
-    let (flow_id, steps) = match client.call(Command::RunFlow { path: path.to_string(), env: env.clone(), keep_going })? {
+    let (flow_id, steps) = match client.call(Command::RunFlow { path: path.to_string(), env: env.clone(), keep_going, data })? {
         Ok(ReplyBody::FlowStarted { flow_id, steps }) => (flow_id, steps),
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),
@@ -740,10 +744,11 @@ fn flow(workspace: &PathBuf, path: &str, env: Option<String>, keep_going: bool, 
     loop {
         let event = client.next_event()?;
         match event.kind {
-            EventKind::RequestStarted { request_id, flow: Some(f), .. } if f == flow_id => {
-                let path = steps.get(ours.len()).cloned().unwrap_or_default();
-                eprintln!("→ {path}  #{request_id}");
-                ours.push((request_id, path));
+            EventKind::RequestStarted { request_id, flow: Some(f), request, .. } if f == flow_id => {
+                // As written: a skipped step starts no request, so its name
+                // can't be told from the order.
+                eprintln!("→ #{request_id} {} {}", request.method, request.url);
+                ours.push((request_id, String::new()));
             }
             EventKind::RequestFinished { request_id, response } if ours.iter().any(|(id, _)| *id == request_id) => {
                 eprintln!("  {} · {:.0} ms · {} B", response.status, response.timing.total_ms, response.size);
@@ -761,7 +766,8 @@ fn flow(workspace: &PathBuf, path: &str, env: Option<String>, keep_going: bool, 
                 let failed = steps.iter().filter(|s| s.outcome == StepOutcome::Failed).count();
                 let skipped = steps.iter().filter(|s| s.outcome == StepOutcome::Skipped).count();
                 for s in steps.iter().filter(|s| s.outcome != StepOutcome::Passed) {
-                    eprintln!("{} {}: {}", if s.outcome == StepOutcome::Failed { "✗" } else { "–" }, s.path, s.note);
+                    let row = s.row.map(|r| format!("row {r}: ")).unwrap_or_default();
+                    eprintln!("{} {row}{}: {}", if s.outcome == StepOutcome::Failed { "✗" } else { "–" }, s.path, s.note);
                 }
                 eprintln!(
                     "flow {flow_id} {}: {} passed, {failed} failed, {skipped} skipped, in {:.1} s",

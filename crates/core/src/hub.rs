@@ -371,12 +371,18 @@ impl Hub {
     }
 
     /// Number a new flow and publish that it started.
-    pub fn start_flow(&self, actor: Actor, path: String, env: Option<String>, steps: Vec<String>) -> u64 {
+    pub fn start_flow(&self, actor: Actor, path: String, env: Option<String>, steps: Vec<String>, data: Option<(String, u32)>) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         let flow_id = inner.next_flow;
         inner.next_flow += 1;
-        publish_locked(&mut inner, actor, EventKind::FlowStarted { flow_id, path, env, steps });
+        let (data, rows) = data.map_or((None, None), |(file, rows)| (Some(file), Some(rows)));
+        publish_locked(&mut inner, actor, EventKind::FlowStarted { flow_id, path, env, steps, data, rows });
         flow_id
+    }
+
+    /// The workspace's folder.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// Number a new bench and publish that it started. Gives its id and the

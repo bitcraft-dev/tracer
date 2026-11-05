@@ -657,7 +657,7 @@ fn a_flow_step_sent_again_is_filled_with_the_captures_it_had() {
     cli.call(Command::SaveRequest { path: "f/1 first".into(), request: first }).unwrap().unwrap();
     cli.call(Command::SaveRequest { path: "f/2 second".into(), request: step(format!("{base}/x{{{{p}}}}"), vec![]) }).unwrap().unwrap();
 
-    cli.call(Command::RunFlow { path: "f".into(), env: None, keep_going: false }).unwrap().unwrap();
+    cli.call(Command::RunFlow { path: "f".into(), env: None, keep_going: false, data: None }).unwrap().unwrap();
     let steps = wait_for(&mut window, |e| match &e.kind {
         EventKind::FlowFinished { passed: true, steps, .. } => Some(steps.clone()),
         EventKind::FlowFinished { steps, .. } => panic!("the flow failed: {steps:?}"),
@@ -680,6 +680,46 @@ fn a_flow_step_sent_again_is_filled_with_the_captures_it_had() {
     let sent: Vec<&str> = journal.lines().filter(|l| l.contains("request_started")).collect();
     assert_eq!(sent.len(), 4);
     assert!(sent.iter().all(|l| !l.contains("/x/first")), "a capture's value reached the journal");
+    core.stop();
+}
+
+#[test]
+fn a_data_driven_flow_runs_once_per_row_with_its_values() {
+    let ws = workspace("flow-data");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
+    let step = |url: String, capture: Vec<String>| HttpRequest { method: "GET".into(), url, capture, ..Default::default() };
+    cli.call(Command::SaveRequest { path: "d/1 user".into(), request: step(format!("{base}/users/{{{{id}}}}"), vec!["p = $.path".into()]) })
+        .unwrap()
+        .unwrap();
+    cli.call(Command::SaveRequest { path: "d/2 again".into(), request: step(format!("{base}/again{{{{p}}}}?n={{{{name}}}}"), vec![]) })
+        .unwrap()
+        .unwrap();
+    std::fs::create_dir_all(ws.join("data")).unwrap();
+    std::fs::write(ws.join("data/users.csv"), "id,name\n7,Ada\n8,\"Grace,H\"\n").unwrap();
+
+    let started = cli.call(Command::RunFlow { path: "d".into(), env: None, keep_going: false, data: Some("data/users.csv".into()) }).unwrap();
+    let Ok(ReplyBody::FlowStarted { steps: names, .. }) = started else { panic!("{started:?}") };
+    assert_eq!(names, ["row 1: d/1 user", "row 1: d/2 again", "row 2: d/1 user", "row 2: d/2 again"]);
+    let steps = wait_for(&mut window, |e| match &e.kind {
+        EventKind::FlowFinished { passed: true, steps, .. } => Some(steps.clone()),
+        EventKind::FlowFinished { steps, .. } => panic!("the flow failed: {steps:?}"),
+        _ => None,
+    });
+    assert_eq!(steps.iter().map(|s| s.row).collect::<Vec<_>>(), [Some(1), Some(1), Some(2), Some(2)]);
+    let body = |cli: &mut Client, id: u64| match cli.call(Command::Response { request_id: id }).unwrap() {
+        Ok(ReplyBody::Response { response: Some(r), .. }) => r.body,
+        other => panic!("{other:?}"),
+    };
+    // Each row's values, and its own captures: row 2 doesn't see row 1's.
+    assert_eq!(body(&mut cli, steps[1].request_id.unwrap()), r#"{"path":"/again/users/7?n=Ada","got":0}"#);
+    assert_eq!(body(&mut cli, steps[3].request_id.unwrap()), r#"{"path":"/again/users/8?n=Grace,H","got":0}"#);
+
+    let missing = cli.call(Command::RunFlow { path: "d".into(), env: None, keep_going: false, data: Some("../users.csv".into()) }).unwrap();
+    assert!(missing.unwrap_err().contains("inside the workspace"));
     core.stop();
 }
 

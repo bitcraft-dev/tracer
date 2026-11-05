@@ -497,6 +497,17 @@
         </view>
         </view>
 
+        <view class="scrim" r-if="askingData" @tap="askingData = false">
+        <view class="palette" @tap="noop()">
+            <text class="prompt-h">Run the folder once per row of</text>
+            <view class="pal-field">
+                <input r-model="dataFile" placeholder="data/users.csv" autofocus @key="dataKey(event)" />
+            </view>
+            <text class="prompt-hint">A CSV with a header line, or a JSON array of objects, in the workspace: each row's columns fill {{ "{{column}}" }} · Enter runs · Esc cancels</text>
+            <text class="mono err" r-if="error != &quot;&quot;">{{ error }}</text>
+        </view>
+        </view>
+
         <view class="scrim" r-if="naming" @tap="naming = false">
         <view class="palette" @tap="noop()">
             <text class="prompt-h">Save as</text>
@@ -1244,9 +1255,10 @@
     border: 1px solid #333333;
     border-radius: 4px;
     cursor: pointer;
+    flex-shrink: 0;
   }
 
-  .browser-t { color: #8a8a8a; font-size: 11px; }
+  .browser-t { color: #8a8a8a; font-size: 11px; white-space: nowrap; }
   .browser-chip.on { border: 1px solid #3a3550; }
   .browser-chip.on .browser-t { color: #c8c0f8; }
   .browser-chip.warn { border: 1px solid #5a4020; }
@@ -1266,9 +1278,10 @@
     border: 1px solid #2e5a43;
     border-radius: 4px;
     cursor: pointer;
+    flex-shrink: 0;
   }
 
-  .agents-t { color: #4ec98f; font-size: 11px; }
+  .agents-t { color: #4ec98f; font-size: 11px; white-space: nowrap; }
   .agents.off { border: 1px solid #6b2a28; background: #3a1d1c; }
   .agents.off .agents-t { color: #f0716c; }
 
@@ -1684,6 +1697,7 @@
     { id: "copy-editor", label: "Copy the request being edited as code (cURL, fetch, Python, Rux)", hint: "" },
     { id: "explain", label: "Copy the request on show, explained, for a person or an AI", hint: "" },
     { id: "servers", label: "Find servers running on this machine", hint: "" },
+    { id: "flow-data", label: "Run the open request's folder once per row of a CSV or JSON file", hint: "" },
     { id: "paste", label: "Paste a curl command or fetch call as a new request", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
@@ -2110,7 +2124,8 @@
         lastFlow = `flow ${e.flow}: ${e.path} running`;
         flowOk = true;
       } else if e.kind == "flow_finished" {
-        lastFlow = if e.allow { `flow ${e.flow} passed` } else { `flow ${e.flow} failed: ${e.reason}` };
+        let rows = if e.n > 0 { ` (${e.n} rows)` } else { "" };
+        lastFlow = if e.allow { `flow ${e.flow} passed${rows}` } else { `flow ${e.flow} failed${rows}: ${e.reason}` };
         flowOk = e.allow;
       } else if e.kind == "browser_changed" || e.kind == "cookies_changed" {
         loadBrowser();
@@ -2851,6 +2866,12 @@
   // The folder of the saved request open in the editor, run as a flow with
   // the chosen environment.
   fn runFolder() {
+    runFolderWith("");
+  }
+
+  // As runFolder, once per row of `data`, a CSV or JSON file in the
+  // workspace ("" for none).
+  fn runFolderWith(data: string) {
     let at = openPath.lastIndexOf("/");
     if at <= 0 {
       error = "open a saved request in a folder: the folder runs as a flow";
@@ -2858,9 +2879,21 @@
     }
     error = "";
     try {
-      tracer.runFlow(openPath.substring(0, at), if envPick == NO_ENV { "" } else { envPick });
+      tracer.runFlow(openPath.substring(0, at), if envPick == NO_ENV { "" } else { envPick }, data);
+      askingData = false;
     } catch e {
       error = `could not run the flow: ${e.message}`;
+    }
+  }
+
+  // The prompt for a data file, for a data-driven flow.
+  let askingData = signal(false);
+  let dataFile = signal("");
+
+  fn dataKey(e: KeyEvent) {
+    if e.key == "Enter" {
+      runFolderWith(dataFile);
+      return false;
     }
   }
 
@@ -3401,6 +3434,8 @@
       copySelCurl();
     } else if id == "flow" {
       runFolder();
+    } else if id == "flow-data" {
+      askingData = true;
     } else if id == "bench" {
       mode = "bench";
       runBench();

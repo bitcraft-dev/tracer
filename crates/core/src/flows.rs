@@ -22,13 +22,21 @@ use serde_json::Value;
 use tracer_protocol::{Actor, EventKind, FlowStep, HttpResponse, SavedRequest, StepOutcome};
 
 use crate::conn::{run_one, Ran};
-use crate::files;
+use crate::{data, files};
 use crate::hub::Hub;
 
 /// The saved requests a flow at `path` runs: those under folder `path`, or
 /// the one at `path`. Starts it on a thread of its own, and gives its id
-/// and steps.
-pub fn start(hub: &Arc<Hub>, actor: &Actor, path: &str, env: Option<String>, keep_going: bool) -> Result<(u64, Vec<String>), String> {
+/// and steps. With `data`, a file of rows, it runs once per row, each
+/// row's values filling `{{column}}`.
+pub fn start(
+    hub: &Arc<Hub>,
+    actor: &Actor,
+    path: &str,
+    env: Option<String>,
+    keep_going: bool,
+    data: Option<&str>,
+) -> Result<(u64, Vec<String>), String> {
     let path = path.trim().trim_end_matches('/');
     let path = if path.is_empty() { String::new() } else { files::normalize(path)? };
     let (requests, _, _) = hub.list_requests();
@@ -37,19 +45,51 @@ pub fn start(hub: &Arc<Hub>, actor: &Actor, path: &str, env: Option<String>, kee
     if steps.is_empty() {
         return Err(format!("there are no saved requests under `{path}`"));
     }
-    let names: Vec<String> = steps.iter().map(|s| s.path.clone()).collect();
-    let flow_id = hub.start_flow(actor.clone(), path.clone(), env.clone(), names.clone());
+    let rows = match data {
+        Some(file) => Some((file.trim().to_string(), data::read(hub.root(), file)?)),
+        None => None,
+    };
+    let names: Vec<String> = match &rows {
+        None => steps.iter().map(|s| s.path.clone()).collect(),
+        Some((_, rows)) => (1..=rows.len()).flat_map(|row| steps.iter().map(move |s| format!("row {row}: {}", s.path))).collect(),
+    };
+    let about = rows.as_ref().map(|(file, rows)| (file.clone(), rows.len() as u32));
+    let flow_id = hub.start_flow(actor.clone(), path.clone(), env.clone(), names.clone(), about);
     let (hub, actor) = (hub.clone(), actor.clone());
-    thread::spawn(move || run(&hub, &actor, flow_id, steps, env, keep_going));
+    thread::spawn(move || {
+        let done: Vec<FlowStep> = match rows {
+            None => run(&hub, &actor, flow_id, &steps, env.as_deref(), keep_going, Vec::new(), None),
+            Some((_, rows)) => rows
+                .into_iter()
+                .enumerate()
+                .flat_map(|(i, row)| run(&hub, &actor, flow_id, &steps, env.as_deref(), keep_going, row, Some(i as u32 + 1)))
+                .collect(),
+        };
+        let passed = done.iter().all(|s| s.outcome == StepOutcome::Passed);
+        hub.publish(actor.clone(), EventKind::FlowFinished { flow_id, passed, steps: done });
+    });
     Ok((flow_id, names))
 }
 
-fn run(hub: &Hub, actor: &Actor, flow_id: u64, steps: Vec<SavedRequest>, env: Option<String>, keep_going: bool) {
-    let mut vars: Vec<(String, String)> = Vec::new();
+/// One run of the flow's `steps`, its variables starting as `vars` (a
+/// data row's), and how each step went.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    hub: &Hub,
+    actor: &Actor,
+    flow_id: u64,
+    steps: &[SavedRequest],
+    env: Option<&str>,
+    keep_going: bool,
+    mut vars: Vec<(String, String)>,
+    row: Option<u32>,
+) -> Vec<FlowStep> {
+    let env = env.map(String::from);
     let mut done: Vec<FlowStep> = Vec::new();
     let mut failing = false;
-    for saved in steps {
-        let mut step = FlowStep { path: saved.path, request_id: None, outcome: StepOutcome::Passed, note: String::new(), captured: Vec::new() };
+    for saved in steps.iter().cloned() {
+        let mut step =
+            FlowStep { path: saved.path, request_id: None, outcome: StepOutcome::Passed, note: String::new(), captured: Vec::new(), row };
         if failing && !keep_going {
             step.outcome = StepOutcome::Skipped;
             step.note = "a step before it failed".into();
@@ -98,8 +138,7 @@ fn run(hub: &Hub, actor: &Actor, flow_id: u64, steps: Vec<SavedRequest>, env: Op
         failing |= step.outcome == StepOutcome::Failed;
         done.push(step);
     }
-    let passed = done.iter().all(|s| s.outcome == StepOutcome::Passed);
-    hub.publish(actor.clone(), EventKind::FlowFinished { flow_id, passed, steps: done });
+    done
 }
 
 /// `token = $.access_token`, `next = header Location`, `code = status`.

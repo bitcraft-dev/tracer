@@ -16,6 +16,7 @@ mod bench;
 mod conn;
 mod cookies;
 mod cors;
+mod data;
 mod diff;
 mod discover;
 mod envs;

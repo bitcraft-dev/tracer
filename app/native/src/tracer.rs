@@ -488,11 +488,13 @@ pub fn import_text(text: String) -> Result<Imported, CoreError> {
     }
 }
 
-/// Run the saved requests under folder `path` as a flow. Gives its id.
+/// Run the saved requests under folder `path` as a flow, once per row of
+/// `data` (a CSV or JSON file in the workspace) if it isn't "". Gives its id.
 #[rux::export]
-pub fn run_flow(path: String, env: String) -> Result<u64, CoreError> {
+pub fn run_flow(path: String, env: String, data: String) -> Result<u64, CoreError> {
     let env = if env.is_empty() { None } else { Some(env) };
-    match shared()?.call(Command::RunFlow { path, env, keep_going: false }) {
+    let data = if data.trim().is_empty() { None } else { Some(data) };
+    match shared()?.call(Command::RunFlow { path, env, keep_going: false, data }) {
         Ok(Ok(ReplyBody::FlowStarted { flow_id, .. })) => Ok(flow_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
@@ -1242,10 +1244,12 @@ fn to_page(event: Event) -> CoreEvent {
         }
         EventKind::FlowFinished { flow_id, passed, steps } => {
             (out.kind, out.flow, out.allow) = ("flow_finished".into(), flow_id, passed);
+            // Rows run, in a data-driven flow.
+            out.n = steps.iter().filter_map(|s| s.row).max().unwrap_or(0).into();
             let failed: Vec<String> = steps
                 .iter()
                 .filter(|s| s.outcome == StepOutcome::Failed)
-                .map(|s| format!("{}: {}", s.path, s.note))
+                .map(|s| format!("{}{}: {}", s.row.map(|r| format!("row {r}: ")).unwrap_or_default(), s.path, s.note))
                 .collect();
             out.reason = failed.join("; ");
         }

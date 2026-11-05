@@ -206,12 +206,19 @@ pub enum Command {
     /// fails when it gets no answer, a check fails, or (with no checks) its
     /// status is 400 or more; the steps after a failed one are skipped
     /// unless `keep_going`. The reply names the steps; the run is events.
+    ///
+    /// With `data`, a CSV (a header line naming the columns) or a JSON
+    /// array of objects in the workspace, the flow runs once per row, in
+    /// order, each row's values filling `{{column}}` (over `env`, under
+    /// captures); a failed step skips the rest of its own row only.
     RunFlow {
         path: String,
         #[serde(default)]
         env: Option<String>,
         #[serde(default)]
         keep_going: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
     },
     /// Send `request` over and over: `plan.concurrency` at a time until
     /// `plan.total` have gone or `plan.duration_secs` has passed, whichever
@@ -425,6 +432,9 @@ pub struct FlowStep {
     /// The names it captured for the steps after it (not their values).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captured: Vec<String>,
+    /// In a data-driven flow, the row (from 1) it ran for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1382,13 +1392,19 @@ pub enum EventKind {
     /// A request's expectations, checked once it ended (after its
     /// `request_finished` or `request_failed`), in the sender's name.
     RequestChecked { request_id: u64, results: Vec<CheckResult> },
-    /// A flow began: its saved requests, in order.
+    /// A flow began: its saved requests, in order (in a data-driven one,
+    /// every row's, as `row 2: path`).
     FlowStarted {
         flow_id: u64,
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<String>,
         steps: Vec<String>,
+        /// The data file it runs once per row of, and how many rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u32>,
     },
     /// A flow ended: how each step went.
     FlowFinished { flow_id: u64, passed: bool, steps: Vec<FlowStep> },

@@ -419,9 +419,10 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             let path = str_arg(args, "path").ok_or("`path` is required")?.to_string();
             let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
             let keep_going = args.get("keep_going").and_then(Value::as_bool).unwrap_or(false);
+            let data = str_arg(args, "data").filter(|d| !d.trim().is_empty()).map(String::from);
             let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT * 2).min(WAIT_MAX);
             while core.events.try_recv().is_ok() {}
-            let ReplyBody::FlowStarted { flow_id, steps } = call(core, Command::RunFlow { path, env, keep_going })? else {
+            let ReplyBody::FlowStarted { flow_id, steps } = call(core, Command::RunFlow { path, env, keep_going, data })? else {
                 return Err(unexpected());
             };
             let deadline = Instant::now() + Duration::from_secs(wait);
@@ -1311,6 +1312,7 @@ fn tools() -> Value {
                     "path": { "type": "string", "description": "A folder under requests/, such as `signup`, or one request's path." },
                     "env": env,
                     "keep_going": { "type": "boolean" },
+                    "data": { "type": "string", "description": "A CSV file (a header line naming columns) or a JSON array of objects in the workspace, such as data/users.csv: the flow runs once per row, each row's values filling {{column}}; a failed step skips only the rest of its row, and each step says its `row`." },
                     "wait_seconds": { "type": "integer", "description": "How long to wait for the end (default 120, at most 600)." },
                 },
                 "required": ["path"],

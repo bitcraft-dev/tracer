@@ -162,8 +162,8 @@ pub fn serve(
             (Some((_, actor)), Command::SetAgents { allowed }) => {
                 hub.set_agents(actor.clone(), allowed).map(|_| ReplyBody::AgentsSwitched)
             }
-            (Some((_, actor)), Command::RunFlow { path, env, keep_going }) => {
-                match flows::start(&hub, actor, &path, env, keep_going) {
+            (Some((_, actor)), Command::RunFlow { path, env, keep_going, data }) => {
+                match flows::start(&hub, actor, &path, env, keep_going, data.as_deref()) {
                     Ok((flow_id, steps)) => Ok(ReplyBody::FlowStarted { flow_id, steps }),
                     Err(e) => Err(e),
                 }
