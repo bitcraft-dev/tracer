@@ -1279,6 +1279,79 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   aligns the item. Tests for a row's end, a centred item and a column.
 - **Status:** open.
 
+## AW-043 The root's background lags one change behind when its class changes as the focused element goes
+
+- **Found:** 2026-11-05, Tracer's light theme. Choosing "Theme: light" in
+  the Ctrl+K palette turned every element light except the `<screen>`
+  itself: its background stayed the dark one (sampled `#141414`, the dark
+  value), so text inheriting the new dark colour sat dark on dark. Choosing
+  again showed the previous theme's background. Started with the theme
+  already set, it's right.
+- **Severity:** wrong paint, no error. Any app switching a theme (or any
+  root class) from a dialog, menu or palette that closes in the same
+  handler. Tracer's theme switch is affected; it's left as is.
+- **Limit:** when one handler both changes the root element's `:class`
+  and removes an overlay holding the focused element (an `r-if` going
+  false over an `autofocus` input, as a palette or dialog closing), the
+  root's `background` is painted with the value from before the change,
+  until the next change, which paints the one before that. The root's
+  `color` and every descendant update at once. It happens from a key
+  handler and from a tap, in either order of the two writes, and with
+  plain colours as with `var()`. Removing an overlay with no focused
+  element in it, or changing the class with nothing removed, paints
+  right.
+- **Reproduction:** (installed `rux` of 2026-11-05 05:33, checkout clean at
+  29fb783, no native crate) open the overlay (its input takes focus), tap
+  "toggle .on and close", and compare the root (the margin around the
+  boxes) with the child box:
+  ```html
+  <template>
+    <screen class="root" :class="{ on: on }">
+      <view class="child"><text>child: background by .root.on .child</text></view>
+      <view class="btn" @tap="open = true"><text>open the overlay (on is {{ on }})</text></view>
+      <view class="scrim" r-if="open">
+        <view class="box">
+          <input r-model="typed" placeholder="focused" autofocus />
+          <view class="btn" @tap="flip()"><text>toggle .on and close</text></view>
+        </view>
+      </view>
+    </screen>
+  </template>
+
+  <style>
+    .root { background: #202020; height: 100%; display: flex; flex-direction: column; gap: 12px; padding: 20px; }
+    .root.on { background: #f0f0f0; }
+    .root.on .child { background: #f0f0f0; }
+    .child { padding: 10px; background: #202020; }
+    .btn { padding: 8px; border: 1px solid #888888; }
+    .scrim { position: absolute; left: 0; top: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; }
+    .box { width: 500px; padding: 10px; background: #ffffff; }
+  </style>
+
+  <script>
+    let on = signal(true);
+    let open = signal(false);
+    let typed = signal("");
+
+    fn flip() {
+      on = !on;
+      open = false;
+    }
+  </script>
+  ```
+  Sampled from PrintWindow captures, root then child: start `#f0f0f0`,
+  `#f0f0f0`; after one toggle `#f0f0f0`, `#202020`; after two `#202020`,
+  `#f0f0f0`. The child is always right; the root is one behind. Without
+  the `<input>` (so nothing focused goes), all three paint right.
+- **Workaround:** none taken in Tracer (closing the palette on one frame
+  and changing the theme on a later one would likely avoid it).
+- **Suggested fix:** the root's background is probably taken for the
+  window's clear colour from the styles of the frame before the overlay's
+  removal relayout; restyle the root (or read its background) after the
+  tree change, in the same frame. A test: flip a root class and remove an
+  `r-if` child in one handler, then check the painted clear colour.
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,
