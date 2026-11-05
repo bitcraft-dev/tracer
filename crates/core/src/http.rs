@@ -59,7 +59,12 @@ pub fn keep_alive(redirects: bool, unchecked_tls: bool) -> Agent {
 /// Send `req` with `agent`, reading the whole body. Gives the response with
 /// only TTFB and the total timed, the phases being the connection's, which
 /// a kept connection doesn't repeat.
-pub fn execute_with(agent: &Agent, req: &HttpRequest, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
+///
+/// An answer that ends its connection (HTTP/1.0 without keep-alive, or
+/// `Connection: close`) has `agent` replaced by a fresh one with
+/// `fresh()`: the server has closed that connection, and the next request
+/// sent on it would fail.
+pub fn execute_with(agent: &mut Agent, fresh: impl Fn() -> Agent, req: &HttpRequest, cancelled: &AtomicBool) -> Result<HttpResponse, String> {
     let request = build(req)?;
     let started = Instant::now();
     let mut res = agent.run(request).map_err(|e| e.to_string())?;
@@ -68,6 +73,11 @@ pub fn execute_with(agent: &Agent, req: &HttpRequest, cancelled: &AtomicBool) ->
     let timing = Marks::default().timing(ttfb.as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0);
     let mut answer = response(&res, bytes, timing);
     answer.tls_unchecked = agent.config().tls_config().disable_verification();
+    let connection = res.headers().get("connection").and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    let ends = connection.contains("close") || (res.version() == ureq::http::Version::HTTP_10 && !connection.contains("keep-alive"));
+    if ends {
+        *agent = fresh();
+    }
     Ok(answer)
 }
 

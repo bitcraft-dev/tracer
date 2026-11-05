@@ -121,7 +121,8 @@ struct Worker {
 
 impl Worker {
     fn work(&self, redirects: bool, unchecked_tls: bool, next: &AtomicU64, stop: &AtomicBool, samples: &Mutex<Samples>) {
-        let agent = http::keep_alive(redirects, unchecked_tls);
+        let fresh = || http::keep_alive(redirects, unchecked_tls);
+        let mut agent = fresh();
         loop {
             let n = next.fetch_add(1, Ordering::SeqCst);
             if n >= self.total || stop.load(Ordering::SeqCst) {
@@ -137,7 +138,7 @@ impl Worker {
             if self.deadline.is_some_and(|d| Instant::now() >= d) {
                 return;
             }
-            let outcome = http::execute_with(&agent, &self.sending, stop)
+            let outcome = http::execute_with(&mut agent, fresh, &self.sending, stop)
                 .map(|r| envs::redact_response(r, &self.secrets))
                 .map_err(|e| envs::redact(&e, &self.secrets));
             // One cut short by a stop is no sample.

@@ -1615,6 +1615,22 @@ fn bench_end(client: &mut Client, id: u64) -> (tracer_protocol::BenchStats, Opti
 }
 
 #[test]
+fn a_bench_against_a_server_that_closes_each_connection_counts_no_failures() {
+    use tracer_protocol::BenchPlan;
+    let ws = workspace("bench-close");
+    // Answers HTTP/1.1 with Connection: close, then closes.
+    let base = status_server(vec![200]);
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "you").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let plan = BenchPlan { total: Some(30), concurrency: 1, ..BenchPlan::default() };
+    let Ok(ReplyBody::BenchStarted { bench_id }) = window.call(bench(format!("{base}/x"), plan)).unwrap() else { panic!() };
+    let (stats, _) = bench_end(&mut window, bench_id);
+    assert_eq!((stats.done, stats.failed, stats.statuses.clone()), (30, 0, vec![(200, 30)]), "{:?}", stats.errors);
+    core.stop();
+}
+
+#[test]
 fn a_bench_sends_its_total_counts_every_answer_and_keeps_only_its_first_in_history() {
     use tracer_protocol::BenchPlan;
     let ws = workspace("bench");
