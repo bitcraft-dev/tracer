@@ -131,6 +131,11 @@ usage:
                                       a request from a curl command or a fetch(…)
                                       call (FILE, or stdin), printed as a .http
                                       file, or saved at PATH
+  tracer explain [ID]                 a past request (the newest that went wrong
+                                      if no ID) as Markdown to paste to a person
+                                      or an AI: request, env (secrets named only),
+                                      answer, timing, checks, settings, and the
+                                      last time it worked
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -186,6 +191,7 @@ fn main() -> ExitCode {
         Some("rm") => rm(workspace, args[1..].to_vec()),
         Some("export") => export(workspace, args[1..].to_vec()),
         Some("import") => import(workspace, args[1..].to_vec()),
+        Some("explain") => explain(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
@@ -1436,6 +1442,40 @@ fn export(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
         Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => Err(io::Error::other(e)),
     }
+}
+
+fn explain(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer explain")?;
+    let explained = |client: &mut Client, request_id: u64| match client.call(Command::Explain { request_id })? {
+        Ok(ReplyBody::Explained { text, failed, summary }) => Ok((text, failed, summary)),
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    };
+    let text = match args.as_slice() {
+        [id] => {
+            let request_id = id.trim_start_matches('#').parse().map_err(|_| io::Error::other(format!("`{id}` isn't a request's number")))?;
+            explained(&mut client, request_id)?.0
+        }
+        [] => {
+            // The newest that went wrong, among the last few hundred.
+            let filter = HistoryFilter { limit: Some(500), ..HistoryFilter::default() };
+            let ReplyBody::History { entries, .. } = client.call(Command::History { filter })?.map_err(io::Error::other)? else {
+                return Err(io::Error::other("unexpected answer"));
+            };
+            let mut found = None;
+            for entry in entries {
+                let (text, failed, _) = explained(&mut client, entry.request_id)?;
+                if failed {
+                    found = Some(text);
+                    break;
+                }
+            }
+            found.ok_or_else(|| io::Error::other("nothing in the last 500 requests went wrong; name one: tracer explain <ID>"))?
+        }
+        _ => return Err(io::Error::other(USAGE)),
+    };
+    print!("{text}");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn import(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {

@@ -181,6 +181,11 @@ pub enum Command {
     /// A request read from a pasted `curl` command or `fetch(…)` call.
     /// Nothing is saved or sent.
     Import { text: String },
+    /// Past request `request_id` as Markdown that explains how it went:
+    /// the request as written, its environment (secrets named only), the
+    /// answer and its timing, the checks, the workspace's browser
+    /// behaviour, and the last time the same request worked.
+    Explain { request_id: u64 },
     /// Empty the jar, or only `domain`'s cookies (and its subdomains').
     /// A person's to do. Published as `cookies_changed`.
     ClearCookies {
@@ -1253,6 +1258,9 @@ pub enum ReplyBody {
     Cookies { browser: Browser, cookies: Vec<CookieSeen> },
     CookiesCleared { removed: u64 },
     Exported { text: String },
+    /// `failed`: it went wrong (no answer, an error status, a failed
+    /// check, cancelled, or not allowed); `summary` says how in a line.
+    Explained { text: String, failed: bool, summary: String },
     /// The request read, the same as a `.http` file's text, and what of
     /// the command wasn't carried over.
     Imported {

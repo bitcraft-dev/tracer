@@ -371,6 +371,13 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             };
             Ok(json!({ "as": lang.name(), "code": text }))
         }
+        "explain_request" => {
+            let request_id = args.get("request_id").and_then(Value::as_u64).ok_or("`request_id` is required")?;
+            let ReplyBody::Explained { text, failed, summary } = call(core, Command::Explain { request_id })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "failed": failed, "summary": summary, "markdown": text }))
+        }
         "import_request" => {
             let text = str_arg(args, "text").ok_or("`text` (a curl command or a fetch call) is required")?.to_string();
             let ReplyBody::Imported { request, http, notes } = call(core, Command::Import { text })? else {
@@ -1407,6 +1414,16 @@ fn tools() -> Value {
                     "as": { "type": "string", "enum": ["curl", "fetch", "python", "rux"] },
                     "env": { "type": "string", "description": "The environment to fill variables from." },
                 },
+            },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "explain_request",
+            "description": "Everything about one past request that helps say why it went as it did, as Markdown: the request as written, its environment's variables (secrets named only), the answer with its timing phases and body (cut at 8 KiB), the checks, the workspace's browser behaviour, and the last time the same method and URL answered without an error (with the request numbers to diff_responses). `failed` and `summary` say whether and how it went wrong.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "request_id": { "type": "integer", "description": "A past request's number." } },
+                "required": ["request_id"],
             },
             "annotations": { "readOnlyHint": true },
         },

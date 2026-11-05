@@ -201,6 +201,7 @@
                             <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
                             <text class="res-url">{{ sel.url }}</text>
                             <view class="link" @tap="openCopy(&quot;sel&quot;)"><text class="link-t">Copy as…</text></view>
+                            <view class="link" r-if="sel.state != &quot;running&quot;" @tap="copyExplain()"><text class="link-t">Explain</text></view>
                             <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
                             <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
                         </view>
@@ -1667,6 +1668,7 @@
     { id: "curl-editor", label: "Copy the request being edited as cURL", hint: "" },
     { id: "copy-sel", label: "Copy the request on show as code (cURL, fetch, Python, Rux)", hint: "" },
     { id: "copy-editor", label: "Copy the request being edited as code (cURL, fetch, Python, Rux)", hint: "" },
+    { id: "explain", label: "Copy the request on show, explained, for a person or an AI", hint: "" },
     { id: "paste", label: "Paste a curl command or fetch call as a new request", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
@@ -2558,6 +2560,18 @@
     }
   }
 
+  // Everything about the request on show that helps say why it went as
+  // it did, as Markdown on the clipboard, to paste to a person or an AI.
+  fn copyExplain() {
+    if sel == none { return; }
+    try {
+      clipboard.writeText(tracer.explain(sel.id));
+      notice = `copied #${sel.id} explained, as Markdown; secret values are left out`;
+    } catch e {
+      notice = `could not explain: ${e.message}`;
+    }
+  }
+
   fn copySelCurl() {
     if sel == none { return; }
     copyWhich = "sel";
@@ -3375,6 +3389,8 @@
       openCopy("sel");
     } else if id == "copy-editor" {
       openCopy("editor");
+    } else if id == "explain" {
+      copyExplain();
     } else if id == "paste" {
       pasteRequest();
     } else if id == "edit-past" {

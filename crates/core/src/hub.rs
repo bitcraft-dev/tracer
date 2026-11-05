@@ -637,6 +637,19 @@ impl Hub {
         Some((entry, response, checks.unwrap_or_default()))
     }
 
+    /// The last request before `request_id` with the same method and URL
+    /// (as written) that answered below 400 with no check failed.
+    pub fn last_good_before(&self, request_id: u64, method: &str, url: &str) -> Option<HistoryEntry> {
+        let inner = self.inner.lock().unwrap();
+        entries(&inner.events).into_iter().rev().find(|e| {
+            e.request_id < request_id
+                && e.request.method.eq_ignore_ascii_case(method)
+                && e.request.url == url
+                && matches!(e.ended, Ended::Done { status, .. } if status < 400)
+                && e.checks.is_none_or(|(_, failed)| failed == 0)
+        })
+    }
+
     /// Publish that running request `request_id` stays open as a stream of
     /// `kind`, its head `response`. Gives where messages to send on it
     /// arrive; `None` if it was cancelled meanwhile.

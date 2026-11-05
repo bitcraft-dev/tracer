@@ -155,6 +155,7 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::Cookies
             | Command::Export { .. }
             | Command::Import { .. }
+            | Command::Explain { .. }
     );
     if reads {
         return None;

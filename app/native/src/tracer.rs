@@ -416,6 +416,17 @@ pub fn export_as(lang: String, method: String, url: String, headers: Vec<Header>
     }
 }
 
+/// Past request `request_id` as Markdown explaining how it went.
+#[rux::export]
+pub fn explain(request_id: u64) -> Result<String, CoreError> {
+    match shared()?.call(Command::Explain { request_id }) {
+        Ok(Ok(ReplyBody::Explained { text, .. })) => Ok(text),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// A request read from a pasted `curl` command or `fetch(…)` call.
 #[rux::export]
 #[derive(Clone)]

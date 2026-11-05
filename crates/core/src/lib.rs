@@ -19,6 +19,7 @@ mod cors;
 mod diff;
 mod envs;
 mod expect;
+mod explain;
 mod export;
 mod files;
 mod flows;

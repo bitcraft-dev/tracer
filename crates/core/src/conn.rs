@@ -17,7 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
-use crate::{export, files, import};
+use crate::{explain, export, files, import};
 use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
@@ -208,6 +208,24 @@ pub fn serve(
                 let env = env.map(|name| hub.environment_shown(&name)).transpose();
                 env.and_then(|env| export::export(&request, env.as_ref(), lang, &hub.browser())).map(|text| ReplyBody::Exported { text })
             }
+            (Some(_), Command::Explain { request_id }) => match hub.response(request_id) {
+                None => Err(format!("there is no request #{request_id}")),
+                Some((entry, response, checks)) => {
+                    let env = entry.env.as_deref().and_then(|name| hub.environment_shown(name).ok());
+                    let last_good = hub.last_good_before(request_id, &entry.request.method, &entry.request.url);
+                    let browser = hub.browser();
+                    let case = explain::Case {
+                        entry: &entry,
+                        response: response.as_ref(),
+                        checks: &checks,
+                        env: env.as_ref(),
+                        browser: &browser,
+                        last_good: last_good.as_ref(),
+                    };
+                    let (failed, summary) = explain::verdict(&entry, &checks);
+                    Ok(ReplyBody::Explained { text: explain::bundle(&case), failed, summary })
+                }
+            },
             (Some(_), Command::Import { text }) => import::import(&text).map(|(request, notes)| ReplyBody::Imported { http: files::to_text(&request), request, notes }),
             (Some((_, actor)), Command::Cookies) => {
                 let (browser, cookies) = hub.cookies(actor.kind != ClientKind::Agent);
