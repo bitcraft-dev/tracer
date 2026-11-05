@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
-    BenchPlan, ClientKind, Command, Direction, Ended, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
+    BenchPlan, ClientKind, Command, Direction, ExportLang, Ended, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, Event, EventKind, HistoryEntry, HistoryFilter, HttpRequest, HttpResponse, ReplyBody,
     StatusClass, StreamItem, StreamKind, StreamMessage, UntilPlan, WEBSOCKET,
 };
 
@@ -339,6 +339,52 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
                 return Err(unexpected());
             };
             Ok(json!({ "path": path, "file": format!("requests/{path}.http") }))
+        }
+        "export_request" => {
+            let lang = match str_arg(args, "as") {
+                Some(name) => ExportLang::parse(name).ok_or_else(|| format!("`{name}`: export as curl, fetch, python or rux"))?,
+                None => ExportLang::Curl,
+            };
+            let env = str_arg(args, "env").filter(|e| !e.is_empty()).map(String::from);
+            let (request, env) = match (str_arg(args, "path"), args.get("request_id").and_then(Value::as_u64)) {
+                (Some(path), None) => {
+                    let wanted = path.trim().trim_start_matches("requests/").trim_end_matches(".http");
+                    let ReplyBody::Requests { requests, .. } = call(core, Command::ListRequests)? else {
+                        return Err(unexpected());
+                    };
+                    let found = requests
+                        .into_iter()
+                        .find(|r| r.path == wanted)
+                        .ok_or_else(|| format!("there is no saved request `{wanted}`; list_requests lists them"))?;
+                    (found.request, env)
+                }
+                (None, Some(request_id)) => {
+                    let ReplyBody::Response { entry, .. } = call(core, Command::Response { request_id })? else {
+                        return Err(unexpected());
+                    };
+                    (entry.request, env.or(entry.env))
+                }
+                _ => return Err("give `path` (a saved request) or `request_id` (a past one), not both".into()),
+            };
+            let ReplyBody::Exported { text } = call(core, Command::Export { request, env, lang })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "as": lang.name(), "code": text }))
+        }
+        "import_request" => {
+            let text = str_arg(args, "text").ok_or("`text` (a curl command or a fetch call) is required")?.to_string();
+            let ReplyBody::Imported { request, http, notes } = call(core, Command::Import { text })? else {
+                return Err(unexpected());
+            };
+            let mut out = json!({ "method": request.method, "url": request.url, "http": http, "notes": notes });
+            if let Some(path) = str_arg(args, "save_path").filter(|p| !p.trim().is_empty()) {
+                let path = path.trim().trim_start_matches("requests/").trim_end_matches(".http").to_string();
+                let ReplyBody::Saved { path } = call(core, Command::SaveRequest { path, request })? else {
+                    return Err(unexpected());
+                };
+                out["saved"] = json!(format!("requests/{path}.http"));
+            }
+            Ok(out)
         }
         "diff_responses" => {
             let id = |name: &str| {
@@ -1349,6 +1395,32 @@ fn tools() -> Value {
                 "required": ["a", "b"],
             },
             "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "export_request",
+            "description": "A saved request (`path`) or a past one (`request_id`) as code that sends it: `as` curl (default), fetch (JavaScript), python (requests), or rux (a Rux app's native Rust export with ureq, and the page's call: Rux script has no HTTP of its own). Variables are filled from `env` (a past request's own by default); secrets stay {{name}}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A saved request's path, as list_requests gives it." },
+                    "request_id": { "type": "integer", "description": "A past request's number." },
+                    "as": { "type": "string", "enum": ["curl", "fetch", "python", "rux"] },
+                    "env": { "type": "string", "description": "The environment to fill variables from." },
+                },
+            },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "import_request",
+            "description": "Read a request from a curl command (bash or Windows cmd quoting, as a browser's Copy as cURL gives it) or a JavaScript fetch(…) call. Gives its method, URL and .http text, with `notes` on anything not carried over (multipart forms, files, --insecure). Nothing is sent; with `save_path` it's saved as a request.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The curl command or fetch call." },
+                    "save_path": { "type": "string", "description": "Save it here (such as users/create), as save_request would." },
+                },
+                "required": ["text"],
+            },
         },
         {
             "name": "read_policy",

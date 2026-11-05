@@ -197,7 +197,7 @@
                             <text class="res-id">#{{ sel.id }}</text>
                             <text class="m" :style="`color: ${methodColor(sel.method)}`">{{ sel.method }}</text>
                             <text class="res-url">{{ sel.url }}</text>
-                            <view class="link" @tap="copySelCurl()"><text class="link-t">cURL</text></view>
+                            <view class="link" @tap="openCopy(&quot;sel&quot;)"><text class="link-t">Copy as…</text></view>
                             <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
                             <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
                         </view>
@@ -438,6 +438,17 @@
                 <text class="agents-t">{{ if agentsOn { "agents on" } else { "agents off" } }}</text>
             </view>
             <text class="status-t key">Ctrl+K</text>
+        </view>
+
+        <view class="scrim" r-if="copyOpen" @tap="copyOpen = false">
+        <view class="palette" @tap="noop()">
+            <text class="prompt-h">Copy {{ if copyWhich == "sel" { "the request on show" } else { "the request being edited" } }} as</text>
+            <text class="sub">Variables filled from its environment; secrets stay {{ "{{name}}" }} for whoever runs it.</text>
+            <view class="cmd" r-for="l in copyLangs" r-key="l.id" @tap="copyAs(l.id)">
+                <text class="cmd-label">{{ l.label }}</text>
+                <text class="cmd-hint">{{ l.hint }}</text>
+            </view>
+        </view>
         </view>
 
         <view class="scrim" r-if="browserOpen" @tap="browserOpen = false">
@@ -1647,6 +1658,9 @@
     { id: "rest", label: "Make the request REST", hint: "" },
     { id: "schema", label: "Load the GraphQL server's schema", hint: "" },
     { id: "curl-editor", label: "Copy the request being edited as cURL", hint: "" },
+    { id: "copy-sel", label: "Copy the request on show as code (cURL, fetch, Python, Rux)", hint: "" },
+    { id: "copy-editor", label: "Copy the request being edited as code (cURL, fetch, Python, Rux)", hint: "" },
+    { id: "paste", label: "Paste a curl command or fetch call as a new request", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
     { id: "refuse", label: "Refuse the agent's request on show", hint: "" },
@@ -2481,54 +2495,79 @@
     out
   }
 
-  // A shell command that sends the request, its variables filled in from
-  // `envName`; secrets stay `{{name}}` for whoever runs it to fill.
-  fn curlOf(m: string, u: string, headers: Header[], b: string, envName: string): string {
-    if m == "GRAPHQL" { return gqlCurl(u, headers, b, envName); }
-    let parts = ["curl"];
-    if m != "GET" { parts.push(`-X ${m}`); }
-    parts.push(shellQuote(fillIn(u.trim(), envName, "")));
-    for h in headers {
-      parts.push(`-H ${shellQuote(fillIn(`${h.name}: ${h.value}`, envName, ""))}`);
+  // What the core can write a request as, for the Copy as menu.
+  let copyLangs = [
+    { id: "curl", label: "cURL", hint: "a shell command" },
+    { id: "fetch", label: "fetch", hint: "JavaScript" },
+    { id: "python", label: "Python", hint: "with requests" },
+    { id: "rux", label: "Rux", hint: "a native export and the page's call: Rux script has no HTTP of its own" }
+  ];
+  let copyOpen = signal(false);
+  // "sel", the request on show, or "editor", the one being edited.
+  let copyWhich = signal("sel");
+
+  fn openCopy(which: string) {
+    if which == "sel" && sel == none { return; }
+    copyWhich = which;
+    copyOpen = true;
+  }
+
+  // The request chosen, as code in `lang`, onto the clipboard. Variables
+  // are filled from its environment; secrets stay `{{name}}`.
+  fn copyAs(lang: string) {
+    try {
+      let text = "";
+      if copyWhich == "editor" {
+        text = tracer.exportAs(lang, method, url, sentHeaders(), body, if envPick == NO_ENV { "" } else { envPick });
+      } else if sel != none {
+        // A past request's environment, if it's still there.
+        let envName = if envs.some(e => e.name == sel.env) { sel.env } else { "" };
+        text = tracer.exportAs(lang, sel.method, sel.url, sel.reqHeaders, sel.reqBody, envName);
+      }
+      if text == "" { return; }
+      clipboard.writeText(text);
+      let name = copyLangs.find(l => l.id == lang)?.label ?? lang;
+      notice = if text.includes("{{") { `copied as ${name}; fill in the {{secrets}} it still names` } else { `copied as ${name}` };
+      copyOpen = false;
+    } catch e {
+      notice = `could not copy: ${e.message}`;
     }
-    if b != "" { parts.push(`--data-raw ${shellQuote(fillIn(b, envName, ""))}`); }
-    parts.join(" ")
-  }
-
-  // A GraphQL request as the JSON POST the core sends.
-  fn gqlCurl(u: string, headers: Header[], b: string, envName: string): string {
-    let p = gqlParts(b);
-    let payload = if p[1] == "" {
-      JSON.stringify({ query: p[0] })
-    } else {
-      `{"query":${JSON.stringify(p[0])},"variables":${p[1]}}`
-    };
-    let all = if headers.some(h => h.name.toLowerCase() == "content-type") {
-      headers
-    } else {
-      [...headers, { name: "Content-Type", value: "application/json" }]
-    };
-    curlOf("POST", u, all, payload, envName)
-  }
-
-  // In single quotes for a POSIX shell: each ' becomes '"'"'.
-  fn shellQuote(s: string): string {
-    let q = "'";
-    q + s.replaceAll(q, q + "\"" + q + "\"" + q) + q
-  }
-
-  fn copyCurl(text: string) {
-    clipboard.writeText(text);
-    notice = if text.includes("{{") { "copied as cURL; fill in the {{secrets}} it still names" } else { "copied as cURL" };
   }
 
   fn copySelCurl() {
     if sel == none { return; }
-    copyCurl(curlOf(sel.method, sel.url, sel.reqHeaders, sel.reqBody, sel.env));
+    copyWhich = "sel";
+    copyAs("curl");
   }
 
   fn copyEditorCurl() {
-    copyCurl(curlOf(method, url, sentHeaders(), body, if envPick == NO_ENV { "" } else { envPick }));
+    copyWhich = "editor";
+    copyAs("curl");
+  }
+
+  // A curl command or fetch(…) call from the clipboard, into the editor,
+  // unsaved; what it couldn't carry over goes in the notice.
+  async fn pasteRequest() {
+    if !guardEdits("paste") { return; }
+    try {
+      let text = await clipboard.readText();
+      if text.trim() == "" {
+        notice = "the clipboard holds no text: copy a curl command or a fetch(…) call first";
+        return;
+      }
+      let r = tracer.importText(text);
+      openPath = "";
+      method = r.method;
+      url = r.url;
+      body = r.body;
+      otherBody = "";
+      headerText = headerLines(r.headers);
+      checksText = "";
+      afterLoad();
+      notice = if r.notes.length == 0 { "pasted; Save keeps it" } else { `pasted; ${r.notes.join("; ")}` };
+    } catch e {
+      notice = `could not paste: ${e.message}`;
+    }
   }
 
   // When a request was sent: the time, and the day too if not today.
@@ -3308,6 +3347,12 @@
       mode = "rest";
     } else if id == "curl-editor" {
       copyEditorCurl();
+    } else if id == "copy-sel" {
+      openCopy("sel");
+    } else if id == "copy-editor" {
+      openCopy("editor");
+    } else if id == "paste" {
+      pasteRequest();
     } else if id == "edit-past" {
       editPast();
     } else if id == "clear-filter" {

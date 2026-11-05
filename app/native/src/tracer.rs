@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use tracer_protocol::client::{Client, Incoming, Shared};
 use tracer_protocol::{
-    BenchPlan, BenchStats, ClientKind, Command, Direction, Environment, Event, EventKind, HttpRequest, ReplyBody, SavedRequest,
+    BenchPlan, BenchStats, ClientKind, Command, Direction, Environment, Event, EventKind, ExportLang, HttpRequest, ReplyBody, SavedRequest,
     StepOutcome, StreamKind, UntilPlan, Browser, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION,
 };
 
@@ -394,6 +394,50 @@ pub fn send(method: String, url: String, headers: Vec<Header>, body: String, env
     let env = if env.is_empty() { None } else { Some(env) };
     match shared()?.call(Command::Send { request, env }) {
         Ok(Ok(ReplyBody::Accepted { request_id })) => Ok(request_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// A request (as written) as code that sends it, in `lang` (`curl`,
+/// `fetch`, `python` or `rux`), its variables filled from `env` ("" for
+/// none); secrets stay `{{name}}`.
+#[rux::export]
+pub fn export_as(lang: String, method: String, url: String, headers: Vec<Header>, body: String, env: String) -> Result<String, CoreError> {
+    let lang = ExportLang::parse(&lang).ok_or_else(|| CoreError(format!("`{lang}`: export as curl, fetch, python or rux")))?;
+    let request = request_of(method, url, headers, body, String::new());
+    let env = if env.is_empty() { None } else { Some(env) };
+    match shared()?.call(Command::Export { request, env, lang }) {
+        Ok(Ok(ReplyBody::Exported { text })) => Ok(text),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// A request read from a pasted `curl` command or `fetch(…)` call.
+#[rux::export]
+#[derive(Clone)]
+pub struct Imported {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<Header>,
+    pub body: String,
+    /// What of the command wasn't carried over.
+    pub notes: Vec<String>,
+}
+
+#[rux::export]
+pub fn import_text(text: String) -> Result<Imported, CoreError> {
+    match shared()?.call(Command::Import { text }) {
+        Ok(Ok(ReplyBody::Imported { request, notes, .. })) => Ok(Imported {
+            method: request.method,
+            url: request.url,
+            headers: headers_of(request.headers),
+            body: request.body.unwrap_or_default(),
+            notes,
+        }),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),

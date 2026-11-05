@@ -170,6 +170,17 @@ pub enum Command {
     /// The browser behaviour and the cookies in the jar. Values are given
     /// to a person, never to an agent.
     Cookies,
+    /// `request` (as written) as code that sends it, its variables filled
+    /// from `env`; secrets stay `{{name}}`, so none leaves this way.
+    Export {
+        request: HttpRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+        lang: ExportLang,
+    },
+    /// A request read from a pasted `curl` command or `fetch(…)` call.
+    /// Nothing is saved or sent.
+    Import { text: String },
     /// Empty the jar, or only `domain`'s cookies (and its subdomains').
     /// A person's to do. Published as `cookies_changed`.
     ClearCookies {
@@ -443,6 +454,38 @@ impl BenchPlan {
         }
         out.push_str(&format!(", {} at a time", self.concurrency));
         out
+    }
+}
+
+/// What [`Command::Export`] writes a request as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportLang {
+    /// A POSIX shell's `curl` command.
+    Curl,
+    /// JavaScript's `fetch`.
+    Fetch,
+    /// Python with `requests`.
+    Python,
+    /// A Rux app's native export (Rust, with `ureq`) and the page's call:
+    /// Rux script has no HTTP of its own.
+    Rux,
+}
+
+impl ExportLang {
+    pub const ALL: [ExportLang; 4] = [ExportLang::Curl, ExportLang::Fetch, ExportLang::Python, ExportLang::Rux];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ExportLang::Curl => "curl",
+            ExportLang::Fetch => "fetch",
+            ExportLang::Python => "python",
+            ExportLang::Rux => "rux",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<ExportLang> {
+        Self::ALL.into_iter().find(|l| l.name().eq_ignore_ascii_case(name.trim()) || (l == &ExportLang::Fetch && name.eq_ignore_ascii_case("js")))
     }
 }
 
@@ -1209,6 +1252,15 @@ pub enum ReplyBody {
     BrowserSet,
     Cookies { browser: Browser, cookies: Vec<CookieSeen> },
     CookiesCleared { removed: u64 },
+    Exported { text: String },
+    /// The request read, the same as a `.http` file's text, and what of
+    /// the command wasn't carried over.
+    Imported {
+        request: HttpRequest,
+        http: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
+    },
     BaselineSaved { name: String, path: String },
     Baselines { baselines: Vec<Baseline>, skipped: Vec<String> },
     BenchCompared { comparison: BenchComparison },

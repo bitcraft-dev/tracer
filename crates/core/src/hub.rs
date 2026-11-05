@@ -902,6 +902,13 @@ impl Hub {
         (environments, inner.next_seq, skipped)
     }
 
+    /// The environment `name` as clients see it: its variables, and its
+    /// secrets by name only.
+    pub fn environment_shown(&self, name: &str) -> Result<Environment, String> {
+        let _inner = self.inner.lock().unwrap();
+        envs::read(&self.root, name)
+    }
+
     /// The environment `name` with its secrets filled in, for sending, and
     /// the secrets alone, for redacting what comes back. Never for a client.
     pub fn environment_for_sending(&self, name: &str) -> Result<(Environment, Vec<(String, String)>), String> {

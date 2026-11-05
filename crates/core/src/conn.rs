@@ -17,6 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
+use crate::{export, files, import};
 use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
@@ -203,6 +204,11 @@ pub fn serve(
                     }
                 }
             }
+            (Some(_), Command::Export { request, env, lang }) => {
+                let env = env.map(|name| hub.environment_shown(&name)).transpose();
+                env.and_then(|env| export::export(&request, env.as_ref(), lang, &hub.browser())).map(|text| ReplyBody::Exported { text })
+            }
+            (Some(_), Command::Import { text }) => import::import(&text).map(|(request, notes)| ReplyBody::Imported { http: files::to_text(&request), request, notes }),
             (Some((_, actor)), Command::Cookies) => {
                 let (browser, cookies) = hub.cookies(actor.kind != ClientKind::Agent);
                 Ok(ReplyBody::Cookies { browser, cookies })

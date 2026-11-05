@@ -153,6 +153,8 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::CompareBench { .. }
             | Command::Status
             | Command::Cookies
+            | Command::Export { .. }
+            | Command::Import { .. }
     );
     if reads {
         return None;

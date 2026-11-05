@@ -29,13 +29,13 @@
 mod mcp;
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tracer_protocol::client::Client;
 use tracer_protocol::{
-    Access, AgentRules, ApproveWhen, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
+    Access, AgentRules, ApproveWhen, ExportLang, BodyDiff, Change, ChangeKind, ClientKind, LineOp, Command, Ended, Event, EventKind, HistoryFilter, HttpRequest, ReplyBody,
     BenchComparison, BenchPlan, BenchStats, Direction, Discovery, FlowStep, BENCH_BUCKETS_MS, GRAPHQL_INTROSPECTION, SavedRequest, StatusClass, StepOutcome, StreamKind,
     Timing, UntilPlan, DISCOVERY_PATH, WEBSOCKET,
 };
@@ -119,6 +119,15 @@ usage:
                                       `tracer send GRAPHQL <URL> -d '<query>'`
                                       sends a query, its variables JSON after a
                                       blank line
+  tracer export <PATH|#ID> [--as curl|fetch|python|rux] [--env <NAME>]
+                                      a saved or past request as code that sends
+                                      it (curl by default), variables filled from
+                                      the env (a past one's own unless given);
+                                      secrets stay {{name}}
+  tracer import [FILE] [--save <PATH>]
+                                      a request from a curl command or a fetch(…)
+                                      call (FILE, or stdin), printed as a .http
+                                      file, or saved at PATH
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -172,6 +181,8 @@ fn main() -> ExitCode {
         Some("cookies") => cookies(workspace, args[1..].to_vec()),
         Some("schema") => schema(workspace, args[1..].to_vec()),
         Some("rm") => rm(workspace, args[1..].to_vec()),
+        Some("export") => export(workspace, args[1..].to_vec()),
+        Some("import") => import(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
@@ -1356,6 +1367,72 @@ fn rm(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
         Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => Err(io::Error::other(e)),
     }
+}
+
+fn export(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let lang = match take_value(&mut args, "--as") {
+        Some(name) => ExportLang::parse(&name).ok_or_else(|| io::Error::other(format!("`{name}`: export as curl, fetch, python or rux")))?,
+        None => ExportLang::Curl,
+    };
+    let env = take_value(&mut args, "--env");
+    let [target] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer export")?;
+    // A past request by its number, with its own env; or a saved one.
+    let (request, env) = match target.trim_start_matches('#').parse::<u64>() {
+        Ok(request_id) => match client.call(Command::Response { request_id })? {
+            Ok(ReplyBody::Response { entry, .. }) => (entry.request, env.or(entry.env)),
+            Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+            Err(e) => return Err(io::Error::other(e)),
+        },
+        Err(_) => {
+            let wanted = target.trim_start_matches("requests/").trim_end_matches(".http").to_string();
+            let (requests, _) = saved(&workspace, "tracer export")?;
+            let found = requests
+                .into_iter()
+                .find(|r| r.path == wanted)
+                .ok_or_else(|| io::Error::other(format!("`{wanted}` is neither a request's number nor a saved request")))?;
+            (found.request, env)
+        }
+    };
+    match client.call(Command::Export { request, env, lang })? {
+        Ok(ReplyBody::Exported { text }) => {
+            println!("{}", text.trim_end());
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+fn import(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let save = take_value(&mut args, "--save");
+    let text = match args.as_slice() {
+        [] => {
+            let mut text = String::new();
+            io::stdin().read_to_string(&mut text)?;
+            text
+        }
+        [file] => std::fs::read_to_string(file)?,
+        _ => return Err(io::Error::other(USAGE)),
+    };
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer import")?;
+    let (request, notes, http) = match client.call(Command::Import { text })? {
+        Ok(ReplyBody::Imported { request, notes, http }) => (request, notes, http),
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    for note in &notes {
+        eprintln!("note: {note}");
+    }
+    match save {
+        Some(path) => {
+            let path = path.trim_start_matches("requests/").trim_end_matches(".http").to_string();
+            client.call(Command::SaveRequest { path: path.clone(), request: request.clone() })?.map_err(io::Error::other)?;
+            eprintln!("saved requests/{path}.http: {} {}", request.method, request.url);
+        }
+        None => print!("{http}"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn saved(workspace: &PathBuf, name: &str) -> io::Result<(Vec<SavedRequest>, Vec<String>)> {
