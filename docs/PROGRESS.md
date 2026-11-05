@@ -18,8 +18,8 @@ Later the same day the user said: **leave Phase 5's chat until near
 release**, and build the S and M items (Next, items 2 and 7) first.
 Done so far, each driven in the window: the TLS switch (bc2ff7e),
 export/import (1571661), re-run on file change (cf3a26d), explain
-(3271f47), finding local servers (17aba45). Next: data-driven runs and
-the mock server (M), then item 2's follow-ups. Scratch setup for driving
+(3271f47), finding local servers (17aba45), data-driven flows (ee28163),
+the mock server (d363488). Next: item 2's follow-ups (S-M), then themes. Scratch setup for driving
 (scratchpad): `tls/server.py` (self-signed HTTPS on 18443, `/hop`
 redirects to 127.0.0.1), `www/` served on 18765 with an `openapi.json`,
 workspace `ws/` (localhost and *.dev.test trusted unchecked).
@@ -654,6 +654,27 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   URLs use the address that answered: `localhost` costs 2 s here (::1
   first). CLI `tracer servers`, MCP `local_servers`, window palette
   **Find servers running on this machine**.
+- **Data-driven flows** (ee28163). `data.rs` reads a CSV (header line,
+  RFC 4180) or a JSON array of objects inside the workspace; `RunFlow
+  { data }` runs the folder once per row, the row's columns as starting
+  variables (captures reset per row; a failure skips only its row).
+  `FlowStep.row`, `FlowStarted { data, rows }`. CLI `tracer run DIR
+  --data FILE` (progress lines now name each request as written: a
+  skipped step starts none, so names by order were wrong), MCP
+  `run_flow data`, window palette **Run the open request's folder once
+  per row…** with a file prompt; status bar `flow N passed (2 rows)`.
+  Variables go into URLs as written, not encoded (a value with a space
+  fails "invalid uri character"). Also: `status 200` now reads as
+  `status == 200`; status-bar chips are `flex-shrink: 0`.
+- **Mock server** (d363488). `mock.rs`: a folder's saved requests as
+  routes on 127.0.0.1 (path after scheme+host or a leading `{{var}}`;
+  `{{var}}` pieces match 1+ chars inside a segment; most literal text
+  wins), each answering with its last real answer (last < 400 first,
+  `hub.last_answer`), 501 with none yet, 404 listing routes; CORS open
+  and OPTIONS answered; looked up per hit; `mock_hit` events. CLI
+  `tracer mock DIR [--port]` / `tracer mock stop ID`, MCP `create_mock`
+  / `stop_mock`, window palette **Mock the open request's folder** and a
+  chip (`mock :PORT · N hits · last … · stop`).
 
 ### Next
 
@@ -704,9 +725,9 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 6. Small: the Bench panel's baseline name field is drawn taller than
    its row (seen 2026-11-04, not looked into).
 7. **Not built yet from PLAN.md** (checked 2026-11-05 against the code):
-   a mock server from a collection or spec (and MCP `create_mock`);
-   data-driven runs from CSV/JSON; OpenAPI import, response validation
-   and drift detection; gRPC (a stretch); themes; undo in the editor. Phase 5's chat waits for release time (the user's call,
+   a mock from an OpenAPI spec (the collection mock is done); OpenAPI
+   import, response validation and drift detection; gRPC (a stretch);
+   themes; undo in the editor. Phase 5's chat waits for release time (the user's call,
    2026-11-05).
 
 ## Gotchas and how they were solved
