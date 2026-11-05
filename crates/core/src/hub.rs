@@ -234,6 +234,15 @@ impl Hub {
                 _ => {}
             }
         }
+        // Mocks a previous core was serving: its listener went with it.
+        let mut open_mocks: Vec<(u64, Actor)> = Vec::new();
+        for e in &events {
+            match &e.kind {
+                EventKind::MockStarted { mock_id, .. } => open_mocks.push((*mock_id, e.actor.clone())),
+                EventKind::MockStopped { mock_id } => open_mocks.retain(|(id, _)| id != mock_id),
+                _ => {}
+            }
+        }
         // The kill switch outlives the core: as a person last left it.
         let agents_allowed = events
             .iter()
@@ -310,6 +319,9 @@ impl Hub {
             for (bench_id, actor, stats) in open_benches {
                 let stopped = Some("the core stopped before it finished".to_string());
                 publish_locked(&mut inner, actor, EventKind::BenchFinished { bench_id, stats, stopped });
+            }
+            for (mock_id, actor) in open_mocks {
+                publish_locked(&mut inner, actor, EventKind::MockStopped { mock_id });
             }
             for (until_id, actor, sent, streak) in open_untils {
                 let stopped = Some("the core stopped before it finished".to_string());

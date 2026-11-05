@@ -2207,3 +2207,28 @@ fn a_bench_notices_rate_limiting_and_a_baseline_catches_the_regression() {
     assert!(cli.call(Command::SaveBaseline { bench_id: good, name: "../x".into() }).unwrap().is_err());
     core.stop();
 }
+
+#[test]
+fn a_mock_a_stopped_core_was_serving_is_closed_by_the_next() {
+    let ws = workspace("dead-mock");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut a = Client::connect(&ws, ClientKind::Cli, "first").unwrap();
+    let request = HttpRequest { method: "GET".into(), url: "{{base}}/items".into(), ..Default::default() };
+    a.call(Command::SaveRequest { path: "shop/items".into(), request }).unwrap().unwrap();
+    let Ok(ReplyBody::MockStarted { mock_id, .. }) = a.call(Command::StartMock { path: "shop".into(), port: None }).unwrap() else { panic!() };
+    drop(a);
+    core.stop();
+
+    let core = tracer_core::start(&ws).unwrap();
+    let mut b = Client::connect(&ws, ClientKind::Cli, "second").unwrap();
+    let Ok(ReplyBody::Status { next_seq, .. }) = b.call(Command::Status).unwrap() else { panic!() };
+    b.call(Command::Subscribe { since: Some(0) }).unwrap().unwrap();
+    let mut closed = false;
+    for _ in 1..next_seq {
+        if matches!(b.next_event().unwrap().kind, EventKind::MockStopped { mock_id: m } if m == mock_id) {
+            closed = true;
+        }
+    }
+    assert!(closed, "mock {mock_id} still looks served after a restart");
+    core.stop();
+}
