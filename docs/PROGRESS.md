@@ -10,7 +10,7 @@ file is about working on Tracer.
 The user is taking the open findings to the Rux team, and asked for the
 housekeeping and the small Tracer items meanwhile. Both branches pushed
 (e58c6d0), then done and driven: a dead core's mock closed by the next
-(e19a6c0's parent), journal write failures said (ada24b6), tokens and
+(588cb02), journal write failures said (ada24b6), tokens and
 WebSocket keys from the OS's randomness (d766e99), connections limited, a
 hello deadline and slow clients let go (4bb7889, fixed in 40245e5: see the
 gotchas), a relative `rux-native` path (40245e5), and the Bench baseline
