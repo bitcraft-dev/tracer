@@ -19,7 +19,14 @@ release**, and build the S and M items (Next, items 2 and 7) first.
 Done so far, each driven in the window: the TLS switch (bc2ff7e),
 export/import (1571661), re-run on file change (cf3a26d), explain
 (3271f47), finding local servers (17aba45), data-driven flows (ee28163),
-the mock server (d363488). Next: item 2's follow-ups (S-M), then themes. Scratch setup for driving
+the mock server (d363488), CLI send on an open WebSocket and transcripts
+(0bace2c), event-stream reconnect (38dbff7). **master was fast-forwarded
+to phase-1-core and pushed** (the user asked, 2026-11-05: it had been at
+Phase 0); keep both pushed together. Next: the rest of item 2 (GraphQL
+subscriptions, comparing a flow's steps in a bench, MCP over local HTTP,
+per-environment jar, a response's Cookies tab), then themes. The
+window's Transcript link isn't driven yet. A local WebSocket echo server
+is `ws_echo.py` (port 18791) in the scratchpad. Scratch setup for driving
 (scratchpad): `tls/server.py` (self-signed HTTPS on 18443, `/hop`
 redirects to 127.0.0.1), `www/` served on 18765 with an `openapi.json`,
 workspace `ws/` (localhost and *.dev.test trusted unchecked).
@@ -675,6 +682,12 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   `tracer mock DIR [--port]` / `tracer mock stop ID`, MCP `create_mock`
   / `stop_mock`, window palette **Mock the open request's folder** and a
   chip (`mock :PORT · N hits · last … · stop`).
+- **Streams** (0bace2c, 38dbff7). `tracer ws send ID MSG`; `Command::
+  Transcript` (`transcript.rs`, Markdown both ways), `tracer ws
+  transcript ID`, MCP `stream_transcript`, window **Transcript** link.
+  An event stream whose server sent `retry:` reconnects with
+  `Last-Event-ID` inside the same stream (`Link.resume`), ending on 204,
+  a non-stream answer, 5 failures in a row, or a close.
 
 ### Next
 
@@ -711,9 +724,7 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    move those into rows/ one at a time, then write the finding. Also seen: in
    `rows/`, a row whose fold text is "" is ~3 px taller than one with ▾.
 2. Realtime follow-ups, untried: GraphQL subscriptions (graphql-ws over a
-   WebSocket); a `tracer` command to send on someone else's open
-   WebSocket (MCP and the window can); saving a WebSocket's messages as a
-   transcript; reconnecting SSE with `Last-Event-ID`. GraphQL follow-ups:
+   WebSocket). GraphQL follow-ups:
    a schema-aware query editor (needs the viewer's line work).
    Benchmarking follow-up: comparing a flow's steps.
 4. MCP over local HTTP (the plan's "stdio or local HTTP"), if a client
