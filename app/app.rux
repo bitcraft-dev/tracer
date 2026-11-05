@@ -202,6 +202,7 @@
                             <text class="res-url">{{ sel.url }}</text>
                             <view class="link" @tap="openCopy(&quot;sel&quot;)"><text class="link-t">Copy as…</text></view>
                             <view class="link" r-if="sel.state != &quot;running&quot;" @tap="copyExplain()"><text class="link-t">Explain</text></view>
+                            <view class="link" r-if="sel.stream != &quot;&quot;" @tap="copyTranscript()"><text class="link-t">Transcript</text></view>
                             <view class="link" @tap="editPast()"><text class="link-t">Edit</text></view>
                             <view class="link" r-if="sel.state != &quot;running&quot;" @tap="rerun()"><text class="link-t">Re-run</text></view>
                         </view>
@@ -2640,6 +2641,17 @@
       notice = `copied #${sel.id} explained, as Markdown; secret values are left out`;
     } catch e {
       notice = `could not explain: ${e.message}`;
+    }
+  }
+
+  // The stream on show, its messages both ways, as Markdown on the clipboard.
+  fn copyTranscript() {
+    if sel == none { return; }
+    try {
+      clipboard.writeText(tracer.transcript(sel.id));
+      notice = `copied #${sel.id}'s transcript, as Markdown`;
+    } catch e {
+      notice = `could not copy the transcript: ${e.message}`;
     }
   }
 

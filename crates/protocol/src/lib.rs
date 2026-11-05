@@ -300,6 +300,9 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u64>,
     },
+    /// Stream `request_id`'s messages so far, both ways, as Markdown: each
+    /// with its time, direction, sender and text.
+    Transcript { request_id: u64 },
     /// Compare two finished requests' responses: status, headers, body.
     /// `ignore` adds patterns to the default noisy ones (see
     /// [`ResponseDiff::patterns`]), or replaces them with `no_defaults`.
@@ -1312,6 +1315,7 @@ pub enum ReplyBody {
     UntilStopped,
     MockStarted { mock_id: u64, port: u16, url: String, routes: Vec<String> },
     MockStopped,
+    Transcript { text: String },
     BrowserSet,
     Cookies { browser: Browser, cookies: Vec<CookieSeen> },
     CookiesCleared { removed: u64 },

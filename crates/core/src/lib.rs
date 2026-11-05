@@ -33,6 +33,7 @@ mod import;
 mod hub;
 mod policy;
 mod realtime;
+mod transcript;
 mod until;
 pub mod ws;
 

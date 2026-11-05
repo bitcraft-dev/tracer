@@ -17,7 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
-use crate::{discover, explain, export, files, import, mock};
+use crate::{discover, explain, export, files, import, mock, transcript};
 use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
@@ -264,6 +264,28 @@ pub fn serve(
                 match hub.stream_messages(request_id, after, limit.unwrap_or(STREAM_LIMIT).min(STREAM_LIMIT)) {
                     Some((messages, open, more)) => Ok(ReplyBody::StreamMessages { messages, open, more }),
                     None => Err(format!("request #{request_id} has not been a stream")),
+                }
+            }
+            (Some(_), Command::Transcript { request_id }) => {
+                let mut items = Vec::new();
+                let mut open = false;
+                loop {
+                    match hub.stream_messages(request_id, items.len() as u64, 10_000) {
+                        None => break,
+                        Some((page, still, more)) => {
+                            open = still;
+                            items.extend(page);
+                            if more == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                match hub.response(request_id) {
+                    Some((entry, _, _)) if !items.is_empty() || open || hub.stream_messages(request_id, 0, 1).is_some() => {
+                        Ok(ReplyBody::Transcript { text: transcript::markdown(&entry, &items, open) })
+                    }
+                    _ => Err(format!("request #{request_id} has not been a stream")),
                 }
             }
             (Some(_), Command::Diff { a, b, ignore, no_defaults }) => {

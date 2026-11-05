@@ -678,6 +678,13 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             ReplyBody::Cookies { browser, cookies } => Ok(json!({ "browser": browser, "cookies": cookies })),
             _ => Err(unexpected()),
         },
+        "stream_transcript" => {
+            let request_id = args.get("request_id").and_then(Value::as_u64).ok_or("`request_id` is required")?;
+            let ReplyBody::Transcript { text } = call(core, Command::Transcript { request_id })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "markdown": text }))
+        }
         "create_mock" => {
             let path = str_arg(args, "path").ok_or("`path` (a folder of saved requests) is required")?.to_string();
             let port = args.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
@@ -1407,6 +1414,12 @@ fn tools() -> Value {
             "name": "list_cookies",
             "description": "How the workspace's requests behave like a browser's (`cookies`: the jar is kept and sent back; `origin`: requests go as from a page there, with a CORS preflight where a browser sends one and a `CORS` check on the answer); `unchecked_tls`: hosts whose TLS certificates are accepted unchecked, an answer from one carrying `tls_unchecked`, and the cookies in the jar: names, domains, paths, expiry and flags, never values. A person switches these on (`tracer browser`).",
             "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "stream_transcript",
+            "description": "A WebSocket's or event stream's messages so far, both ways, as Markdown: each with its time, direction, sender (for what was sent) and text.",
+            "inputSchema": { "type": "object", "properties": { "request_id": { "type": "integer" } }, "required": ["request_id"] },
             "annotations": { "readOnlyHint": true },
         },
         {

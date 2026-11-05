@@ -157,6 +157,7 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::Import { .. }
             | Command::Explain { .. }
             | Command::LocalServers { .. }
+            | Command::Transcript { .. }
     );
     if reads {
         return None;

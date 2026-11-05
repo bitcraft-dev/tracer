@@ -453,6 +453,17 @@ pub async fn local_servers() -> Result<Vec<ServerRow>, CoreError> {
     }
 }
 
+/// Stream `request_id`'s messages so far as Markdown.
+#[rux::export]
+pub fn transcript(request_id: u64) -> Result<String, CoreError> {
+    match shared()?.call(Command::Transcript { request_id }) {
+        Ok(Ok(ReplyBody::Transcript { text })) => Ok(text),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// Serve the saved requests under folder `path` as a mock. Gives its id.
 #[rux::export]
 pub fn start_mock(path: String) -> Result<u64, CoreError> {

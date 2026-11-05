@@ -59,6 +59,9 @@ usage:
                                       -m once open, then each line typed; what comes
                                       in goes to stdout; end of input closes it,
                                       unless --for or --count says when
+  tracer ws send <ID> <MESSAGE>       send on an open WebSocket, whoever opened it
+  tracer ws transcript <ID>           a stream's messages so far, both ways, as
+                                      Markdown (redirect it to keep it)
   (send, run, ws) [--for <DURATION>] [--count <N>]
                                       a stream (a WebSocket, or an answer of
                                       text/event-stream) prints its messages as they
@@ -386,6 +389,30 @@ fn send(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
 }
 
 fn ws(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let id = |a: Option<&String>| -> io::Result<u64> {
+        a.and_then(|a| a.trim_start_matches('#').parse().ok()).ok_or_else(|| io::Error::other(USAGE))
+    };
+    match args.first().map(String::as_str) {
+        Some("send") => {
+            let request_id = id(args.get(1))?;
+            let text = args.get(2..).map(|rest| rest.join(" ")).filter(|t| !t.is_empty()).ok_or_else(|| io::Error::other(USAGE))?;
+            let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer ws send")?;
+            client.call(Command::StreamSend { request_id, text })?.map_err(io::Error::other)?;
+            eprintln!("sent on #{request_id}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some("transcript") => {
+            let request_id = id(args.get(1))?;
+            let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer ws transcript")?;
+            match client.call(Command::Transcript { request_id })? {
+                Ok(ReplyBody::Transcript { text }) => print!("{text}"),
+                Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+                Err(e) => return Err(io::Error::other(e)),
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
     let env = take_value(&mut args, "--env");
     let until = Until::take(&mut args, true)?;
     let mut messages = Vec::new();
