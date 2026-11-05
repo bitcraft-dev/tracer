@@ -16,10 +16,13 @@ are listed under Next, item 7. Next is still Show more (item 1).
 
 Later the same day the user said: **leave Phase 5's chat until near
 release**, and build the S and M items (Next, items 2 and 7) first.
-Done so far: the TLS switch (bc2ff7e) and export/import (1571661), both
-driven in the window. Being worked through next: re-run on file change,
-the "explain this failure" bundle, port discovery, then data-driven runs
-and the mock server, then item 2's follow-ups.
+Done so far, each driven in the window: the TLS switch (bc2ff7e),
+export/import (1571661), re-run on file change (cf3a26d), explain
+(3271f47), finding local servers (17aba45). Next: data-driven runs and
+the mock server (M), then item 2's follow-ups. Scratch setup for driving
+(scratchpad): `tls/server.py` (self-signed HTTPS on 18443, `/hop`
+redirects to 127.0.0.1), `www/` served on 18765 with an `openapi.json`,
+workspace `ws/` (localhost and *.dev.test trusted unchecked).
 
 ## Where it stood (2026-11-04, night)
 
@@ -634,6 +637,23 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   and run as curl, Node fetch and Python (a stand-in `requests` over
   urllib: `requests` isn't installed here) to 201; the Rux export
   compiled inside `app/native` (then removed).
+- **Re-run on file change** (cf3a26d). `tracer run PATH --watch` (the
+  request, or a folder's flow, again on each change to its file, a file
+  under the folder, or its env); the window's **↻ re-run on save** chip
+  per open request (a save here, or an outside one it follows).
+- **Explain** (3271f47). `explain.rs`: one request as Markdown, a verdict
+  line, request as written, env vars (secrets named only), answer with
+  phases and body (8 KiB), checks, browser settings, and the last time
+  the same method + URL answered < 400 with checks passing (`tracer diff
+  A B`). CLI `tracer explain [ID]` (newest gone wrong by default), MCP
+  `explain_request`, window **Explain** link (copies) and palette.
+- **Local servers** (17aba45). `discover.rs`: listening ports from
+  `netstat -ano` (or `/proc/net/tcp`; the usual dev ports otherwise),
+  below 1024 skipped but 80/443, process names from `tasklist`, each
+  tried HTTP then HTTPS (1.5 s budget), OpenAPI/Swagger at 8 usual paths.
+  URLs use the address that answered: `localhost` costs 2 s here (::1
+  first). CLI `tracer servers`, MCP `local_servers`, window palette
+  **Find servers running on this machine**.
 
 ### Next
 
@@ -686,9 +706,7 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 7. **Not built yet from PLAN.md** (checked 2026-11-05 against the code):
    a mock server from a collection or spec (and MCP `create_mock`);
    data-driven runs from CSV/JSON; OpenAPI import, response validation
-   and drift detection; an "explain this failure" bundle; localhost port
-   discovery; re-run on file change; gRPC (a stretch); themes; undo in
-   the editor. Phase 5's chat waits for release time (the user's call,
+   and drift detection; gRPC (a stretch); themes; undo in the editor. Phase 5's chat waits for release time (the user's call,
    2026-11-05).
 
 ## Gotchas and how they were solved
