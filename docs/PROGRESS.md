@@ -5,11 +5,20 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-11-04, night)
+## Where it stands (2026-11-05)
+
+**`phase-1-core` pushed** (2dfc0f4; the 15 commits from bb55ab1 on). The
+user's core from 2026-11-02 (`tracer-running-2026-11-02.exe`, PIDs 10280,
+14864, 15456) is gone: the machine restarted 2026-11-05 04:51, and no
+`tracer` process runs. Phases 0 to 4 are done; Phase 5 (in-window chat,
+bring your own model) hasn't started. The plan's features not built yet
+are listed under Next, item 7. Next is still Show more (item 1).
+
+## Where it stood (2026-11-04, night)
 
 The user went to sleep and asked for development to go on, committing as
-it goes. Done since the evening, all on `phase-1-core` (not pushed;
-a922dfd onwards): AW-036 re-driven, fixed; **AW-042** found (`margin:
+it goes. Done since the evening, all on `phase-1-core` (pushed
+2026-11-05; a922dfd onwards): AW-036 re-driven, fixed; **AW-042** found (`margin:
 auto` is 0 in flex, which is why the Collections `+` and Save don't sit
 at their row's end); the small layout fixes (652b9df); Realtime's body
 no longer leaks into a GET (808af61); a flow step's re-run gets its
@@ -52,13 +61,12 @@ detection; see Done), committed on `phase-1-core`. Not pushed. **Phase 4
 is done except the response viewer**, which waited on AW-037 (fixed
 2026-11-04).
 
-Left running, not this session's: the user's `rux run`, window and core on
-`~/Tracer` (PIDs 10280, 14864, 15456; the window relaunched itself at
-22:47 when this session edited `app/native`, see the gotchas), and four
-Python processes from 2026-10-30 23:39/23:49, one of them a
-`SimpleHTTP` server on port 8765. The user's core runs from
-`target/debug/tracer-running-2026-11-02.exe` (renamed so cargo could
-build).
+Left running then, not this session's: the user's `rux run`, window and
+core on `~/Tracer` (PIDs 10280, 14864, 15456; the window relaunched itself
+at 22:47 when this session edited `app/native`, see the gotchas), and four
+Python processes from 2026-10-30, one of them a `SimpleHTTP` server on
+port 8765. The core ran from `target/debug/tracer-running-2026-11-02.exe`
+(renamed so cargo could build). All gone since the 2026-11-05 restart.
 
 ## Where it stood (2026-11-03)
 
@@ -639,6 +647,15 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    jar; a response's own Cookies tab (the plan's).
 6. Small: the Bench panel's baseline name field is drawn taller than
    its row (seen 2026-11-04, not looked into).
+7. **Not built yet from PLAN.md** (checked 2026-11-05 against the code):
+   Phase 5, the in-window chat with your own model (OpenAI-compatible,
+   Anthropic, Gemini, Ollama / LM Studio; keys in the vault); a mock
+   server from a collection or spec (and MCP `create_mock`); data-driven
+   runs from CSV/JSON; OpenAPI import, response validation and drift
+   detection; importing pasted cURL/fetch; export to Rux / JS / Python
+   (cURL is done); an "explain this failure" bundle; localhost port
+   discovery; re-run on file change; a self-signed TLS toggle; gRPC (a
+   stretch); themes; undo in the editor.
 
 ## Gotchas and how they were solved
 
