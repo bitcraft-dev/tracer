@@ -40,9 +40,7 @@ mod transcript;
 mod until;
 pub mod ws;
 
-use std::collections::hash_map::RandomState;
 use std::fs;
-use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -168,15 +166,17 @@ pub fn start(workspace: &Path) -> io::Result<Running> {
     Ok(Running { accept: Some(accept), ..running })
 }
 
-/// 128 bits from the OS's randomness, as hex. `RandomState` is seeded from
-/// the OS once per process and per instance, which is enough for a token that
-/// only has to keep other local processes out.
+/// 128 bits from the OS's randomness, as hex.
 fn new_token() -> String {
-    (0..2)
-        .map(|_| {
-            let mut h = RandomState::new().build_hasher();
-            h.write_u64(std::process::id() as u64);
-            format!("{:016x}", h.finish())
-        })
-        .collect()
+    let mut bytes = [0u8; 16];
+    random_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `out` filled from the OS's randomness (`BCryptGenRandom` on Windows,
+/// `getrandom` elsewhere). Without it there is nothing safe to fall back
+/// to, so the core stops rather than hand out a guessable token.
+pub(crate) fn random_bytes(out: &mut [u8]) {
+    use ring::rand::SecureRandom;
+    ring::rand::SystemRandom::new().fill(out).expect("the OS's randomness could not be read");
 }

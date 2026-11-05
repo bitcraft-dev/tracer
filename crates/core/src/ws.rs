@@ -3,8 +3,6 @@
 //! ([`crate::realtime`]). Hand-written, as the rest of the core's HTTP
 //! plumbing is, so no crate comes in for it.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 
 pub const CONTINUATION: u8 = 0x0;
 pub const TEXT: u8 = 0x1;
@@ -105,13 +103,11 @@ pub fn new_mask() -> [u8; 4] {
     (random_u64() as u32).to_le_bytes()
 }
 
-/// From the OS's randomness, through `RandomState`'s per-instance seed: no
-/// more than masks and handshake keys need, which only have to be
-/// unpredictable to the page or proxy in between.
+/// From the OS's randomness, for masks and handshake keys.
 fn random_u64() -> u64 {
-    let mut h = RandomState::new().build_hasher();
-    h.write_u64(std::process::id() as u64);
-    h.finish()
+    let mut bytes = [0u8; 8];
+    crate::random_bytes(&mut bytes);
+    u64::from_le_bytes(bytes)
 }
 
 pub fn sha1(data: &[u8]) -> [u8; 20] {
