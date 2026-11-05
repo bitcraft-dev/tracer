@@ -2021,6 +2021,58 @@ fn an_event_stream_is_read_as_it_comes_until_the_server_ends_it_or_someone_close
     core.stop();
 }
 
+#[test]
+fn an_event_stream_that_said_retry_is_reconnected_from_its_last_id() {
+    // First connection: retry 100 ms, ids 1 and 2, then it ends. The next
+    // must say Last-Event-ID: 2, and gets id 3; the one after gets 204.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut last = String::from("-");
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("last-event-id:") {
+                    last = v.trim().to_string();
+                }
+            }
+            seen.lock().unwrap().push(last);
+            let (head, body) = match n {
+                0 => ("200 OK", "retry: 100\nid: 1\ndata: a\n\nid: 2\ndata: b\n\n"),
+                1 => ("200 OK", "id: 3\ndata: c\n\n"),
+                _ => ("204 No Content", ""),
+            };
+            let _ = write!(stream, "HTTP/1.1 {head}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}");
+        }
+    });
+    let ws = workspace("sse-retry");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer send").unwrap();
+    let Ok(ReplyBody::Accepted { request_id }) = cli.call(get(format!("http://127.0.0.1:{port}/feed"))).unwrap() else { panic!() };
+    let mut events = Vec::new();
+    collect_until(&mut window, &mut events, |s| {
+        s.iter().any(|e| matches!(&e.kind, EventKind::StreamClosed { request_id: id, .. } if *id == request_id))
+    });
+    let data: Vec<String> = messages(&events, request_id).into_iter().map(|m| m.2).collect();
+    assert_eq!(data, ["a", "b", "c"]);
+    let reason = events.iter().find_map(|e| match &e.kind {
+        EventKind::StreamClosed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    });
+    assert_eq!(reason.as_deref(), Some("the server ended the stream; the server said no more (204) (reconnected 1 time)"));
+    assert_eq!(*asked.lock().unwrap(), ["-", "2", "3"]);
+    core.stop();
+}
+
 /// `/limited` answers 200 twenty times with `X-RateLimit-*` headers, then
 /// 429 with `Retry-After`; anything else is always 200.
 fn limiting_server() -> String {

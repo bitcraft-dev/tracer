@@ -95,6 +95,9 @@ pub struct Link<'a> {
     pub request_id: u64,
     pub cancelled: &'a AtomicBool,
     pub secrets: &'a [(String, String)],
+    /// The request as sent, to send again when an event stream whose
+    /// server sent `retry:` ends.
+    pub resume: Option<HttpRequest>,
 }
 
 impl Link<'_> {
@@ -518,13 +521,74 @@ fn read_rest(conn: &mut Conn, mut body: Vec<u8>, length: Option<usize>) -> Vec<u
 /// Read an answer of server-sent events from `reader` until the server
 /// ends it, the connection goes, or the stream is closed. `head` is the
 /// answer's status, headers and timing so far.
+///
+/// A server that sent a `retry:` field has said how soon to reconnect, and
+/// is reconnected to as a browser's `EventSource` would: after that many
+/// milliseconds, sending `Last-Event-ID` with the last `id:` it gave,
+/// within this same stream. It ends when the server answers 204 or
+/// anything but an event stream, after 5 tries in a row fail, or when it's
+/// closed.
 pub fn sse(link: &Link, head: HttpResponse, reader: Box<dyn Read + Send>, started: Instant) -> Result<HttpResponse, String> {
     if link.hub.open_stream(link.actor.clone(), link.request_id, StreamKind::Sse, head.clone()).is_none() {
         return Err("cancelled".into());
     }
-    // Reads block until the server sends something, so they happen on a
-    // thread of their own and a close needn't wait for the next event. That
-    // thread ends at its next read once nobody listens.
+    let mut rx = read_on_a_thread(reader);
+    let mut parser = SseParser::default();
+    let mut counts = Counts::default();
+    let mut reconnects = 0u32;
+    let reason = 'stream: loop {
+        let ended = loop {
+            if link.cancelled.load(Ordering::SeqCst) {
+                break 'stream link.closed();
+            }
+            match rx.recv_timeout(POLL) {
+                Ok(Ok(bytes)) if bytes.is_empty() => break "the server ended the stream".to_string(),
+                Ok(Ok(bytes)) => {
+                    counts.bytes += bytes.len() as u64;
+                    for event in parser.feed(&bytes) {
+                        counts.received += 1;
+                        link.publish(link.actor.clone(), Direction::In, event.data.as_bytes(), false, event.event, event.id);
+                    }
+                }
+                Ok(Err(e)) => break format!("the connection failed: {e}"),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break "the connection went".to_string(),
+            }
+        };
+        // Without a `retry:` from the server, or a request to send again,
+        // the stream ends as the server ended it.
+        let (Some(retry), Some(request)) = (parser.retry, link.resume.as_ref()) else { break ended };
+        let mut failures = 0;
+        loop {
+            if !wait(link.cancelled, Duration::from_millis(retry.min(60_000))) {
+                break 'stream link.closed();
+            }
+            match open_events(link.hub, request, parser.last_id.as_deref(), link.cancelled) {
+                Ok((answer, Some(reader))) if answer.status == 200 => {
+                    reconnects += 1;
+                    parser.reset_partial();
+                    rx = read_on_a_thread(reader);
+                    continue 'stream;
+                }
+                Ok((answer, _)) if answer.status == 204 => break 'stream format!("{ended}; the server said no more (204)"),
+                Ok((answer, _)) => break 'stream format!("{ended}; reconnecting got {}, not an event stream", answer.status),
+                Err(e) => {
+                    failures += 1;
+                    if failures >= 5 {
+                        break 'stream format!("{ended}; 5 tries to reconnect failed, the last: {e}");
+                    }
+                }
+            }
+        }
+    };
+    let reason = if reconnects > 0 { format!("{reason} (reconnected {reconnects} time{})", if reconnects == 1 { "" } else { "s" }) } else { reason };
+    Ok(link.end(head, started, reason, counts))
+}
+
+/// Reads block until the server sends something, so they happen on a
+/// thread of their own and a close needn't wait for the next event. That
+/// thread ends at its next read once nobody listens.
+fn read_on_a_thread(reader: Box<dyn Read + Send>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
     let (tx, rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(64);
     thread::spawn(move || {
         let mut reader = reader;
@@ -537,27 +601,43 @@ pub fn sse(link: &Link, head: HttpResponse, reader: Box<dyn Read + Send>, starte
             }
         }
     });
-    let mut parser = SseParser::default();
-    let mut counts = Counts::default();
-    let reason = loop {
-        if link.cancelled.load(Ordering::SeqCst) {
-            break link.closed();
+    rx
+}
+
+/// Wait `for_`, or less if `cancelled` is raised; false if it was.
+fn wait(cancelled: &AtomicBool, for_: Duration) -> bool {
+    let until = Instant::now() + for_;
+    while Instant::now() < until {
+        if cancelled.load(Ordering::SeqCst) {
+            return false;
         }
-        match rx.recv_timeout(POLL) {
-            Ok(Ok(bytes)) if bytes.is_empty() => break "the server ended the stream".to_string(),
-            Ok(Ok(bytes)) => {
-                counts.bytes += bytes.len() as u64;
-                for event in parser.feed(&bytes) {
-                    counts.received += 1;
-                    link.publish(link.actor.clone(), Direction::In, event.data.as_bytes(), false, event.event, event.id);
-                }
-            }
-            Ok(Err(e)) => break format!("the connection failed: {e}"),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break "the connection went".to_string(),
-        }
+        thread::sleep(POLL.min(until.saturating_duration_since(Instant::now())));
+    }
+    !cancelled.load(Ordering::SeqCst)
+}
+
+/// Send `request` again for its event stream, with `Last-Event-ID` if
+/// there's one: the answer's head, and its body to read if it's a stream.
+fn open_events(
+    hub: &Hub,
+    request: &HttpRequest,
+    last_id: Option<&str>,
+    cancelled: &AtomicBool,
+) -> Result<(HttpResponse, Option<Box<dyn Read + Send>>), String> {
+    let mut again = request.clone();
+    again.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("last-event-id"));
+    if let Some(id) = last_id {
+        again.headers.push(("Last-Event-ID".into(), id.to_string()));
+    }
+    let kept: std::sync::Mutex<Option<Box<dyn Read + Send>>> = std::sync::Mutex::new(None);
+    let keep = |head: HttpResponse, reader: Box<dyn Read + Send>, _started: Instant| {
+        *kept.lock().unwrap() = Some(reader);
+        Ok(head)
     };
-    Ok(link.end(head, started, reason, counts))
+    let unchecked = crate::http::tls_unchecked(&hub.browser(), &again.url);
+    let answer = crate::http::execute(&again, true, unchecked, cancelled, Some(&keep))?;
+    let reader = kept.into_inner().unwrap();
+    Ok((answer, reader))
 }
 
 /// One server-sent event.
@@ -580,9 +660,20 @@ struct SseParser {
     data: Option<String>,
     event: Option<String>,
     id: Option<String>,
+    /// The last `id:` given, kept across events, for `Last-Event-ID`; an
+    /// empty one clears it.
+    last_id: Option<String>,
+    /// How soon to reconnect, in milliseconds, if the server said.
+    retry: Option<u64>,
 }
 
 impl SseParser {
+    /// Forget an event left half-read when its connection went.
+    fn reset_partial(&mut self) {
+        (self.line, self.after_cr) = (Vec::new(), false);
+        (self.data, self.event, self.id) = (None, None, None);
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Vec<Sse> {
         let mut out = Vec::new();
         for &b in bytes {
@@ -622,7 +713,11 @@ impl SseParser {
                 data.push('\n');
             }
             "event" => self.event = Some(value.to_string()),
-            "id" => self.id = Some(value.to_string()),
+            "id" if !value.contains('\0') => {
+                self.id = Some(value.to_string());
+                self.last_id = (!value.is_empty()).then(|| value.to_string());
+            }
+            "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => self.retry = value.parse().ok(),
             _ => {}
         }
         None

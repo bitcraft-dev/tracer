@@ -446,7 +446,8 @@ pub(crate) fn run_one(
     // anything is published or journalled.
     // A WebSocket, or an answer of server-sent events, stays open as a
     // stream until it's closed.
-    let link = realtime::Link { hub, actor, request_id, cancelled, secrets: &secrets };
+    let resume = resolved.as_ref().ok().cloned();
+    let link = realtime::Link { hub, actor, request_id, cancelled, secrets: &secrets, resume };
     let read_events = |head, reader, started| realtime::sse(&link, head, reader, started);
     let outcome = resolved
         .and_then(|sending| {
