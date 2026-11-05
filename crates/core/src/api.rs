@@ -20,6 +20,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -37,27 +38,45 @@ const BODY_MAX: usize = 16 * 1024 * 1024;
 const HELLO_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
-    // A connection that says nothing is let go: until it has said hello (or
-    // sent its HTTP request), it may wait this long for each read.
-    let _ = stream.set_read_timeout(Some(HELLO_WAIT));
+    // A connection that says nothing is let go: if it hasn't said hello (or
+    // sent its HTTP request's head) within `HELLO_WAIT`, it's shut down.
+    let said = Arc::new(AtomicBool::new(false));
+    if let Ok(watched) = stream.try_clone() {
+        let said = said.clone();
+        let _ = std::thread::Builder::new().name("tracer-hello".into()).spawn(move || {
+            let until = std::time::Instant::now() + HELLO_WAIT;
+            while std::time::Instant::now() < until {
+                if said.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !said.load(Ordering::SeqCst) {
+                let _ = watched.shutdown(std::net::Shutdown::Both);
+            }
+        });
+    }
     let mut first = [0u8; 1];
     match stream.peek(&mut first) {
         Ok(1) if first[0].is_ascii_alphabetic() => {}
-        Ok(_) => return conn::serve_tcp(stream, hub, token, stop),
+        Ok(_) => return conn::serve_tcp(stream, hub, token, stop, said),
         Err(_) => return,
     }
     let Ok(write_half) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
     let mut out = write_half;
     let head = match read_head(&mut reader) {
-        Ok(head) => head,
+        Ok(head) => {
+            said.store(true, Ordering::SeqCst);
+            head
+        }
         Err(why) => return respond(&mut out, 400, &json!({ "error": why })),
     };
     if let Err(why) = from_this_machine(&head) {
         return respond(&mut out, 403, &json!({ "error": why }));
     }
     match (head.method.as_str(), head.path.as_str()) {
-        ("GET", "/v1/ws") => websocket(reader, out, &head, hub, token, stop),
+        ("GET", "/v1/ws") => websocket(reader, out, &head, hub, token, stop, said),
         ("POST", "/v1/command") => match read_body(&mut reader, &head) {
             Ok(body) => {
                 let (status, answer) = command(&head, &body, hub, token, stop);
@@ -210,7 +229,7 @@ fn command(head: &Head, body: &[u8], hub: Arc<Hub>, token: &str, stop: &Stop) ->
 }
 
 /// The core's protocol over a WebSocket (RFC 6455), a message per frame.
-fn websocket(reader: BufReader<TcpStream>, mut out: TcpStream, head: &Head, hub: Arc<Hub>, token: &str, stop: &Stop) {
+fn websocket(reader: BufReader<TcpStream>, mut out: TcpStream, head: &Head, hub: Arc<Hub>, token: &str, stop: &Stop, said: Arc<AtomicBool>) {
     let upgrade = head.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
     let Some(key) = head.header("sec-websocket-key").filter(|_| upgrade) else {
         return respond(&mut out, 400, &json!({ "error": "/v1/ws is a WebSocket: send Upgrade: websocket" }));
@@ -222,7 +241,9 @@ fn websocket(reader: BufReader<TcpStream>, mut out: TcpStream, head: &Head, hub:
     if out.write_all(handshake.as_bytes()).is_err() {
         return;
     }
-    let wire = conn::Wire::of(&out);
+    // Its HTTP head was its hello as far as the watchdog goes; the
+    // protocol's own hello over the socket is checked by `conn`.
+    let wire = conn::Wire::of(&out, said);
     // Shared by the writer and the reader's pongs and close, a frame at a time.
     let out = Arc::new(Mutex::new(out));
     let write = out.clone();

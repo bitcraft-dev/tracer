@@ -23,31 +23,29 @@ use crate::hub::Hub;
 use crate::Stop;
 
 /// A client on the core's TCP protocol: a line of JSON each way.
-pub fn serve_tcp(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
+pub fn serve_tcp(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop, said: Arc<AtomicBool>) {
     let Ok(write_half) = stream.try_clone() else { return };
     let mut w = BufWriter::new(write_half);
     let write_line = move |line: &str| writeln!(w, "{line}").and_then(|_| w.flush());
-    let wire = Wire::of(&stream);
+    let wire = Wire::of(&stream, said);
     serve(BufReader::new(stream).lines(), write_line, hub, token, stop, wire);
 }
 
-/// What `serve` may do to the connection under it: let it wait as long as
-/// it likes once it has said hello, and close it.
+/// What `serve` may do to the connection under it: say it has said hello
+/// (so the watchdog in `api::serve` leaves it be), and close it.
 pub struct Wire {
     pub on_hello: Box<dyn FnOnce() + Send>,
     pub close: Box<dyn Fn() + Send>,
 }
 
 impl Wire {
-    /// For a TCP stream (the protocol's, or a WebSocket's).
-    pub fn of(stream: &TcpStream) -> Wire {
-        let (a, b) = (stream.try_clone().ok(), stream.try_clone().ok());
+    /// For a TCP stream (the protocol's, or a WebSocket's). A shutdown acts
+    /// on the socket whichever handle asks; a read timeout set through a
+    /// clone doesn't, on Windows, which is why hello is a flag.
+    pub fn of(stream: &TcpStream, said: Arc<AtomicBool>) -> Wire {
+        let b = stream.try_clone().ok();
         Wire {
-            on_hello: Box::new(move || {
-                if let Some(s) = a {
-                    let _ = s.set_read_timeout(None);
-                }
-            }),
+            on_hello: Box::new(move || said.store(true, std::sync::atomic::Ordering::SeqCst)),
             close: Box::new(move || {
                 if let Some(s) = &b {
                     let _ = s.shutdown(std::net::Shutdown::Both);

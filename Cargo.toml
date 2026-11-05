@@ -16,6 +16,10 @@ publish = false
 # dependency in the native crate itself would give the app a second copy of
 # `rux-native` beside the one `rux run` supplies, and a second copy is a second
 # export registry (the same reasoning Mava Studio 2 follows).
+#
+# The path is relative to this file: the Rux checkout is expected at
+# `../../Mobile/UI Research` (beside `Rux apps/`). Elsewhere, change these
+# two paths to your checkout's `crates/` before building.
 [patch.crates-io]
-rux-native = { path = "C:/Users/USER/Mobile/UI Research/crates/rux-native" }
-rux-native-macros = { path = "C:/Users/USER/Mobile/UI Research/crates/rux-native-macros" }
+rux-native = { path = "../../Mobile/UI Research/crates/rux-native" }
+rux-native-macros = { path = "../../Mobile/UI Research/crates/rux-native-macros" }

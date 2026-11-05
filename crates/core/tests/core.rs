@@ -2247,3 +2247,13 @@ fn a_connection_that_never_says_hello_is_let_go() {
     assert!(waited >= Duration::from_secs(9) && waited < Duration::from_secs(20), "closed after {waited:?}");
     core.stop();
 }
+
+#[test]
+fn a_client_that_said_hello_may_sit_quiet() {
+    let ws = workspace("quiet");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut c = Client::connect(&ws, ClientKind::Cli, "quiet").unwrap();
+    thread::sleep(Duration::from_secs(12));
+    assert!(c.call(Command::Status).unwrap().is_ok(), "let go after hello");
+    core.stop();
+}
