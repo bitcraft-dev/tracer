@@ -106,6 +106,9 @@
                     <text class="title-t" :class="{ unsaved: openPath == &quot;&quot; }">{{ if openPath == "" { "Unsaved request" } else { openPath } }}</text>
                     <text class="dirty" r-if="dirty">●</text>
                     <text class="notice" r-if="notice != &quot;&quot;">{{ notice }}</text>
+                    <view class="watch-chip" r-if="openPath != &quot;&quot;" :class="{ on: watchOpen }" @tap="toggleWatch()">
+                        <text class="watch-t">{{ if watchOpen { "↻ re-runs on save" } else { "↻ re-run on save" } }}</text>
+                    </view>
                     <view class="save" @tap="save()"><text class="save-t">Save</text></view>
                 </view>
                 <view class="bar">
@@ -843,6 +846,10 @@
   .title-t.unsaved { color: #8a8a8a; font-weight: 400; }
   .dirty { color: #e8a54b; font-size: 10px; }
 
+  .watch-chip { padding: 3px 8px; border-radius: 6px; border: 1px solid #2c2c2c; flex-shrink: 0; }
+  .watch-t { color: #8a8a8a; font-size: 11px; }
+  .watch-chip.on { border: 1px solid #3a3550; }
+  .watch-chip.on .watch-t { color: #c8c0f8; }
   .notice {
     flex: 1;
     min-width: 0;
@@ -1685,6 +1692,15 @@
   // The saved request in the editor, by path; "" for one not saved yet.
   let openPath = signal("");
   let notice = signal("");
+  // The saved request sent again whenever its file is saved, from here or
+  // outside; only while it's the one open.
+  let watchPath = signal("");
+  computed watchOpen = watchPath != "" && watchPath == openPath;
+
+  fn toggleWatch() {
+    watchPath = if watchOpen { "" } else { openPath };
+    notice = if watchOpen { "sent again whenever it's saved, here or outside" } else { "" };
+  }
   // A request clicked while there were unsaved edits: a second click opens it.
   let pendingOpen = signal("");
   let naming = signal(false);
@@ -2213,15 +2229,23 @@
     }
     let s = { path: e.path, method: e.method, url: e.url, headers: e.headers, body: e.body, checks: e.checks };
     let before = saved.find(x => x.path == e.path);
+    // Whether the editor now holds what was saved, so a watched request
+    // can go again: a save from here, or one from outside it followed.
+    let current = e.path == openPath && sameAs(s);
     if e.path == openPath && !sameAs(s) {
       if before == none || sameAs(before) {
         // No edits of our own: follow theirs.
         load(s);
         notice = `updated by ${who}`;
+        current = true;
       } else {
         // The dev's edit wins; say what happened.
         notice = `${who} saved this; your unsaved edits are kept`;
       }
+    }
+    if watchOpen && current {
+      send();
+      notice = `${notice}${if notice == "" { "" } else { " · " }}re-run on save`;
     }
     if before == none {
       saved = (saved + [s]).sort((a, b) => if a.path < b.path { -1 } else if a.path > b.path { 1 } else { 0 });

@@ -69,12 +69,15 @@ usage:
   tracer save <PATH> <METHOD> <URL> [-H 'Name: value']... [-d <body>] [--expect '…']...
                                       save a request as requests/<PATH>.http, its
                                       expectations as `# @expect` lines
-  tracer run <PATH> [--env <NAME>] [--keep-going] [--report json]
+  tracer run <PATH> [--env <NAME>] [--keep-going] [--report json] [--watch]
                                       send a saved request and print its answer;
                                       a folder runs as a flow, in path order, each
                                       step's `# @capture name = $.path` filling
                                       {{name}} after it; stops at a failed step
-                                      unless --keep-going; exits 1 if it fails
+                                      unless --keep-going; exits 1 if it fails.
+                                      --watch: run it again whenever its file
+                                      (or one under the folder) or its env
+                                      changes, until Ctrl+C
   tracer bench <PATH> [-n <N>] [-c <C>] [-t <DURATION>] [--rate <R>] [--env <NAME>]
              [--report json]          send a saved request N times (default 100),
                                       C at a time (default 10), or for DURATION
@@ -655,25 +658,56 @@ fn run(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     if report.as_deref().is_some_and(|r| r != "json") {
         return Err(io::Error::other("--report takes json"));
     }
-    let keep_going = match args.iter().position(|a| a == "--keep-going") {
+    let mut flag = |name: &str| match args.iter().position(|a| a == name) {
         Some(at) => {
             args.remove(at);
             true
         }
         None => false,
     };
+    let keep_going = flag("--keep-going");
+    let watch = flag("--watch");
     let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
     // Matched as the core names paths, so `requests/a/b.http` finds `a/b`.
     let wanted = path.trim().replace('\\', "/");
     let wanted = wanted.strip_prefix("requests/").unwrap_or(&wanted);
-    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted).trim_end_matches('/');
-    let (requests, _) = saved(&workspace, "tracer run")?;
-    match requests.into_iter().find(|r| r.path == wanted) {
-        Some(found) if report.is_none() => {
-            send_and_wait(&workspace, Command::Send { request: found.request, env }, "tracer run", until)
+    let wanted = wanted.strip_suffix(".http").unwrap_or(wanted).trim_end_matches('/').to_string();
+    // Read afresh each time, so a run after a change sends what's saved now.
+    let once = || -> io::Result<ExitCode> {
+        let (requests, _) = saved(&workspace, "tracer run")?;
+        match requests.into_iter().find(|r| r.path == wanted) {
+            Some(found) if report.is_none() => {
+                send_and_wait(&workspace, Command::Send { request: found.request, env: env.clone() }, "tracer run", until)
+            }
+            // A folder, or one request wanted as a report: a flow.
+            _ => flow(&workspace, &wanted, env.clone(), keep_going, report.is_some()),
         }
-        // A folder, or one request wanted as a report: a flow.
-        _ => flow(&workspace, wanted, env, keep_going, report.is_some()),
+    };
+    if !watch {
+        return once();
+    }
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer run --watch")?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    // A failed run doesn't end the watch: the next change may fix it.
+    let report_run = |run: io::Result<ExitCode>| {
+        if let Err(e) = run {
+            eprintln!("tracer: {e}");
+        }
+    };
+    report_run(once());
+    let under = format!("{wanted}/");
+    let env_too = env.as_deref().map(|e| format!(" and environment {e}")).unwrap_or_default();
+    eprintln!("watching requests/{wanted}{env_too}; Ctrl+C stops");
+    loop {
+        let why = match client.next_event()?.kind {
+            EventKind::RequestSaved { path, .. } if path == wanted || path.starts_with(&under) => format!("requests/{path}.http changed"),
+            EventKind::EnvironmentSaved { env: changed } if env.as_deref() == Some(changed.name.as_str()) => {
+                format!("environment {} changed", changed.name)
+            }
+            _ => continue,
+        };
+        eprintln!("\n── {why}; running again");
+        report_run(once());
     }
 }
 
