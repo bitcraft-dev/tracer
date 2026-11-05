@@ -12,6 +12,7 @@
                 <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && gql }" @tap="toGraphql()"><text class="rail-label">GraphQL</text></view>
                 <view class="rail-item" :class="{ on: mode == &quot;rest&quot; && wsMode }" @tap="toRealtime()"><text class="rail-label">Realtime</text></view>
                 <view class="rail-item" :class="{ on: mode == &quot;bench&quot; }" @tap="mode = &quot;bench&quot;"><text class="rail-label">Bench</text></view>
+                <view class="rail-item" :class="{ on: mode == &quot;spec&quot; }" @tap="toSpecs()"><text class="rail-label">API</text></view>
             </view>
 
             <view class="side" :style="`width: ${sideWidth}px`">
@@ -224,6 +225,10 @@
                             <text class="chip">by {{ sel.actorKind }} · {{ sel.actor }}</text>
                             <text class="chip">sent {{ when(sel.atMs) }}</text>
                             </view>
+                            <view class="spec-check" r-if="specCheck != none && specCheckFor == sel.id">
+                                <text class="spec-head" :class="{ bad: !specCheck.pass }">{{ if specCheck.pass { "✓" } else { "✗" } }} {{ specCheck.head }}</text>
+                                <text class="op-line" r-for="l in specCheck.lines">{{ l }}</text>
+                            </view>
                             <view class="fall" r-if="(sel.state == &quot;done&quot; || sel.stream != &quot;&quot;) && sel.dnsMs >= 0.0">
                                 <view class="fall-bar">
                                     <view class="fall-seg" r-for="p in phases(sel)" :style="`flex-grow: ${p.ms}; background: ${p.color}`"></view>
@@ -314,6 +319,69 @@
                             <view class="hdr" r-if="(sel.state == &quot;done&quot; || sel.stream != &quot;&quot;) && shownTab() == &quot;headers&quot;" r-for="h in sel.resHeaders">
                                 <text class="hdr-n">{{ h.name }}</text>
                                 <text class="hdr-v">{{ h.value }}</text>
+                            </view>
+                        </view>
+                    </view>
+                    <view class="bench" r-if="mode == &quot;spec&quot;">
+                        <view class="bench-form">
+                            <view class="bf spec-from"><text class="bf-l">OpenAPI document</text><view class="bf-in"><input r-model="specFrom" placeholder="a URL, or a file in the workspace" /></view></view>
+                            <view class="bf"><text class="bf-l">Name</text><view class="bf-in"><input r-model="specName" placeholder="from its title" /></view></view>
+                            <view class="send" :class="{ off: !connected || specBusy }" @tap="importSpec()">
+                                <text class="send-label">{{ if specBusy { "Importing…" } else { "Import" } }}</text>
+                            </view>
+                        </view>
+                        <text class="empty" r-if="specs.length == 0">Import an OpenAPI document (3.0, 3.1 or Swagger 2, JSON or YAML) from a URL or a file. Each operation gets a saved request under its name in Collections, starting with {{base}}, and each answer is checked against the spec. The picked environment gets base if it has none.</text>
+                        <view class="tabs" r-if="specs.length > 0">
+                            <view class="tab" r-for="sp in specs" r-key="sp.name" :class="{ on: sp.name == specPick }" @tap="pickSpec(sp.name)">
+                                <text class="tab-label">{{ sp.name }}</text>
+                                <text class="badge">{{ sp.ops.length }}</text>
+                            </view>
+                        </view>
+                        <view class="bench-in" r-if="spec != none">
+                            <view class="res-h">
+                                <text class="res-id">{{ spec.title }}</text>
+                                <text class="chip">{{ spec.version }}</text>
+                                <text class="res-url">{{ if spec.server == "" { "no server named: set base" } else { spec.server } }}</text>
+                                <view class="link" @tap="loadDrift()"><text class="link-t">Check drift</text></view>
+                                <view class="link" @tap="mockSpec()"><text class="link-t">Mock it</text></view>
+                                <view class="link" @tap="reimportSpec()"><text class="link-t">Import again</text></view>
+                            </view>
+                            <text class="spec-note" r-for="n in specNotes">{{ n }}</text>
+                            <view class="tiles" r-if="drift != none">
+                                <view class="tile"><text class="tile-v">{{ drift.tried }} of {{ drift.ops.length }}</text><text class="tile-l">operations tried</text></view>
+                                <view class="tile"><text class="tile-v">{{ drift.checked }}</text><text class="tile-l">answers checked</text></view>
+                                <view class="tile"><text class="tile-v" :class="{ bad: drift.off > 0 }">{{ drift.off }}</text><text class="tile-l">off the spec</text></view>
+                                <view class="tile"><text class="tile-v" :class="{ bad: drift.unknown.length > 0 }">{{ drift.unknown.length }}</text><text class="tile-l">not in the spec</text></view>
+                            </view>
+                            <text class="empty" r-if="driftNote != &quot;&quot;">{{ driftNote }}</text>
+                            <view class="spec-list" r-if="drift != none">
+                                <view class="op" r-for="o in drift.ops" r-key="`${o.method} ${o.path}`" @tap="openOp(o.saved)">
+                                    <view class="op-top">
+                                        <text class="op-mark" :style="`color: ${markColor(o.mark)}`">{{ markText(o.mark) }}</text>
+                                        <text class="m" :style="`color: ${methodColor(o.method)}`">{{ o.method }}</text>
+                                        <text class="op-path">{{ o.path }}</text>
+                                        <text class="op-sum">{{ o.summary }}</text>
+                                        <text class="op-seen">{{ o.seen }}</text>
+                                        <view class="link" r-if="o.lastFailing > 0" @tap="showRequest(o.lastFailing)"><text class="link-t">#{{ o.lastFailing }}</text></view>
+                                    </view>
+                                    <text class="op-line" r-for="l in o.lines">{{ l }}</text>
+                                </view>
+                                <view class="op" r-for="u in drift.unknown" r-key="`${u.method} ${u.path}`" @tap="showRequest(u.last)">
+                                    <view class="op-top">
+                                        <text class="op-mark" :style="`color: ${markColor(&quot;off&quot;)}`">!</text>
+                                        <text class="m" :style="`color: ${methodColor(u.method)}`">{{ u.method }}</text>
+                                        <text class="op-path">{{ u.path }}</text>
+                                        <text class="op-sum">not in the spec</text>
+                                        <text class="op-seen">{{ u.line }}</text>
+                                    </view>
+                                </view>
+                                <view class="op" r-for="st in drift.stale" r-key="st" @tap="openOp(st)">
+                                    <view class="op-top">
+                                        <text class="op-mark" :style="`color: ${markColor(&quot;drift&quot;)}`">?</text>
+                                        <text class="op-path">{{ st }}</text>
+                                        <text class="op-sum">a saved request no operation in the spec matches now</text>
+                                    </view>
+                                </view>
                             </view>
                         </view>
                     </view>
@@ -1696,6 +1764,20 @@
 
   .gql-m { display: flex; align-items: center; padding: 0 14px; }
   .gql-t { color: var(--c-e535ab); font-size: 14px; font-weight: 700; }
+  .spec-from { flex: 3; }
+  .spec-note { color: var(--c-8a8a8a); font-size: 12px; }
+  .spec-list { display: flex; flex-direction: column; gap: 2px; }
+  .op { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+  .op:hover { background: var(--c-1f1f1f); }
+  .op-top { display: flex; align-items: center; gap: 8px; }
+  .op-mark { width: 14px; font-size: 13px; font-weight: 700; }
+  .op-path { color: var(--c-d4d4d4); font-family: monospace; font-size: 12px; }
+  .op-sum { color: var(--c-7a7a7a); font-size: 12px; flex: 1; min-width: 0; }
+  .op-seen { color: var(--c-8a8a8a); font-size: 11px; font-family: monospace; }
+  .op-line { color: var(--c-e8a54b); font-size: 11px; font-family: monospace; padding-left: 22px; overflow-wrap: break-word; }
+  .spec-check { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+  .spec-head { color: var(--c-4ec98f); font-size: 12px; }
+  .spec-head.bad { color: var(--c-f0716c); }
   .schema { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-top: 6px; }
   .schema-h { display: flex; gap: 10px; align-items: center; }
   .hsearch.grow { flex: 1; }
@@ -1783,6 +1865,9 @@
   use type native::tracer::GSchema;
   use type native::tracer::GType;
   use type native::tracer::CookieRow;
+  use type native::tracer::SpecRow;
+  use type native::tracer::DriftView;
+  use type native::tracer::SpecCheck;
   use native::view;
   use type native::view::BodyLine;
 
@@ -1909,6 +1994,10 @@
     { id: "servers", label: "Find servers running on this machine", hint: "" },
     { id: "flow-data", label: "Run the open request's folder once per row of a CSV or JSON file", hint: "" },
     { id: "mock", label: "Mock the open request's folder: a server answering with its last answers", hint: "" },
+    { id: "spec-import", label: "Import the OpenAPI document in the URL bar", hint: "" },
+    { id: "spec-check", label: "Check the answer on show against its OpenAPI spec", hint: "" },
+    { id: "spec-mock", label: "Mock the OpenAPI spec on show", hint: "" },
+    { id: "mode:spec", label: "Show the API specs and their drift", hint: "" },
     { id: "theme:dark", label: "Theme: dark", hint: "" },
     { id: "theme:light", label: "Theme: light", hint: "" },
     { id: "theme:system", label: "Theme: as the computer is set", hint: "" },
@@ -2295,6 +2384,24 @@
     }
   }
 
+  // OpenAPI specs in the workspace, the one on show, and its drift.
+  // Declared before the event effect below, which calls loadSpecs and
+  // loadDrift: declared after it, `rux check` refuses those functions
+  // (AW-044); move back beside them once that's fixed.
+  let specs: SpecRow[] = signal([]);
+  let specPick = signal("");
+  let specFrom = signal("");
+  let specName = signal("");
+  let specBusy = signal(false);
+  // What the last import said: notes, changes, what it saved.
+  let specNotes: string[] = signal([]);
+  let drift: DriftView? = signal(none);
+  let driftNote = signal("");
+  // A spec check asked for from the palette, and the request it's of.
+  let specCheck: SpecCheck? = signal(none);
+  let specCheckFor = signal(0);
+  computed spec = specs.find(x => x.name == specPick) ?? none;
+
   // Every event the core publishes arrives here once, in the core's order,
   // replayed from the start of the journal when the window opens.
   effect {
@@ -2424,6 +2531,9 @@
         benchOk = ok;
       } else if e.kind == "request_checked" {
         requests = requests.map(r => if r.id == e.requestId { withResults(r, e.results) } else { r });
+        if mode == "spec" && specPick != "" { loadDrift(); }
+      } else if e.kind == "spec_imported" {
+        loadSpecs();
       } else if e.kind == "agents_switched" {
         agentsOn = e.allow;
       } else if e.kind == "policy_changed" {
@@ -3184,6 +3294,131 @@
     }
   }
 
+
+  fn toSpecs() {
+    mode = "spec";
+    loadSpecs();
+  }
+
+  async fn loadSpecs() {
+    try {
+      specs = await tracer.listSpecs();
+    } catch e {
+      error = `could not list the specs: ${e.message}`;
+      return;
+    }
+    if specs.length > 0 && !specs.some(x => x.name == specPick) {
+      specPick = specs[0].name;
+    }
+    if specPick != "" { await loadDrift(); }
+  }
+
+  fn pickSpec(name: string) {
+    specPick = name;
+    specNotes = [];
+    drift = none;
+    loadDrift();
+  }
+
+  async fn loadDrift() {
+    if specPick == "" { return; }
+    driftNote = "";
+    try {
+      drift = await tracer.specDrift(specPick);
+    } catch e {
+      drift = none;
+      driftNote = `could not read its drift: ${e.message}`;
+    }
+  }
+
+  async fn importSpec() {
+    let from = specFrom.trim();
+    if from == "" {
+      error = "write the OpenAPI document's URL, or its file's path, first";
+      return;
+    }
+    if specBusy { return; }
+    specBusy = true;
+    error = "";
+    let env = if envPick == NO_ENV { "" } else { envPick };
+    try {
+      let r = await tracer.importSpec(from, specName.trim(), env);
+      specPick = r.spec.name;
+      specName = "";
+      let made = r.created.map(c => `+ ${c}`);
+      let gone = r.gone.map(g => `? ${g} matches no operation now`);
+      let kept: string[] = if r.kept > 0 { [`${r.kept} saved already, kept as they are`] } else { [] };
+      specNotes = r.notes + r.changes.map(c => `changed: ${c}`) + made + kept + gone;
+      notice = `imported ${r.spec.name}: ${r.spec.ops.length} operations, ${r.created.length} new requests`;
+    } catch e {
+      error = `could not import it: ${e.message}`;
+    }
+    specBusy = false;
+    await loadSpecs();
+    await loadSaved();
+    await loadEnvs();
+  }
+
+  fn reimportSpec() {
+    if spec == none { return; }
+    specFrom = spec.from;
+    specName = spec.name;
+    importSpec();
+  }
+
+  fn mockSpec() {
+    if specPick == "" {
+      error = "import a spec first: the API view (rail) imports one";
+      return;
+    }
+    try {
+      tracer.startSpecMock(specPick);
+      notice = `mocking ${specPick}: each operation answers with its example; Prefer: code=404 picks another`;
+    } catch e {
+      error = `could not mock it: ${e.message}`;
+    }
+  }
+
+  fn checkShownSpec() {
+    if selected == 0 { return; }
+    try {
+      specCheck = tracer.checkSpec(selected);
+      specCheckFor = selected;
+    } catch e {
+      error = e.message;
+    }
+  }
+
+  // A drift row's saved request, opened in the editor with its answers.
+  fn openOp(path: string) {
+    if path == "" {
+      notice = "no saved request for it: Import again saves one";
+      return;
+    }
+    openSaved(path);
+    mode = "rest";
+  }
+
+  fn showRequest(id: int) {
+    if id <= 0 { return; }
+    selected = id;
+    mode = "rest";
+  }
+
+  fn markText(m: string): string {
+    if m == "off" { return "✗"; }
+    if m == "drift" { return "~"; }
+    if m == "ok" { return "✓"; }
+    return "·";
+  }
+
+  fn markColor(m: string): string {
+    if m == "off" { return "var(--c-f0716c)"; }
+    if m == "drift" { return "var(--c-e8a54b)"; }
+    if m == "ok" { return "var(--c-4ec98f)"; }
+    return "var(--c-6a6a6a)";
+  }
+
   // The newest mock serving, as the status bar shows it.
   let mockId = signal(0);
   let mockPort = signal(0);
@@ -3763,6 +3998,14 @@
       runFolder();
     } else if id == "mock" {
       mockFolder();
+    } else if id == "spec-import" {
+      specFrom = url.trim();
+      toSpecs();
+      importSpec();
+    } else if id == "spec-check" {
+      checkShownSpec();
+    } else if id == "spec-mock" {
+      mockSpec();
     } else if id == "flow-data" {
       askingData = true;
     } else if id == "bench" {

@@ -1336,6 +1336,7 @@ fn to_page(event: Event) -> CoreEvent {
             (out.status, out.path) = (status.into(), route.unwrap_or_default());
         }
         EventKind::MockStopped { mock_id } => (out.kind, out.mock) = ("mock_stopped".into(), mock_id),
+        EventKind::SpecImported { spec, created } => (out.kind, out.path, out.n) = ("spec_imported".into(), spec.name, created.into()),
         EventKind::PolicyChanged { error, .. } => {
             (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
         }
@@ -1406,4 +1407,237 @@ fn shown(mut body: String) -> String {
         body.truncate(cut);
     }
     body
+}
+
+// ---- OpenAPI specs ----
+
+/// A spec in the workspace, for the API view.
+#[rux::export]
+#[derive(Clone)]
+pub struct SpecRow {
+    pub name: String,
+    pub title: String,
+    pub version: String,
+    pub openapi: String,
+    pub from: String,
+    /// Its first server, or "".
+    pub server: String,
+    pub ops: Vec<SpecOpRow>,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct SpecOpRow {
+    pub method: String,
+    pub path: String,
+    pub summary: String,
+    pub tag: String,
+    pub deprecated: bool,
+}
+
+fn spec_row(s: tracer_protocol::SpecInfo) -> SpecRow {
+    SpecRow {
+        name: s.name,
+        title: s.title,
+        version: s.version,
+        openapi: s.openapi,
+        from: s.from,
+        server: s.servers.into_iter().next().unwrap_or_default(),
+        ops: s
+            .operations
+            .into_iter()
+            .map(|o| SpecOpRow { method: o.method, path: o.path, summary: o.summary, tag: o.tag, deprecated: o.deprecated })
+            .collect(),
+    }
+}
+
+/// The workspace's specs.
+#[rux::export]
+pub async fn list_specs() -> Result<Vec<SpecRow>, CoreError> {
+    match shared()?.call(Command::ListSpecs) {
+        Ok(Ok(ReplyBody::Specs { specs, .. })) => Ok(specs.into_iter().map(spec_row).collect()),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// What importing a spec did.
+#[rux::export]
+#[derive(Clone)]
+pub struct SpecImport {
+    pub spec: SpecRow,
+    pub created: Vec<String>,
+    pub kept: u64,
+    pub gone: Vec<String>,
+    pub changes: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+/// Import the OpenAPI document at `from` (a URL or a file) as spec `name`
+/// ("": from its title), giving environment `env` ("": none) a `base`.
+#[rux::export]
+pub async fn import_spec(from: String, name: String, env: String) -> Result<SpecImport, CoreError> {
+    let name = (!name.trim().is_empty()).then_some(name);
+    let env = (!env.trim().is_empty()).then_some(env);
+    match shared()?.call(Command::ImportSpec { from, name, env }) {
+        Ok(Ok(ReplyBody::SpecImported { imported })) => Ok(SpecImport {
+            spec: spec_row(imported.spec),
+            created: imported.created,
+            kept: imported.kept.len() as u64,
+            gone: imported.gone,
+            changes: imported.changes,
+            notes: imported.notes,
+        }),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// One operation in a drift report, put in words for the page.
+#[rux::export]
+#[derive(Clone)]
+pub struct DriftOp {
+    pub method: String,
+    pub path: String,
+    pub summary: String,
+    /// `off` (answers that don't match, or an unlisted status), `drift`
+    /// (only fields the spec doesn't name), `never` (not tried) or `ok`.
+    pub mark: String,
+    /// `3 sent · 2 off · saw 200 410`, or `never sent`.
+    pub seen: String,
+    /// What's wrong, a line each.
+    pub lines: Vec<String>,
+    /// Its first saved request, or "".
+    pub saved: String,
+    /// The newest request for it and the newest that didn't match (0: none).
+    pub last: u64,
+    pub last_failing: u64,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct DriftEndpoint {
+    pub method: String,
+    pub path: String,
+    pub line: String,
+    pub last: u64,
+}
+
+#[rux::export]
+#[derive(Clone)]
+pub struct DriftView {
+    pub name: String,
+    pub checked: u64,
+    pub tried: u64,
+    pub off: u64,
+    pub ops: Vec<DriftOp>,
+    pub unknown: Vec<DriftEndpoint>,
+    pub stale: Vec<String>,
+}
+
+/// Where the API, as history saw it, and spec `name` part ways.
+#[rux::export]
+pub async fn spec_drift(name: String) -> Result<DriftView, CoreError> {
+    let drift = match shared()?.call(Command::SpecDrift { name }) {
+        Ok(Ok(ReplyBody::SpecDrift { drift })) => drift,
+        Ok(Ok(other)) => return Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => return Err(CoreError(refused)),
+        Err(e) => return Err(CoreError(e.to_string())),
+    };
+    let ops: Vec<DriftOp> = drift
+        .operations
+        .into_iter()
+        .map(|o| {
+            let mark = if o.failing > 0 || !o.undeclared.is_empty() {
+                "off"
+            } else if !o.undocumented.is_empty() {
+                "drift"
+            } else if o.sent == 0 {
+                "never"
+            } else {
+                "ok"
+            };
+            let statuses: Vec<String> = o.statuses.iter().map(u16::to_string).collect();
+            let seen = if o.sent == 0 {
+                "never sent".to_string()
+            } else {
+                let off = if o.failing > 0 { format!(" · {} off", o.failing) } else { String::new() };
+                format!("{} sent{off} · saw {}", o.sent, statuses.join(" "))
+            };
+            let mut lines: Vec<String> = o.undeclared.iter().map(|s| format!("answers {s}, which the spec doesn't list")).collect();
+            lines.extend(o.problems);
+            if !o.undocumented.is_empty() {
+                lines.push(format!("fields the spec doesn't name: {}", o.undocumented.join(", ")));
+            }
+            DriftOp {
+                method: o.method,
+                path: o.path,
+                summary: format!("{}{}", o.summary, if o.deprecated { " (deprecated)" } else { "" }),
+                mark: mark.into(),
+                seen,
+                lines,
+                saved: o.saved.into_iter().next().unwrap_or_default(),
+                last: o.last_request,
+                last_failing: o.last_failing,
+            }
+        })
+        .collect();
+    Ok(DriftView {
+        name: drift.spec.name,
+        checked: u64::from(drift.checked),
+        tried: ops.iter().filter(|o| o.mark != "never").count() as u64,
+        off: ops.iter().filter(|o| o.mark == "off").count() as u64,
+        ops,
+        unknown: drift
+            .undocumented
+            .into_iter()
+            .map(|e| DriftEndpoint {
+                line: format!("{} sent{}", e.sent, e.last_status.map(|s| format!(" · last answered {s}")).unwrap_or_default()),
+                method: e.method,
+                path: e.path,
+                last: e.last_request,
+            })
+            .collect(),
+        stale: drift.stale,
+    })
+}
+
+/// Serve spec `name` as a mock. Gives its id.
+#[rux::export]
+pub fn start_spec_mock(name: String) -> Result<u64, CoreError> {
+    match shared()?.call(Command::StartSpecMock { name, port: None }) {
+        Ok(Ok(ReplyBody::MockStarted { mock_id, .. })) => Ok(mock_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// How past request `request_id`'s answer measures up to a spec.
+#[rux::export]
+#[derive(Clone)]
+pub struct SpecCheck {
+    pub pass: bool,
+    /// `spec pet-shop · GET /pets/{petId} · 200 · Pet`.
+    pub head: String,
+    pub lines: Vec<String>,
+}
+
+#[rux::export]
+pub fn check_spec(request_id: u64) -> Result<SpecCheck, CoreError> {
+    let r = match shared()?.call(Command::CheckSpec { request_id, spec: None }) {
+        Ok(Ok(ReplyBody::SpecChecked { report })) => report,
+        Ok(Ok(other)) => return Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => return Err(CoreError(refused)),
+        Err(e) => return Err(CoreError(e.to_string())),
+    };
+    let mut head = format!("spec {} · {} · {}", r.spec, r.operation.clone().unwrap_or_else(|| "no operation".into()), r.status);
+    if let Some(schema) = &r.schema {
+        head.push_str(&format!(" · {schema}"));
+    }
+    let mut lines = r.problems;
+    lines.extend(r.undocumented.iter().map(|u| format!("{u} isn't in the spec")));
+    Ok(SpecCheck { pass: r.pass, head, lines })
 }
