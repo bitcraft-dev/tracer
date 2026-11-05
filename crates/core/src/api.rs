@@ -33,8 +33,13 @@ use crate::Stop;
 /// The most a request's head or body, or a WebSocket message, may be.
 const HEAD_MAX: usize = 64 * 1024;
 const BODY_MAX: usize = 16 * 1024 * 1024;
+/// How long a connection may sit silent before it has said hello.
+const HELLO_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn serve(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
+    // A connection that says nothing is let go: until it has said hello (or
+    // sent its HTTP request), it may wait this long for each read.
+    let _ = stream.set_read_timeout(Some(HELLO_WAIT));
     let mut first = [0u8; 1];
     match stream.peek(&mut first) {
         Ok(1) if first[0].is_ascii_alphabetic() => {}
@@ -189,7 +194,7 @@ fn command(head: &Head, body: &[u8], hub: Arc<Hub>, token: &str, stop: &Stop) ->
     let written = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = written.clone();
     let lines = [Ok(hello.to_string()), Ok(command.to_string())];
-    conn::serve(lines, move |line: &str| Ok(sink.lock().unwrap().push(line.to_string())), hub, token, stop);
+    conn::serve(lines, move |line: &str| Ok(sink.lock().unwrap().push(line.to_string())), hub, token, stop, conn::Wire::none());
 
     let mut answer = (400, json!({ "error": "the core gave no answer" }));
     for line in written.lock().unwrap().iter() {
@@ -217,11 +222,12 @@ fn websocket(reader: BufReader<TcpStream>, mut out: TcpStream, head: &Head, hub:
     if out.write_all(handshake.as_bytes()).is_err() {
         return;
     }
+    let wire = conn::Wire::of(&out);
     // Shared by the writer and the reader's pongs and close, a frame at a time.
     let out = Arc::new(Mutex::new(out));
     let write = out.clone();
     let write_line = move |line: &str| write_frame(&mut write.lock().unwrap(), TEXT, line.as_bytes());
-    conn::serve(Frames { reader, out }, write_line, hub, token, stop);
+    conn::serve(Frames { reader, out }, write_line, hub, token, stop, wire);
 }
 
 fn write_frame(out: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {

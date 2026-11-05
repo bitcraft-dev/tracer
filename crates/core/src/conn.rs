@@ -27,7 +27,39 @@ pub fn serve_tcp(stream: TcpStream, hub: Arc<Hub>, token: &str, stop: &Stop) {
     let Ok(write_half) = stream.try_clone() else { return };
     let mut w = BufWriter::new(write_half);
     let write_line = move |line: &str| writeln!(w, "{line}").and_then(|_| w.flush());
-    serve(BufReader::new(stream).lines(), write_line, hub, token, stop);
+    let wire = Wire::of(&stream);
+    serve(BufReader::new(stream).lines(), write_line, hub, token, stop, wire);
+}
+
+/// What `serve` may do to the connection under it: let it wait as long as
+/// it likes once it has said hello, and close it.
+pub struct Wire {
+    pub on_hello: Box<dyn FnOnce() + Send>,
+    pub close: Box<dyn Fn() + Send>,
+}
+
+impl Wire {
+    /// For a TCP stream (the protocol's, or a WebSocket's).
+    pub fn of(stream: &TcpStream) -> Wire {
+        let (a, b) = (stream.try_clone().ok(), stream.try_clone().ok());
+        Wire {
+            on_hello: Box::new(move || {
+                if let Some(s) = a {
+                    let _ = s.set_read_timeout(None);
+                }
+            }),
+            close: Box::new(move || {
+                if let Some(s) = &b {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }),
+        }
+    }
+
+    /// For a connection that is only ever one call.
+    pub fn none() -> Wire {
+        Wire { on_hello: Box::new(|| {}), close: Box::new(|| {}) }
+    }
 }
 
 /// A client whose messages arrive as `lines`, and whose replies and events
@@ -38,12 +70,35 @@ pub fn serve(
     hub: Arc<Hub>,
     token: &str,
     stop: &Stop,
+    wire: Wire,
 ) {
     let (out, rx) = mpsc::channel::<ServerMessage>();
+    let backlog = Arc::new(crate::hub::Backlog::default());
+    let counted = backlog.clone();
+    let Wire { on_hello, close } = wire;
+    let mut on_hello = Some(on_hello);
     let writer = thread::spawn(move || {
+        use std::sync::atomic::Ordering::SeqCst;
         for msg in rx {
+            let event = matches!(msg, ServerMessage::Event(_));
             let Ok(line) = serde_json::to_string(&msg) else { continue };
             if write_line(&line).is_err() {
+                break;
+            }
+            if event {
+                counted.pending.fetch_sub(1, SeqCst);
+            }
+            // Let go for falling behind: what was queued is written, then
+            // the client is told, and the connection closed.
+            if counted.lagged.load(SeqCst) && counted.pending.load(SeqCst) == 0 {
+                let why = format!(
+                    "this client fell more than {} events behind and was let go: connect again and subscribe with `since` the last event it has",
+                    crate::hub::BACKLOG
+                );
+                if let Ok(line) = serde_json::to_string(&reply(0, Err(why))) {
+                    let _ = write_line(&line);
+                }
+                close();
                 break;
             }
         }
@@ -81,6 +136,9 @@ pub fn serve(
                     Err("wrong token".to_string())
                 } else {
                     let actor = Actor { kind, name };
+                    if let Some(f) = on_hello.take() {
+                        f();
+                    }
                     let client = hub.join(actor.clone());
                     session = Some((client, actor));
                     Ok(ReplyBody::Welcome { client, protocol: PROTOCOL_VERSION })
@@ -91,7 +149,7 @@ pub fn serve(
             (Some((client, _)), Command::Subscribe { since }) => {
                 // The reply goes out before the replay, under the hub's lock,
                 // so the client reads "subscribed" and then the events.
-                hub.subscribe(*client, since, out.clone(), |replayed, next_seq| {
+                hub.subscribe(*client, since, out.clone(), backlog.clone(), |replayed, next_seq| {
                     reply(id, Ok(ReplyBody::Subscribed { replayed, next_seq }))
                 });
                 continue;

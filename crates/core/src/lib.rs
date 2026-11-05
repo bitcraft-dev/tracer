@@ -117,6 +117,9 @@ impl Running {
 /// How often the core looks for files changed behind it.
 const DISK_SCAN: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// At most this many connections at once; each is a thread.
+const MAX_CONNECTIONS: usize = 64;
+
 pub fn start(workspace: &Path) -> io::Result<Running> {
     fs::create_dir_all(workspace.join(".tracer"))?;
     // The journal, the discovery file's token and the secrets stay out of
@@ -151,16 +154,27 @@ pub fn start(workspace: &Path) -> io::Result<Running> {
     })?;
 
     let stop = running.stop.clone();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let accept = thread::Builder::new().name("tracer-accept".into()).spawn(move || {
         for stream in listener.incoming() {
             if stop.stopping.load(Ordering::SeqCst) {
                 break;
             }
-            let Ok(stream) = stream else { continue };
-            let (hub, token, stop) = (hub.clone(), token.clone(), stop.clone());
-            let _ = thread::Builder::new()
-                .name("tracer-client".into())
-                .spawn(move || api::serve(stream, hub, &token, &stop));
+            let Ok(mut stream) = stream else { continue };
+            // A connection is a thread: past the limit, it's refused
+            // rather than let grow without end.
+            if live.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                eprintln!("tracer core: refused a connection: {MAX_CONNECTIONS} are open");
+                use std::io::Write as _;
+                let _ = writeln!(stream, r#"{{"id":0,"error":"the core has {MAX_CONNECTIONS} connections open and takes no more"}}"#);
+                continue;
+            }
+            live.fetch_add(1, Ordering::SeqCst);
+            let (hub, token, stop, live) = (hub.clone(), token.clone(), stop.clone(), live.clone());
+            let _ = thread::Builder::new().name("tracer-client".into()).spawn(move || {
+                api::serve(stream, hub, &token, &stop);
+                live.fetch_sub(1, Ordering::SeqCst);
+            });
         }
     })?;
     Ok(Running { accept: Some(accept), ..running })

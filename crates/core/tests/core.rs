@@ -2232,3 +2232,18 @@ fn a_mock_a_stopped_core_was_serving_is_closed_by_the_next() {
     assert!(closed, "mock {mock_id} still looks served after a restart");
     core.stop();
 }
+
+#[test]
+fn a_connection_that_never_says_hello_is_let_go() {
+    let ws = workspace("silent");
+    let core = tracer_core::start(&ws).unwrap();
+    let mut raw = TcpStream::connect(("127.0.0.1", core.port)).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let started = std::time::Instant::now();
+    let mut buf = Vec::new();
+    // The core closes it: the read ends rather than waiting the 30 s.
+    let _ = raw.read_to_end(&mut buf);
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(9) && waited < Duration::from_secs(20), "closed after {waited:?}");
+    core.stop();
+}

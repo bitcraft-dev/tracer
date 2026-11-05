@@ -52,7 +52,7 @@ struct Inner {
     /// workspace will want this paged from the file instead.
     events: Vec<Event>,
     clients: BTreeMap<u64, Actor>,
-    subscribers: Vec<(u64, Sender<ServerMessage>)>,
+    subscribers: Vec<Subscriber>,
     /// Requests still running, each with the flag its worker checks to stop
     /// early. Whoever takes a request out of here publishes how it ended, so
     /// it ends exactly once.
@@ -352,7 +352,7 @@ impl Hub {
 
     pub fn leave(&self, client: u64) {
         let mut inner = self.inner.lock().unwrap();
-        inner.subscribers.retain(|(c, _)| *c != client);
+        inner.subscribers.retain(|s| s.client != client);
         if let Some(actor) = inner.clients.remove(&client) {
             publish_locked(&mut inner, actor, EventKind::ClientLeft { client });
         }
@@ -366,6 +366,7 @@ impl Hub {
         client: u64,
         since: Option<u64>,
         out: Sender<ServerMessage>,
+        backlog: Arc<Backlog>,
         first: impl FnOnce(u64, u64) -> ServerMessage,
     ) {
         let mut inner = self.inner.lock().unwrap();
@@ -373,12 +374,17 @@ impl Hub {
             Some(since) => inner.events.iter().filter(|e| e.seq > since).collect(),
             None => Vec::new(),
         };
+        let replayed = replay.len();
+        // Counted before any is sent: the writer counts each down as it goes.
+        backlog.pending.fetch_add(replayed, std::sync::atomic::Ordering::SeqCst);
         let _ = out.send(first(replay.len() as u64, inner.next_seq));
         for event in replay {
             let _ = out.send(ServerMessage::Event(event.clone()));
         }
-        inner.subscribers.retain(|(c, _)| *c != client);
-        inner.subscribers.push((client, out));
+        inner.subscribers.retain(|s| s.client != client);
+        // The replay is let through whole; past it, a client may fall
+        // `BACKLOG` events behind before it's let go.
+        inner.subscribers.push(Subscriber { client, out, backlog, allowance: replayed + BACKLOG });
     }
 
     /// Number a new request and publish that it started. Gives its id and
@@ -1287,6 +1293,26 @@ fn entries(events: &[Event]) -> Vec<HistoryEntry> {
     entries
 }
 
+/// How many live events a client may have waiting to be written before
+/// it's let go: a stuck client mustn't grow the core without limit. It can
+/// subscribe again with `since` and miss nothing.
+pub const BACKLOG: usize = 10_000;
+
+/// A client's events not yet written, counted by its connection's writer.
+#[derive(Default)]
+pub struct Backlog {
+    pub pending: std::sync::atomic::AtomicUsize,
+    /// Set when it fell too far behind and was let go.
+    pub lagged: std::sync::atomic::AtomicBool,
+}
+
+struct Subscriber {
+    client: u64,
+    out: Sender<ServerMessage>,
+    backlog: Arc<Backlog>,
+    allowance: usize,
+}
+
 fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {
     let seq = inner.next_seq;
     inner.next_seq += 1;
@@ -1319,10 +1345,18 @@ fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {
         }
     }
     // A subscriber whose connection has gone is dropped here rather than
-    // failing the publish for everyone else.
-    inner
-        .subscribers
-        .retain(|(_, out)| out.send(ServerMessage::Event(event.clone())).is_ok());
+    // failing the publish for everyone else; so is one too far behind,
+    // which its connection then closes, saying why (`conn.rs`).
+    inner.subscribers.retain(|s| {
+        use std::sync::atomic::Ordering::SeqCst;
+        if s.backlog.pending.load(SeqCst) >= s.allowance {
+            eprintln!("tracer core: client {} fell {} events behind and was let go", s.client, s.backlog.pending.load(SeqCst));
+            s.backlog.lagged.store(true, SeqCst);
+            return false;
+        }
+        s.backlog.pending.fetch_add(1, SeqCst);
+        s.out.send(ServerMessage::Event(event.clone())).is_ok()
+    });
     inner.events.push(event);
     if let Some(kind) = follow {
         publish_locked(inner, Actor { kind: ClientKind::Disk, name: "journal".into() }, kind);
@@ -1378,4 +1412,30 @@ mod tests {
         drop(inner);
         let _ = fs::remove_dir_all(&ws);
     }
+
+    #[test]
+    fn a_client_too_far_behind_is_let_go_and_told() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let ws = std::env::temp_dir().join(format!("tracer-backlog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let hub = Hub::open(&ws).unwrap();
+        let who = Actor { kind: ClientKind::Cli, name: "t".into() };
+        // Two events to replay, then a subscriber whose writer never writes.
+        hub.publish(who.clone(), EventKind::AgentsSwitched { allowed: true });
+        hub.publish(who.clone(), EventKind::AgentsSwitched { allowed: true });
+        let (out, _kept) = std::sync::mpsc::channel();
+        let backlog = Arc::new(Backlog::default());
+        hub.subscribe(7, Some(0), out, backlog.clone(), |_, _| ServerMessage::Event(Event { seq: 0, at_ms: 0, actor: who.clone(), kind: EventKind::AgentsSwitched { allowed: true } }));
+        assert_eq!(backlog.pending.load(SeqCst), 2);
+        for _ in 0..BACKLOG {
+            hub.publish(who.clone(), EventKind::AgentsSwitched { allowed: true });
+        }
+        assert!(!backlog.lagged.load(SeqCst), "the replay doesn't count against it");
+        hub.publish(who.clone(), EventKind::AgentsSwitched { allowed: true });
+        assert!(backlog.lagged.load(SeqCst));
+        assert!(hub.inner.lock().unwrap().subscribers.is_empty());
+        let _ = fs::remove_dir_all(&ws);
+    }
+
 }
