@@ -333,6 +333,10 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
     },
+    /// `query`'s problems against the GraphQL schema in finished request
+    /// `request_id`'s answer (as [`Command::GraphqlSchema`] reads it), each
+    /// at its line and column with what would fit there.
+    CheckGraphql { query: String, request_id: u64 },
     /// The GraphQL schema in finished request `request_id`'s answer: one
     /// sent with the introspection query ([`GRAPHQL_INTROSPECTION`]).
     GraphqlSchema { request_id: u64 },
@@ -974,7 +978,7 @@ pub struct StreamItem {
 /// three deep, enough for `[User!]!`, and arguments' two, so the whole query
 /// stays within the depth of 8 that servers commonly cap queries at; an
 /// argument of type `[ID!]!` reads as `[?]!`.
-pub const GRAPHQL_INTROSPECTION: &str = "query Schema { __schema { queryType { name } mutationType { name } subscriptionType { name } types { kind name description fields { name description args { name type { ...A } } type { ...T } } inputFields { name type { ...T } } enumValues { name } possibleTypes { name } } } } fragment T on __Type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } fragment A on __Type { kind name ofType { kind name ofType { kind name } } }";
+pub const GRAPHQL_INTROSPECTION: &str = "query Schema { __schema { queryType { name } mutationType { name } subscriptionType { name } types { kind name description fields { name description args { name defaultValue type { ...A } } type { ...T } } inputFields { name type { ...T } } enumValues { name } possibleTypes { name } } } } fragment T on __Type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } fragment A on __Type { kind name ofType { kind name ofType { kind name } } }";
 
 /// A GraphQL server's schema, as its introspection describes it, its own
 /// `__` types left out. The root types are named, or "" where it has none.
@@ -1048,6 +1052,27 @@ impl GqlSchema {
         }
         out.trim_end().to_string()
     }
+}
+
+/// A problem in a GraphQL query, against its server's schema.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqlProblem {
+    /// 1-based; the column counts characters.
+    pub line: u32,
+    pub col: u32,
+    /// The bytes of the query it's about, so a suggestion can replace them.
+    pub start: u64,
+    pub end: u64,
+    /// `error` or `warning`.
+    pub severity: String,
+    pub message: String,
+    /// What would fit there, nearest first: field names, values, types.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
+    /// Whether a suggestion replaces `start..end` (a misspelt name), or
+    /// only says what goes there.
+    #[serde(default)]
+    pub replaces: bool,
 }
 
 /// An OpenAPI document in the workspace.
@@ -1505,6 +1530,7 @@ pub enum ReplyBody {
     BenchCompared { comparison: BenchComparison },
     GraphqlSchema { schema: GqlSchema },
     SpecImported { imported: SpecImported },
+    GraphqlChecked { problems: Vec<GqlProblem> },
     Specs { specs: Vec<SpecInfo>, skipped: Vec<String> },
     SpecChecked { report: SpecReport },
     SpecDrift { drift: SpecDrift },

@@ -284,6 +284,14 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             };
             Ok(json!({ "request_id": request_id, "types": schema.types.len(), "sdl": schema.to_sdl() }))
         }
+        "check_graphql" => {
+            let query = str_arg(args, "query").ok_or("`query` is required")?.to_string();
+            let request_id = args.get("schema_request").and_then(Value::as_u64).ok_or("`schema_request` (the request_id graphql_schema gave) is required")?;
+            let ReplyBody::GraphqlChecked { problems } = call(core, Command::CheckGraphql { query, request_id })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "ok": problems.iter().all(|p| p.severity != "error"), "problems": problems }))
+        }
         "run_saved_request" => {
             let path = str_arg(args, "path").ok_or("`path` is required")?;
             let wanted = path.trim().trim_start_matches("requests/").trim_end_matches(".http");
@@ -1308,6 +1316,15 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": { "url": { "type": "string" }, "headers": headers, "env": env, "wait_seconds": wait },
                 "required": ["url"],
+            },
+        },
+        {
+            "name": "check_graphql",
+            "description": "Check a GraphQL query against a server's schema before sending it: unknown fields (with what the type has, nearest first), arguments missing or unknown, enum values, selections a leaf can't take or an object needs, fragments, and variables declared or not. Each problem has its line and column. `schema_request` is the request_id graphql_schema gave.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "query": { "type": "string" }, "schema_request": { "type": "integer" } },
+                "required": ["query", "schema_request"],
             },
         },
         {

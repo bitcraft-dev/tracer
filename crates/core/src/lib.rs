@@ -25,6 +25,7 @@ mod explain;
 mod export;
 mod files;
 mod flows;
+mod gqlcheck;
 mod graphql;
 mod guard;
 mod http;

@@ -168,6 +168,8 @@ pub fn serve(
                     Err(e) => Err(e),
                 }
             }
+            (Some(_), Command::CheckGraphql { query, request_id }) => graphql::cached_schema(&hub, request_id)
+                .map(|schema| ReplyBody::GraphqlChecked { problems: crate::gqlcheck::check(&query, &schema) }),
             (Some(_), Command::GraphqlSchema { request_id }) => match hub.response(request_id) {
                 Some((_, Some(response), _)) => graphql::schema(&response.body).map(|schema| ReplyBody::GraphqlSchema { schema }),
                 Some(_) => Err(format!("request #{request_id} has no answer to read a schema from")),

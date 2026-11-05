@@ -577,6 +577,46 @@ pub fn introspection() -> String {
     GRAPHQL_INTROSPECTION.to_string()
 }
 
+/// A problem in the GraphQL query being edited, for the page.
+#[rux::export]
+#[derive(Clone)]
+pub struct GqlDiag {
+    pub line: u32,
+    pub col: u32,
+    pub start: u64,
+    pub end: u64,
+    pub warning: bool,
+    pub message: String,
+    pub suggestions: Vec<String>,
+    /// Whether taking a suggestion replaces `start..end`.
+    pub replaces: bool,
+}
+
+/// `query`'s problems against the schema in request `request_id`'s answer.
+#[rux::export]
+pub fn check_graphql(query: String, request_id: u64) -> Result<Vec<GqlDiag>, CoreError> {
+    match shared()?.call(Command::CheckGraphql { query, request_id }) {
+        Ok(Ok(ReplyBody::GraphqlChecked { problems })) => Ok(problems
+            .into_iter()
+            .map(|p| GqlDiag { line: p.line, col: p.col, start: p.start, end: p.end, warning: p.severity == "warning", message: p.message, suggestions: p.suggestions, replaces: p.replaces })
+            .collect()),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// `text` with bytes `start..end` replaced by `with`: a suggestion taken.
+/// Out of range or off a character boundary, `text` as it was.
+#[rux::export]
+pub fn replace_range(text: String, start: u64, end: u64, with: String) -> String {
+    let (start, end) = (start as usize, end as usize);
+    if start > end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return text;
+    }
+    format!("{}{with}{}", &text[..start], &text[end..])
+}
+
 /// The schema in finished request `request_id`'s answer.
 #[rux::export]
 pub fn graphql_schema(request_id: u64) -> Result<GSchema, CoreError> {

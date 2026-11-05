@@ -187,6 +187,27 @@ fn errors_check(response: Result<&HttpResponse, &str>) -> CheckResult {
 
 /// The schema in an answer to [`tracer_protocol::GRAPHQL_INTROSPECTION`], the server's own
 /// `__` types left out.
+/// The schema in finished request `request_id`'s answer, read once: an
+/// editor asks again on every keystroke.
+pub fn cached_schema(hub: &crate::hub::Hub, request_id: u64) -> Result<std::sync::Arc<GqlSchema>, String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<Option<(u64, Arc<GqlSchema>)>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    if let Some((id, s)) = last.lock().unwrap().as_ref() {
+        if *id == request_id {
+            return Ok(s.clone());
+        }
+    }
+    let body = match hub.response(request_id) {
+        Some((_, Some(response), _)) => response.body,
+        Some(_) => return Err(format!("request #{request_id} has no answer yet")),
+        None => return Err(format!("there is no request #{request_id} in the history")),
+    };
+    let s = Arc::new(schema(&body)?);
+    *last.lock().unwrap() = Some((request_id, s.clone()));
+    Ok(s)
+}
+
 pub fn schema(body: &str) -> Result<GqlSchema, String> {
     let json: Value = serde_json::from_str(body).map_err(|_| "the answer is not JSON".to_string())?;
     if let Some(errors) = json.get("errors").and_then(Value::as_array).filter(|e| !e.is_empty()) {
@@ -214,7 +235,10 @@ pub fn schema(body: &str) -> Result<GqlSchema, String> {
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .map(|a| format!("{}: {}", text(a, "name"), type_name(a.get("type"))))
+                    .map(|a| match a.get("defaultValue").and_then(Value::as_str) {
+                        Some(d) => format!("{}: {} = {d}", text(a, "name"), type_name(a.get("type"))),
+                        None => format!("{}: {}", text(a, "name"), type_name(a.get("type"))),
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
                 ty: type_name(f.get("type")),

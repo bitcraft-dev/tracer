@@ -160,6 +160,20 @@
                     <input r-if="reqTab == &quot;headers&quot;" type="textarea" r-model="headerText" placeholder="Name: value, one per line" />
                     <input r-if="reqTab == &quot;checks&quot;" type="textarea" r-model="checksText" placeholder="one per line: status 2xx · $.id == 1 · header Content-Type contains json · time &lt; 500 · len($.items) &gt;= 3" />
                 </view>
+                <view class="gdiags" r-if="reqTab == &quot;query&quot; && gql">
+                    <text class="gd-hint" r-if="schemaId == 0">Load the schema (the Schema view, beside the response) and the query is checked against it as you type.</text>
+                    <text class="gd-ok" r-if="schemaId > 0 && gqlDiags.length == 0 && gqlQuery.trim() != &quot;&quot;">✓ fits the schema</text>
+                    <view class="gd" r-for="d in gqlDiags.slice(0, 6)">
+                        <view class="gd-top">
+                            <text class="gd-at" :class="{ warn: d.warning }">{{ d.line }}:{{ d.col }}</text>
+                            <text class="gd-m">{{ d.message }}</text>
+                        </view>
+                        <view class="gd-sugs" r-if="d.suggestions.length > 0">
+                            <view class="gd-s" r-for="sg in d.suggestions.slice(0, 8)" :class="{ take: d.replaces }" @tap="takeSuggestion(d, sg)"><text class="gd-s-t">{{ sg }}</text></view>
+                        </view>
+                    </view>
+                    <text class="gd-hint" r-if="gqlDiags.length > 6">and {{ gqlDiags.length - 6 }} more</text>
+                </view>
                 <text class="error" r-if="error != &quot;&quot;">{{ error }}</text>
                 <view class="split-h" @drag="resizeReq(event)"><view class="grip-h"></view></view>
 
@@ -1762,6 +1776,20 @@
     white-space: nowrap;
   }
 
+  .gdiags { display: flex; flex-direction: column; gap: 4px; padding: 6px 2px 0; flex-shrink: 0; max-height: 180px; overflow-y: auto; }
+  .gd { display: flex; flex-direction: column; gap: 3px; }
+  .gd-top { display: flex; gap: 8px; align-items: baseline; }
+  .gd-at { color: var(--c-f0716c); font-family: monospace; font-size: 11px; flex-shrink: 0; }
+  .gd-at.warn { color: var(--c-e8a54b); }
+  .gd-m { color: var(--c-d4d4d4); font-size: 12px; flex: 1; min-width: 0; overflow-wrap: break-word; }
+  .gd-sugs { display: flex; flex-wrap: wrap; gap: 4px; padding-left: 40px; }
+  .gd-s { padding: 1px 6px; border-radius: 4px; border: 1px solid var(--c-333333); }
+  .gd-s.take { border-color: var(--c-3a3550); cursor: pointer; }
+  .gd-s.take:hover { background: var(--c-2b2540); }
+  .gd-s-t { color: var(--c-9a9a9a); font-size: 11px; font-family: monospace; }
+  .gd-s.take .gd-s-t { color: var(--c-9d8ff5); }
+  .gd-ok { color: var(--c-4ec98f); font-size: 12px; }
+  .gd-hint { color: var(--c-7a7a7a); font-size: 12px; }
   .gql-m { display: flex; align-items: center; padding: 0 14px; }
   .gql-t { color: var(--c-e535ab); font-size: 14px; font-weight: 700; }
   .spec-from { flex: 3; }
@@ -1864,6 +1892,7 @@
   use type native::tracer::Comparison;
   use type native::tracer::GSchema;
   use type native::tracer::GType;
+  use type native::tracer::GqlDiag;
   use type native::tracer::CookieRow;
   use type native::tracer::SpecRow;
   use type native::tracer::DriftView;
@@ -2094,6 +2123,10 @@
   let schemaNote = signal("");
   // The introspection request whose answer becomes the schema, or 0.
   let schemaFor = signal(0);
+  // The request whose answer the loaded schema is, which the query is
+  // checked against as it's typed; 0 before one is loaded.
+  let schemaId = signal(0);
+  let gqlDiags: GqlDiag[] = signal([]);
   // The next bench's plan, as typed; blank is no limit.
   let bTotal = signal("200");
   let bConc = signal("10");
@@ -2401,6 +2434,21 @@
   let specCheck: SpecCheck? = signal(none);
   let specCheckFor = signal(0);
   computed spec = specs.find(x => x.name == specPick) ?? none;
+
+  // The query being edited, checked against the loaded schema each time
+  // it changes.
+  effect {
+    let q = gqlQuery;
+    if !gql || schemaId == 0 || q.trim() == "" {
+      gqlDiags = [];
+    } else {
+      try {
+        gqlDiags = tracer.checkGraphql(q, schemaId);
+      } catch e {
+        gqlDiags = [];
+      }
+    }
+  }
 
   // Every event the core publishes arrives here once, in the core's order,
   // replayed from the start of the journal when the window opens.
@@ -2830,10 +2878,17 @@
     schemaFor = 0;
     try {
       schema = tracer.graphqlSchema(id);
+      schemaId = id;
       schemaNote = "";
     } catch e {
       schemaNote = e.message;
     }
+  }
+
+  // A problem's suggestion: a name put in place of the misspelt one.
+  fn takeSuggestion(d: GqlDiag, s: string) {
+    if !d.replaces { return; }
+    gqlQuery = tracer.replaceRange(gqlQuery, d.start, d.end, s);
   }
 
   fn typeMatches(t: GType, q: string): bool {
