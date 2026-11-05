@@ -1048,6 +1048,9 @@ fn add_response(v: &mut Value, r: &HttpResponse, max: usize) {
             "download": ms(Some(r.timing.total_ms - r.timing.ttfb_ms)),
         });
     }
+    if r.tls_unchecked {
+        v["tls_unchecked"] = json!(true);
+    }
     v["size"] = json!(r.size);
     let headers: Vec<String> = r.headers.iter().map(|(k, val)| format!("{k}: {val}")).collect();
     v["headers"] = json!(headers);
@@ -1323,7 +1326,7 @@ fn tools() -> Value {
         },
         {
             "name": "list_cookies",
-            "description": "How the workspace's requests behave like a browser's (`cookies`: the jar is kept and sent back; `origin`: requests go as from a page there, with a CORS preflight where a browser sends one and a `CORS` check on the answer), and the cookies in the jar: names, domains, paths, expiry and flags, never values. A person switches these on (`tracer browser`).",
+            "description": "How the workspace's requests behave like a browser's (`cookies`: the jar is kept and sent back; `origin`: requests go as from a page there, with a CORS preflight where a browser sends one and a `CORS` check on the answer); `unchecked_tls`: hosts whose TLS certificates are accepted unchecked, an answer from one carrying `tls_unchecked`, and the cookies in the jar: names, domains, paths, expiry and flags, never values. A person switches these on (`tracer browser`).",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true },
         },

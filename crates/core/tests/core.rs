@@ -828,7 +828,7 @@ fn browser_behaviour_keeps_cookies_and_preflights_as_a_browser_would_once_switch
     assert_eq!(response.body, "");
 
     // On, it's kept and sent back; an agent may not switch it, nor see values.
-    let on = tracer_protocol::Browser { cookies: true, origin: None };
+    let on = tracer_protocol::Browser { cookies: true, origin: None, unchecked_tls: vec![] };
     assert!(agent.call(Command::SetBrowser { browser: on.clone() }).unwrap().is_err());
     assert_eq!(window.call(Command::SetBrowser { browser: on }).unwrap(), Ok(ReplyBody::BrowserSet));
     let id = send(&mut window, "GET", "/login", vec![]);
@@ -847,7 +847,7 @@ fn browser_behaviour_keeps_cookies_and_preflights_as_a_browser_would_once_switch
 
     // With a page's origin: PUT with X-Token is preflighted (a request of
     // its own), allowed, and its answer passes the CORS check.
-    let page = tracer_protocol::Browser { cookies: false, origin: Some("HTTPS://app.test:443/index.html".into()) };
+    let page = tracer_protocol::Browser { cookies: false, origin: Some("HTTPS://app.test:443/index.html".into()), unchecked_tls: vec![] };
     window.call(Command::SetBrowser { browser: page }).unwrap().unwrap();
     let Ok(ReplyBody::Cookies { browser, .. }) = window.call(Command::Cookies).unwrap() else { panic!() };
     assert_eq!(browser.origin.as_deref(), Some("https://app.test"));

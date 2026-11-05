@@ -209,6 +209,7 @@ mod tests {
             body: body.into(),
             size: 0,
             timing: Timing { ttfb_ms: 1.0, total_ms: 1.0, dns_ms: None, connect_ms: None, tls_ms: None },
+            tls_unchecked: false,
         };
         let r = gql("{ a }");
         let ok = checks(&r, Ok(&answer(r#"{"data":{"a":1}}"#)));

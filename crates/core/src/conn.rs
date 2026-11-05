@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, BenchPlan, CheckResult, ClientKind, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
+    Access, Actor, BenchPlan, Browser, CheckResult, ClientKind, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
 };
 
 use crate::baselines::{self, Side};
@@ -393,11 +393,11 @@ pub(crate) fn run_one(
     let outcome = resolved
         .and_then(|sending| {
             if realtime::is_websocket(&sending) {
-                realtime::websocket(&link, &sending)
-            } else if browser.cookies {
-                send_keeping_cookies(hub, actor, sending, redirects, cancelled, &read_events)
+                realtime::websocket(&link, &sending, http::tls_unchecked(&browser, &sending.url))
+            } else if browser.cookies || !browser.unchecked_tls.is_empty() {
+                send_hop_by_hop(hub, actor, &browser, sending, redirects, cancelled, &read_events)
             } else {
-                http::execute(&sending, redirects, cancelled, Some(&read_events))
+                http::execute(&sending, redirects, false, cancelled, Some(&read_events))
             }
         })
         .map(|response| envs::redact_response(response, &secrets))
@@ -422,22 +422,29 @@ pub(crate) fn run_one(
 /// The most redirects followed one at a time, as a browser's limit is.
 const MAX_REDIRECTS: usize = 20;
 
-/// Send `sending` as a browser with cookies does: each answer's
-/// `Set-Cookie` kept, and redirects followed a hop at a time so a cookie set
-/// on the way (a login's 302) is kept and the next hop gets the jar's
-/// cookies for its own URL. A 303, or a 301 or 302 to a POST, goes on as a
-/// GET without the body. The last hop's answer and timing are the answer.
-fn send_keeping_cookies(
+/// Send `sending` following redirects a hop at a time, as a browser does:
+/// with cookies on, each answer's `Set-Cookie` is kept, so a cookie set on
+/// the way (a login's 302) is kept and the next hop gets the jar's cookies
+/// for its own URL; and each hop's host is trusted without checking its
+/// certificate only if it's one of `browser.unchecked_tls`. A 303, or a 301
+/// or 302 to a POST, goes on as a GET without the body. The last hop's
+/// answer and timing are the answer.
+fn send_hop_by_hop(
     hub: &Hub,
     actor: &Actor,
+    browser: &Browser,
     mut sending: HttpRequest,
     redirects: bool,
     cancelled: &AtomicBool,
     read_events: http::EventsReader,
 ) -> Result<HttpResponse, String> {
-    for _ in 0..=MAX_REDIRECTS {
-        let response = http::execute(&sending, false, cancelled, Some(read_events))?;
-        hub.keep_cookies(actor.clone(), &sending.url, &response.headers);
+    for hop in 0..=MAX_REDIRECTS {
+        let unchecked = http::tls_unchecked(browser, &sending.url);
+        let response = http::execute(&sending, false, unchecked, cancelled, Some(read_events))
+            .map_err(|e| if hop == 0 { e } else { format!("redirected to {}: {e}", sending.url) })?;
+        if browser.cookies {
+            hub.keep_cookies(actor.clone(), &sending.url, &response.headers);
+        }
         let location = response.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).map(|(_, v)| v.trim());
         let next = match location {
             Some(to) if redirects && (300..400).contains(&response.status) && response.status != 304 => {
@@ -451,9 +458,11 @@ fn send_keeping_cookies(
             sending.body = None;
             sending.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-type") && !n.eq_ignore_ascii_case("content-length"));
         }
-        sending.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("cookie"));
-        if let Some(jar) = hub.cookie_header(&next) {
-            sending.headers.push(("Cookie".into(), jar));
+        if browser.cookies {
+            sending.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("cookie"));
+            if let Some(jar) = hub.cookie_header(&next) {
+                sending.headers.push(("Cookie".into(), jar));
+            }
         }
         sending.url = next;
     }
@@ -503,7 +512,8 @@ fn preflight(hub: &Hub, actor: &Actor, ask: &Ask, sending: &HttpRequest, secrets
     let (pre_id, cancelled) = hub.start_request(actor.clone(), as_written, ask.env.map(String::from), None, None, None);
     let to_send = cors::preflight_of(sending, ask.origin, ask.method, ask.headers);
     // A browser doesn't follow a preflight's redirect.
-    let outcome = http::execute(&to_send, false, &cancelled, None)
+    let unchecked = http::tls_unchecked(&hub.browser(), &to_send.url);
+    let outcome = http::execute(&to_send, false, unchecked, &cancelled, None)
         .map(|r| envs::redact_response(r, secrets))
         .map_err(|e| envs::redact(&e, secrets));
     let verdict = match &outcome {

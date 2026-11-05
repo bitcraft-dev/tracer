@@ -86,6 +86,9 @@ pub struct CoreEvent {
     pub dns_ms: f64,
     pub connect_ms: f64,
     pub tls_ms: f64,
+    /// The server's certificate wasn't checked (a host the workspace
+    /// trusts without checking), for `request_finished` and `stream_opened`.
+    pub tls_unchecked: bool,
     /// Why a request failed; for `policy_changed`, why the policy file was
     /// not taken, or "" if it was.
     pub error: String,
@@ -617,6 +620,8 @@ pub struct BrowserState {
     pub cookies: bool,
     /// The page's origin, or "".
     pub origin: String,
+    /// Hosts whose TLS certificates aren't checked, `, ` between them.
+    pub unchecked_tls: String,
     pub jar: Vec<CookieRow>,
 }
 
@@ -626,6 +631,7 @@ pub fn browser_state() -> Result<BrowserState, CoreError> {
     match shared()?.call(Command::Cookies) {
         Ok(Ok(ReplyBody::Cookies { browser, cookies })) => Ok(BrowserState {
             cookies: browser.cookies,
+            unchecked_tls: browser.unchecked_tls.join(", "),
             origin: browser.origin.unwrap_or_default(),
             jar: cookies
                 .into_iter()
@@ -657,11 +663,14 @@ pub fn browser_state() -> Result<BrowserState, CoreError> {
     }
 }
 
-/// Keep cookies or not, and send as a page at `origin` ("" for none).
+/// Keep cookies or not, send as a page at `origin` ("" for none), and
+/// don't check the TLS certificates of `unchecked_tls`'s hosts (separated
+/// by commas or spaces; "" for none).
 #[rux::export]
-pub fn set_browser(cookies: bool, origin: String) -> Result<(), CoreError> {
+pub fn set_browser(cookies: bool, origin: String, unchecked_tls: String) -> Result<(), CoreError> {
     let origin = (!origin.trim().is_empty()).then(|| origin.trim().to_string());
-    match shared()?.call(Command::SetBrowser { browser: Browser { cookies, origin } }) {
+    let unchecked_tls = unchecked_tls.split([',', ' ']).map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect();
+    match shared()?.call(Command::SetBrowser { browser: Browser { cookies, origin, unchecked_tls } }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
@@ -1049,6 +1058,7 @@ fn to_page(event: Event) -> CoreEvent {
         dns_ms: -1.0,
         connect_ms: -1.0,
         tls_ms: -1.0,
+        tls_unchecked: false,
         error: String::new(),
         reason: String::new(),
         allow: false,
@@ -1094,6 +1104,7 @@ fn to_page(event: Event) -> CoreEvent {
             out.dns_ms = response.timing.dns_ms.unwrap_or(-1.0);
             out.connect_ms = response.timing.connect_ms.unwrap_or(-1.0);
             out.tls_ms = response.timing.tls_ms.unwrap_or(-1.0);
+            out.tls_unchecked = response.tls_unchecked;
             out.body = shown(response.body);
         }
         EventKind::RequestFailed { request_id, error } => {
@@ -1199,6 +1210,7 @@ fn to_page(event: Event) -> CoreEvent {
             out.dns_ms = response.timing.dns_ms.unwrap_or(-1.0);
             out.connect_ms = response.timing.connect_ms.unwrap_or(-1.0);
             out.tls_ms = response.timing.tls_ms.unwrap_or(-1.0);
+            out.tls_unchecked = response.tls_unchecked;
         }
         EventKind::StreamMessage { request_id, message } => {
             (out.kind, out.request_id, out.n) = ("stream_message".into(), request_id, message.n);

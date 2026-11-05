@@ -163,7 +163,7 @@ mod tests {
     fn answer(status: u16, headers: &[(&str, &str)]) -> HttpResponse {
         let headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
         let timing = Timing { ttfb_ms: 1.0, total_ms: 1.0, dns_ms: None, connect_ms: None, tls_ms: None };
-        HttpResponse { status, headers, body: String::new(), size: 0, timing }
+        HttpResponse { status, headers, body: String::new(), size: 0, timing, tls_unchecked: false }
     }
 
     #[test]

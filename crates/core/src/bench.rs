@@ -75,7 +75,10 @@ fn run(
         Ok(found) => found,
         Err(why) => return (stats(&samples), Some(why)),
     };
-    let redirects = hub.rules_for(actor).is_none_or(|r| r.access != Access::Local);
+    // A host trusted without checking its certificate: its redirects
+    // aren't followed, so another host isn't trusted by the way.
+    let unchecked_tls = http::tls_unchecked(&hub.browser(), &sending.url);
+    let redirects = hub.rules_for(actor).is_none_or(|r| r.access != Access::Local) && !unchecked_tls;
     let total = plan.total.unwrap_or(u64::MAX);
     let deadline = plan.duration_secs.map(|s| started + Duration::from_secs(s));
     // The number of the next request to send; the first has gone.
@@ -84,7 +87,7 @@ fn run(
     let workers: Vec<_> = (0..plan.concurrency.min(total.saturating_sub(1).min(u32::MAX as u64) as u32))
         .map(|_| {
             let (shared, next, stop, samples) = (shared.clone(), next.clone(), stop.clone(), samples.clone());
-            thread::spawn(move || shared.work(redirects, &next, &stop, &samples))
+            thread::spawn(move || shared.work(redirects, unchecked_tls, &next, &stop, &samples))
         })
         .collect();
     while !workers.iter().all(|w| w.is_finished()) {
@@ -107,8 +110,8 @@ struct Worker {
 }
 
 impl Worker {
-    fn work(&self, redirects: bool, next: &AtomicU64, stop: &AtomicBool, samples: &Mutex<Samples>) {
-        let agent = http::keep_alive(redirects);
+    fn work(&self, redirects: bool, unchecked_tls: bool, next: &AtomicU64, stop: &AtomicBool, samples: &Mutex<Samples>) {
+        let agent = http::keep_alive(redirects, unchecked_tls);
         loop {
             let n = next.fetch_add(1, Ordering::SeqCst);
             if n >= self.total || stop.load(Ordering::SeqCst) {
@@ -302,7 +305,7 @@ mod tests {
 
     fn answer(status: u16, ms: f64) -> HttpResponse {
         let timing = Timing { ttfb_ms: ms, total_ms: ms, dns_ms: None, connect_ms: None, tls_ms: None };
-        HttpResponse { status, headers: vec![], body: String::new(), size: 0, timing }
+        HttpResponse { status, headers: vec![], body: String::new(), size: 0, timing, tls_unchecked: false }
     }
 
     #[test]

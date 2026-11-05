@@ -350,6 +350,10 @@ pub struct HttpResponse {
     /// The body's size in bytes, as received.
     pub size: u64,
     pub timing: Timing,
+    /// The server's certificate wasn't checked: its host is one the
+    /// workspace trusts without checking ([`Browser::unchecked_tls`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tls_unchecked: bool,
 }
 
 /// Where a request's time went, in milliseconds.
@@ -458,6 +462,30 @@ pub struct Browser {
     /// keep from the page fails a `CORS` check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Hosts whose TLS certificates aren't checked: a self-signed or
+    /// expired one is accepted. `localhost`, `*.dev.example.com` (the
+    /// domain and anything under it) or `*` (every host). Not a browser's
+    /// way but kept with them: a person sets it, never an agent. Each
+    /// redirect's host is judged on its own, and an answer got this way
+    /// says so ([`HttpResponse::tls_unchecked`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchecked_tls: Vec<String>,
+}
+
+impl Browser {
+    /// Whether `host` (a URL's host, no port) is one whose certificate
+    /// isn't checked.
+    pub fn tls_unchecked_for(&self, host: &str) -> bool {
+        let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+        self.unchecked_tls.iter().any(|pattern| {
+            let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+            match pattern.strip_prefix("*.") {
+                _ if pattern == "*" => true,
+                Some(domain) => host == domain || host.ends_with(&format!(".{domain}")),
+                None => host == pattern,
+            }
+        })
+    }
 }
 
 /// A cookie in the jar, as clients see it.
@@ -1348,6 +1376,24 @@ pub enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchecked_tls_hosts_match_exactly_or_by_domain() {
+        let browser = Browser { unchecked_tls: vec!["localhost".into(), "*.Dev.Test".into()], ..Browser::default() };
+        assert!(browser.tls_unchecked_for("localhost"));
+        assert!(browser.tls_unchecked_for("LOCALHOST."));
+        assert!(browser.tls_unchecked_for("dev.test"));
+        assert!(browser.tls_unchecked_for("api.dev.test"));
+        assert!(!browser.tls_unchecked_for("127.0.0.1"));
+        assert!(!browser.tls_unchecked_for("evildev.test"));
+        assert!(!browser.tls_unchecked_for("localhost.example.com"));
+        assert!(!Browser::default().tls_unchecked_for("localhost"));
+        let every = Browser { unchecked_tls: vec!["*".into()], ..Browser::default() };
+        assert!(every.tls_unchecked_for("example.com"));
+        // An old browser.json, without the field, reads.
+        let old: Browser = serde_json::from_str(r#"{"cookies":true}"#).unwrap();
+        assert!(old.unchecked_tls.is_empty());
+    }
 
     #[test]
     fn a_request_reads_as_flat_json() {

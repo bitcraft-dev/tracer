@@ -207,6 +207,7 @@
                                 <text class="link-t">re-run of #{{ sel.rerunOf }}</text>
                             </view>
                             <text class="chip" r-if="sel.env != &quot;&quot;">env {{ sel.env }}</text>
+                            <text class="chip warn-chip" r-if="sel.tlsUnchecked">TLS not checked</text>
                             <text class="chip" r-if="sel.flow > 0">flow {{ sel.flow }}</text>
                             <view class="chip link-chip" r-if="sel.bench > 0" @tap="showBench(sel.bench)">
                                 <text class="link-t">first of bench {{ sel.bench }}</text>
@@ -430,7 +431,7 @@
             <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
             <text class="status-t flow-t" r-if="lastBench != &quot;&quot;" :class="{ bad: !benchOk }" @tap="showBench(benchId)">{{ lastBench }}</text>
             <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
-            <view class="browser-chip" :class="{ on: browserOn || browserOrigin != &quot;&quot; }" @tap="openBrowser()">
+            <view class="browser-chip" :class="{ on: browserOn || browserOrigin != &quot;&quot;, warn: browserTls != &quot;&quot; }" @tap="openBrowser()">
                 <text class="browser-t">{{ browserLabel() }}</text>
             </view>
             <view class="agents" :class="{ off: !agentsOn }" @tap="setAgents(!agentsOn)">
@@ -450,6 +451,9 @@
             <text class="sub">Page origin, blank for none</text>
             <view class="pal-field small"><input r-model="bOrigin" placeholder="https://app.example.com" /></view>
             <text class="sub">As from a page there: Origin is sent to other origins, a request a browser would preflight goes after its OPTIONS (in History), and the answer gets a CORS check.</text>
+            <text class="sub">Hosts whose TLS certificates aren't checked, blank for none</text>
+            <view class="pal-field small"><input r-model="bTls" placeholder="localhost, *.dev.example.com" /></view>
+            <text class="sub">A self-signed or expired certificate is accepted from these (`*` for every host). Each redirect's host is judged on its own; an answer got this way says "TLS not checked".</text>
             <view class="b-actions">
                 <text class="mono err" r-if="browserError != &quot;&quot;">{{ browserError }}</text>
                 <view class="save" @tap="saveBrowser()"><text class="save-t">Save</text></view>
@@ -1215,6 +1219,9 @@
   .browser-t { color: #8a8a8a; font-size: 11px; }
   .browser-chip.on { border: 1px solid #3a3550; }
   .browser-chip.on .browser-t { color: #c8c0f8; }
+  .browser-chip.warn { border: 1px solid #5a4020; }
+  .browser-chip.warn .browser-t { color: #e0b070; }
+  .warn-chip { color: #e0b070; }
   .b-row { display: flex; gap: 8px; align-items: center; padding: 8px 2px; cursor: pointer; }
   .b-box { color: #c8c0f8; font-size: 16px; }
   .b-t { color: #d4d4d4; font-size: 13px; }
@@ -1538,6 +1545,8 @@
     dnsMs: float,
     connectMs: float,
     tlsMs: float,
+    // The server's certificate wasn't checked.
+    tlsUnchecked: bool,
     size: int,
     body: string,
     resHeaders: Header[],
@@ -1801,10 +1810,12 @@
   // the panel's draft of the setting.
   let browserOn = signal(false);
   let browserOrigin = signal("");
+  let browserTls = signal("");
   let jar: CookieRow[] = signal([]);
   let browserOpen = signal(false);
   let bCookies = signal(false);
   let bOrigin = signal("");
+  let bTls = signal("");
   let browserError = signal("");
 
   effect {
@@ -1816,6 +1827,7 @@
       let b = tracer.browserState();
       browserOn = b.cookies;
       browserOrigin = b.origin;
+      browserTls = b.uncheckedTls;
       jar = b.jar;
     } catch e {
       browserError = e.message;
@@ -1823,6 +1835,11 @@
   }
 
   fn browserLabel(): string {
+    let tls = if browserTls != "" { " · TLS unchecked" } else { "" };
+    `${browserBase()}${tls}`
+  }
+
+  fn browserBase(): string {
     let host = browserOrigin.replace("https://", "").replace("http://", "");
     if browserOn && browserOrigin != "" {
       `cookies · ${host}`
@@ -1838,6 +1855,7 @@
   fn openBrowser() {
     bCookies = browserOn;
     bOrigin = browserOrigin;
+    bTls = browserTls;
     browserError = "";
     loadBrowser();
     browserOpen = true;
@@ -1845,7 +1863,7 @@
 
   fn saveBrowser() {
     try {
-      tracer.setBrowser(bCookies, bOrigin);
+      tracer.setBrowser(bCookies, bOrigin, bTls);
       browserError = "";
       browserOpen = false;
     } catch e {
@@ -2012,6 +2030,7 @@
           dnsMs: -1.0,
           connectMs: -1.0,
           tlsMs: -1.0,
+          tlsUnchecked: false,
           size: 0,
           body: "",
           resHeaders: [],
@@ -2323,6 +2342,7 @@
     out.dnsMs = e.dnsMs;
     out.connectMs = e.connectMs;
     out.tlsMs = e.tlsMs;
+    out.tlsUnchecked = e.tlsUnchecked;
     out
   }
 
@@ -2780,6 +2800,7 @@
       out.dnsMs = e.dnsMs;
       out.connectMs = e.connectMs;
       out.tlsMs = e.tlsMs;
+      out.tlsUnchecked = e.tlsUnchecked;
       out.size = e.size;
       out.body = e.body;
       out.resHeaders = e.headers;

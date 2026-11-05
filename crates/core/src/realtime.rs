@@ -222,9 +222,69 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// Like [`tls_config`], but taking any certificate: for a host the
+/// workspace trusts without checking (`Browser::unchecked_tls`). The
+/// handshake's signatures are still verified; who signed the certificate,
+/// its names and its dates are not.
+fn unchecked_tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let verifier = Arc::new(AnyCertificate(provider.clone()));
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("ring has TLS 1.2 and 1.3")
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            Arc::new(config)
+        })
+        .clone()
+}
+
+#[derive(Debug)]
+struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// Open `request`'s WebSocket and keep it until it's closed. An answer to
-/// the handshake other than `101` is an ordinary finished request.
-pub fn websocket(link: &Link, request: &HttpRequest) -> Result<HttpResponse, String> {
+/// the handshake other than `101` is an ordinary finished request. With
+/// `unchecked_tls`, a `wss:` server's certificate isn't checked.
+pub fn websocket(link: &Link, request: &HttpRequest, unchecked_tls: bool) -> Result<HttpResponse, String> {
     let uri: Uri = request.url.parse().map_err(|e| format!("`{}` is not a URL: {e}", request.url))?;
     let tls = match uri.scheme_str().map(str::to_ascii_lowercase).as_deref() {
         Some("wss" | "https") => true,
@@ -248,7 +308,7 @@ pub fn websocket(link: &Link, request: &HttpRequest) -> Result<HttpResponse, Str
     tcp.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| e.to_string())?;
     let mut conn = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("{host}: {e}"))?;
-        let mut session = rustls::ClientConnection::new(tls_config(), name).map_err(|e| e.to_string())?;
+        let mut session = rustls::ClientConnection::new(if unchecked_tls { unchecked_tls_config() } else { tls_config() }, name).map_err(|e| e.to_string())?;
         let mut tcp = tcp;
         while session.is_handshaking() {
             session.complete_io(&mut tcp).map_err(|e| format!("TLS with {host}: {e}"))?;
@@ -291,12 +351,12 @@ pub fn websocket(link: &Link, request: &HttpRequest) -> Result<HttpResponse, Str
         let mut timing = timing;
         timing.total_ms = ms(started.elapsed());
         let size = body.len() as u64;
-        return Ok(HttpResponse { status, headers, size, body: String::from_utf8_lossy(&body).into_owned(), timing });
+        return Ok(HttpResponse { status, headers, size, body: String::from_utf8_lossy(&body).into_owned(), timing, tls_unchecked: unchecked_tls && tls });
     }
     if header("sec-websocket-accept").map(str::trim) != Some(ws::accept_key(&key).as_str()) {
         return Err("the server agreed to a WebSocket but answered the handshake's key wrongly".into());
     }
-    let head = HttpResponse { status, headers, size: 0, body: String::new(), timing };
+    let head = HttpResponse { status, headers, size: 0, body: String::new(), timing, tls_unchecked: unchecked_tls && tls };
     let Some(outbox) = link.hub.open_stream(link.actor.clone(), link.request_id, StreamKind::Websocket, head.clone()) else {
         return Err("cancelled".into());
     };

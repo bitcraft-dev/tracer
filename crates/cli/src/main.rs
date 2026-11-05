@@ -105,11 +105,13 @@ usage:
                                       2s); a line an answer; exits 0 when the streak
                                       came, 1 when it ended without it
   tracer until stop <ID>              stop a running run-until, whoever started it
-  tracer browser [cookies on|off] [origin <URL>|none]
+  tracer browser [cookies on|off] [origin <URL>|none] [tls <HOSTS>|none]
                                       how requests behave like a browser's (off
                                       unless set): keep cookies and send them back;
                                       as a page at URL, send Origin, preflight what
-                                      a browser would, and check the answer's CORS
+                                      a browser would, and check the answer's CORS;
+                                      HOSTS (localhost,*.dev.test or *) have their
+                                      TLS certificates accepted unchecked
   tracer cookies [clear [DOMAIN]]     the cookie jar, or empty it (a domain's part)
   tracer schema <URL|PATH> [-H 'Name: value']... [--env <NAME>]
                                       a GraphQL server's schema as SDL, asked by
@@ -870,6 +872,10 @@ fn browser(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
                 ("cookies", Some("off")) => browser.cookies = false,
                 ("origin", Some("none")) => browser.origin = None,
                 ("origin", Some(url)) => browser.origin = Some(url.to_string()),
+                ("tls", Some("none")) => browser.unchecked_tls.clear(),
+                ("tls", Some(hosts)) => {
+                    browser.unchecked_tls = hosts.split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect()
+                }
                 _ => return Err(io::Error::other(USAGE)),
             }
         }
@@ -883,6 +889,10 @@ fn browser(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     match &browser.origin {
         Some(origin) => println!("origin   {origin}: Origin sent, preflights as a browser's, answers checked for CORS"),
         None => println!("origin   none: no CORS"),
+    }
+    match browser.unchecked_tls.as_slice() {
+        [] => println!("tls      every certificate checked"),
+        hosts => println!("tls      certificates NOT checked for {}", hosts.join(", ")),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1457,6 +1467,9 @@ fn send_and_wait(workspace: &PathBuf, sending: Command, name: &str, until: Until
                     response.timing.total_ms,
                     response.size
                 );
+                if response.tls_unchecked {
+                    eprintln!("TLS not checked: the server's certificate was accepted unchecked (tracer browser)");
+                }
                 if !streamed {
                     println!("{}", response.body);
                 }
@@ -1580,9 +1593,10 @@ fn describe(event: &Event) -> String {
         }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
         EventKind::BrowserChanged { browser } => format!(
-            "browser behaviour: cookies {}, origin {}",
+            "browser behaviour: cookies {}, origin {}, TLS unchecked for {}",
             if browser.cookies { "on" } else { "off" },
-            browser.origin.as_deref().unwrap_or("none")
+            browser.origin.as_deref().unwrap_or("none"),
+            if browser.unchecked_tls.is_empty() { "none".to_string() } else { browser.unchecked_tls.join(", ") }
         ),
         EventKind::CookiesChanged { cookies } => {
             format!("cookie jar: {} cookie{}", cookies.len(), if cookies.len() == 1 { "" } else { "s" })
