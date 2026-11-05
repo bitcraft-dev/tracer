@@ -17,7 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
-use crate::{explain, export, files, import};
+use crate::{discover, explain, export, files, import};
 use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
@@ -226,6 +226,9 @@ pub fn serve(
                     Ok(ReplyBody::Explained { text: explain::bundle(&case), failed, summary })
                 }
             },
+            (Some(_), Command::LocalServers { ports }) => {
+                Ok(ReplyBody::LocalServers { servers: discover::local_servers(stop.port, &ports) })
+            }
             (Some(_), Command::Import { text }) => import::import(&text).map(|(request, notes)| ReplyBody::Imported { http: files::to_text(&request), request, notes }),
             (Some((_, actor)), Command::Cookies) => {
                 let (browser, cookies) = hub.cookies(actor.kind != ClientKind::Agent);

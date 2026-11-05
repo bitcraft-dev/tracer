@@ -371,6 +371,17 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             };
             Ok(json!({ "as": lang.name(), "code": text }))
         }
+        "local_servers" => {
+            let ports = args
+                .get("ports")
+                .and_then(Value::as_array)
+                .map(|ps| ps.iter().filter_map(Value::as_u64).filter_map(|p| u16::try_from(p).ok()).collect())
+                .unwrap_or_default();
+            let ReplyBody::LocalServers { servers } = call(core, Command::LocalServers { ports })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "servers": servers }))
+        }
         "explain_request" => {
             let request_id = args.get("request_id").and_then(Value::as_u64).ok_or("`request_id` is required")?;
             let ReplyBody::Explained { text, failed, summary } = call(core, Command::Explain { request_id })? else {
@@ -1414,6 +1425,15 @@ fn tools() -> Value {
                     "as": { "type": "string", "enum": ["curl", "fetch", "python", "rux"] },
                     "env": { "type": "string", "description": "The environment to fill variables from." },
                 },
+            },
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "local_servers",
+            "description": "The servers answering HTTP or HTTPS on this machine: every port the system says is listening (or the usual dev ports where it can't say), and `ports` too, each with what GET / answered, its Server header, an HTML title, the process listening, and the path of an OpenAPI document if one is served. Takes a few seconds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "ports": { "type": "array", "items": { "type": "integer" }, "description": "More ports to try." } },
             },
             "annotations": { "readOnlyHint": true },
         },

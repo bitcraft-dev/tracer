@@ -416,6 +416,39 @@ pub fn export_as(lang: String, method: String, url: String, headers: Vec<Header>
     }
 }
 
+/// A server answering on this machine, for the Servers panel.
+#[rux::export]
+#[derive(Clone)]
+pub struct ServerRow {
+    pub port: u32,
+    pub url: String,
+    pub status: u32,
+    /// The process, its Server header and an HTML title, those known.
+    pub about: String,
+    /// The OpenAPI document's path, or "".
+    pub openapi: String,
+}
+
+/// The servers answering HTTP on this machine. Takes a few seconds.
+#[rux::export]
+pub async fn local_servers() -> Result<Vec<ServerRow>, CoreError> {
+    match shared()?.call(Command::LocalServers { ports: Vec::new() }) {
+        Ok(Ok(ReplyBody::LocalServers { servers })) => Ok(servers
+            .into_iter()
+            .map(|s| ServerRow {
+                port: u32::from(s.port),
+                url: s.url,
+                status: u32::from(s.status),
+                about: [s.process, s.server, s.title.map(|t| format!("“{t}”"))].into_iter().flatten().collect::<Vec<_>>().join(" · "),
+                openapi: s.openapi.unwrap_or_default(),
+            })
+            .collect()),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
 /// Past request `request_id` as Markdown explaining how it went.
 #[rux::export]
 pub fn explain(request_id: u64) -> Result<String, CoreError> {

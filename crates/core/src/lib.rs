@@ -17,6 +17,7 @@ mod conn;
 mod cookies;
 mod cors;
 mod diff;
+mod discover;
 mod envs;
 mod expect;
 mod explain;

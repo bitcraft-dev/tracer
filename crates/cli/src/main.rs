@@ -136,6 +136,10 @@ usage:
                                       or an AI: request, env (secrets named only),
                                       answer, timing, checks, settings, and the
                                       last time it worked
+  tracer servers [PORT]...            the servers answering HTTP(S) on this
+                                      machine: its listening ports (or the usual
+                                      dev ports) and PORTs, with what answers /,
+                                      the process, and any OpenAPI document
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -192,6 +196,7 @@ fn main() -> ExitCode {
         Some("export") => export(workspace, args[1..].to_vec()),
         Some("import") => import(workspace, args[1..].to_vec()),
         Some("explain") => explain(workspace, args[1..].to_vec()),
+        Some("servers") => servers(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
@@ -1442,6 +1447,40 @@ fn export(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
         Ok(other) => Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => Err(io::Error::other(e)),
     }
+}
+
+fn servers(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
+    let ports = args
+        .iter()
+        .map(|p| p.parse::<u16>().map_err(|_| io::Error::other(format!("`{p}` isn't a port"))))
+        .collect::<io::Result<Vec<u16>>>()?;
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer servers")?;
+    eprintln!("looking…");
+    let servers = match client.call(Command::LocalServers { ports })? {
+        Ok(ReplyBody::LocalServers { servers }) => servers,
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    if servers.is_empty() {
+        println!("nothing answers HTTP on this machine's listening ports");
+    }
+    for s in servers {
+        let mut line = format!("{:<28} {}", s.url, s.status);
+        if let Some(process) = &s.process {
+            line.push_str(&format!("  {process}"));
+        }
+        if let Some(server) = &s.server {
+            line.push_str(&format!("  ({server})"));
+        }
+        if let Some(title) = &s.title {
+            line.push_str(&format!("  \"{title}\""));
+        }
+        if let Some(openapi) = &s.openapi {
+            line.push_str(&format!("  OpenAPI at {openapi}"));
+        }
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn explain(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {

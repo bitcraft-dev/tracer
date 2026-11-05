@@ -186,6 +186,14 @@ pub enum Command {
     /// answer and its timing, the checks, the workspace's browser
     /// behaviour, and the last time the same request worked.
     Explain { request_id: u64 },
+    /// The servers answering HTTP on this machine: every TCP port the
+    /// system says is listening (or the usual dev ports, where it can't
+    /// say), and `ports` too, each tried for HTTP then HTTPS and looked
+    /// over for an OpenAPI document. Takes a few seconds.
+    LocalServers {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ports: Vec<u16>,
+    },
     /// Empty the jar, or only `domain`'s cookies (and its subdomains').
     /// A person's to do. Published as `cookies_changed`.
     ClearCookies {
@@ -460,6 +468,33 @@ impl BenchPlan {
         out.push_str(&format!(", {} at a time", self.concurrency));
         out
     }
+}
+
+/// A server answering on this machine ([`Command::LocalServers`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalServer {
+    pub port: u16,
+    /// `http://127.0.0.1:<port>/` (or `[::1]`, the address that answered),
+    /// `https://` when only TLS answered.
+    pub url: String,
+    /// What `GET /` answered.
+    pub status: u16,
+    /// Its `Server` (or `X-Powered-By`) header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// An HTML page's title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The path of an OpenAPI (or Swagger) document it serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi: Option<String>,
+    /// The process listening, where the system says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
 }
 
 /// What [`Command::Export`] writes a request as.
@@ -1261,6 +1296,7 @@ pub enum ReplyBody {
     /// `failed`: it went wrong (no answer, an error status, a failed
     /// check, cancelled, or not allowed); `summary` says how in a line.
     Explained { text: String, failed: bool, summary: String },
+    LocalServers { servers: Vec<LocalServer> },
     /// The request read, the same as a `.http` file's text, and what of
     /// the command wasn't carried over.
     Imported {

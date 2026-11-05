@@ -444,6 +444,17 @@
             <text class="status-t key">Ctrl+K</text>
         </view>
 
+        <view class="scrim" r-if="serversOpen" @tap="serversOpen = false">
+        <view class="palette" @tap="noop()">
+            <text class="prompt-h">Servers on this machine</text>
+            <text class="sub">{{ serversNote }}</text>
+            <view class="cmd srv" r-for="s in servers" r-key="s.port" @tap="useServer(s)">
+                <text class="cmd-label">{{ s.url }} · {{ s.status }}</text>
+                <text class="cmd-hint">{{ s.about }}{{ if s.openapi != "" { ` · OpenAPI at ${s.openapi}` } else { "" } }}</text>
+            </view>
+        </view>
+        </view>
+
         <view class="scrim" r-if="copyOpen" @tap="copyOpen = false">
         <view class="palette" @tap="noop()">
             <text class="prompt-h">Copy {{ if copyWhich == "sel" { "the request on show" } else { "the request being edited" } }} as</text>
@@ -1329,6 +1340,8 @@
   .cmd.on { background: #2b2540; }
   .cmd-label { flex: 1; color: #d4d4d4; font-size: 13px; }
   .cmd-hint { color: #7a7a7a; font-size: 11px; font-family: monospace; }
+  .cmd.srv { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .cmd.srv .cmd-label { flex: none; }
 
   .prompt-h {
     color: #f0f0f0;
@@ -1538,6 +1551,7 @@
   use type native::tracer::CoreEvent;
   use type native::tracer::Header;
   use type native::tracer::Saved;
+  use type native::tracer::ServerRow;
   use type native::tracer::Env;
   use type native::tracer::Var;
   use type native::tracer::Check;
@@ -1669,6 +1683,7 @@
     { id: "copy-sel", label: "Copy the request on show as code (cURL, fetch, Python, Rux)", hint: "" },
     { id: "copy-editor", label: "Copy the request being edited as code (cURL, fetch, Python, Rux)", hint: "" },
     { id: "explain", label: "Copy the request on show, explained, for a person or an AI", hint: "" },
+    { id: "servers", label: "Find servers running on this machine", hint: "" },
     { id: "paste", label: "Paste a curl command or fetch call as a new request", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
@@ -2560,6 +2575,33 @@
     }
   }
 
+  // The servers answering on this machine, for the Servers panel.
+  let serversOpen = signal(false);
+  let servers: ServerRow[] = signal([]);
+  let serversNote = signal("");
+
+  async fn findServers() {
+    servers = [];
+    serversNote = "looking at this machine's listening ports…";
+    serversOpen = true;
+    try {
+      servers = await tracer.localServers();
+      serversNote = if servers.length == 0 {
+        "nothing answers HTTP on this machine's listening ports"
+      } else {
+        "Pick one to send to it: the URL goes in the editor."
+      };
+    } catch e {
+      serversNote = `could not look: ${e.message}`;
+    }
+  }
+
+  fn useServer(s: ServerRow) {
+    url = if s.openapi != "" { `${s.url}${s.openapi.slice(1)}` } else { s.url };
+    serversOpen = false;
+    notice = if s.openapi != "" { `its OpenAPI document; ${s.url} is the server` } else { `${s.url} (${s.about})` };
+  }
+
   // Everything about the request on show that helps say why it went as
   // it did, as Markdown on the clipboard, to paste to a person or an AI.
   fn copyExplain() {
@@ -3389,6 +3431,8 @@
       openCopy("sel");
     } else if id == "copy-editor" {
       openCopy("editor");
+    } else if id == "servers" {
+      findServers();
     } else if id == "explain" {
       copyExplain();
     } else if id == "paste" {
