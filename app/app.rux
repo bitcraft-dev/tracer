@@ -458,10 +458,10 @@
                         <text class="mono err" r-for="x in bn.errors">no answer: {{ x }}</text>
                         <text class="mono warn-t" r-if="bn.rate != &quot;&quot;">rate {{ bn.rate }}</text>
                         <view class="cmp-bar" r-if="!benchRunning">
-                             <view class="bf-in"><input r-model="baselineName" placeholder="main" /></view>
+                             <view class="cmp-box cmp-name"><input r-model="baselineName" placeholder="name, such as main" /></view>
                              <view class="link" @tap="saveBaseline()"><text class="link-t">Save as baseline</text></view>
-                             <text class="sub">compare with</text>
-                             <view class="cmp-pick"><input type="select" r-model="compareWith" :options="compareOptions" /></view>
+                             <text class="cmp-with">compare with</text>
+                             <view class="cmp-box cmp-pick"><input type="select" r-model="compareWith" :options="compareOptions" /></view>
                              <view class="link" @tap="compareNow()"><text class="link-t">Compare</text></view>
                         </view>
                         <text class="mono dim" r-if="cmpNote != &quot;&quot;">{{ cmpNote }}</text>
@@ -1856,6 +1856,19 @@
   .u-streak { color: var(--c-7a7a7a); font-size: 12px; font-family: monospace; }
   .cmp-bar { display: flex; gap: 10px; align-items: center; padding-top: 6px; }
   .cmp-pick { width: 200px; }
+  /* The baseline row's two fields: one box each, as tall as the row's links. */
+  .cmp-box {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    background: var(--c-1e1e1e);
+    border: 1px solid var(--c-2e2e2e);
+    border-radius: 6px;
+    padding: 0 8px;
+    flex-shrink: 0;
+  }
+  .cmp-name { width: 220px; }
+  .cmp-with { color: var(--c-7a7a7a); font-size: 11px; }
   .cmp { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; background: var(--c-1a1a1a); border: 1px solid var(--c-262626); border-radius: 6px; }
   .cmp-row { display: flex; gap: 12px; align-items: baseline; }
   .cmp-l { width: 80px; color: var(--c-8a8a8a); font-size: 12px; }

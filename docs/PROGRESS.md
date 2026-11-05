@@ -5,7 +5,20 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-11-05, afternoon)
+## Where it stands (2026-11-05, evening)
+
+The user is taking the open findings to the Rux team, and asked for the
+housekeeping and the small Tracer items meanwhile. Both branches pushed
+(e58c6d0), then done and driven: a dead core's mock closed by the next
+(e19a6c0's parent), journal write failures said (ada24b6), tokens and
+WebSocket keys from the OS's randomness (d766e99), connections limited, a
+hello deadline and slow clients let go (4bb7889, fixed in 40245e5: see the
+gotchas), a relative `rux-native` path (40245e5), and the Bench baseline
+row (below). Left of the outside review: retention of events (M-L), disk
+file-change notifications (M), splitting `app.rux`, and the protocol
+questions. Nothing of this session is running.
+
+## Where it stood (2026-11-05, afternoon)
 
 The user picked three things: OpenAPI (import, validation, drift, a spec
 mock), the schema-aware query editor, and undo in the editor. All three
@@ -825,14 +838,14 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    reading of run-until, told to the user: with a named kind, any other
    answer, a 500 too, resets the streak. Follow-ups: a per-environment
    jar; a response's own Cookies tab (the plan's).
-6. Small: the Bench panel's baseline name field is drawn taller than
-   its row (seen 2026-11-04, not looked into).
+6. ~~The Bench baseline name field taller than its row~~: done
+   2026-11-05; the row's name and compare fields share a 28 px box.
 7. **Not built yet from PLAN.md** (2026-11-05, afternoon): gRPC (a
    stretch). Phase 5's chat waits for release time (the user's call,
    2026-11-05). Waiting on Rux: completion at the caret and highlighting
    in the query field (AW-046); when AW-044 is fixed, move the API view's
    signals back beside their functions.
-9. **A mock from a dead core shows as serving**: the journal replays
+9. ~~**A mock from a dead core shows as serving**~~ (done 2026-11-05): the journal replays
    `mock_started` and nothing says it stopped when that core went (seen
    2026-11-05: the status bar's mock chip after a restart). Close mocks
    as dangling requests are closed when a core opens a journal. S.
@@ -882,6 +895,13 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
      state that can be rebuilt), not `Hub` itself.
 
 ## Gotchas and how they were solved
+
+- **On Windows a read timeout set through `TcpStream::try_clone()` doesn't
+  reach the socket** (the clone is a duplicated handle with its own
+  options): clearing the hello timeout that way left every client cut off
+  10 s after connecting, the window showing "core lost: the core hung up".
+  A watchdog that calls `shutdown` (which acts on the socket) replaced it.
+  Test quiet clients for longer than any deadline.
 
 - **Bash heredocs with apostrophes in the text fail** in this tool ("unexpected
   EOF while looking for matching `''") even with `<<'EOF'`. Write the
