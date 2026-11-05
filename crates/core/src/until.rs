@@ -96,7 +96,18 @@ fn run(hub: &Hub, actor: &Actor, until_id: u64, stop: &AtomicBool, request: &Htt
                 end.stopped = Some(format!("request #{request_id}: {why}"));
                 return end;
             }
-            Ran::Ended(outcome, checks) => counts(plan.matching.as_deref(), outcome.as_ref().map_err(String::as_str), &checks),
+            Ran::Ended(outcome, checks) => {
+                let o = outcome.as_ref().map_err(String::as_str);
+                match plan.matching.as_deref().filter(|m| crate::openapi::spec_line(m).is_some()) {
+                    // `spec petstore`: checked against the workspace's spec.
+                    Some(m) => {
+                        let mut r = expect::check(&[m.to_string()], o);
+                        crate::openapi::fill_checks(hub.root(), request, o, &mut r);
+                        r.first().is_some_and(|c| c.pass)
+                    }
+                    None => counts(plan.matching.as_deref(), o, &checks),
+                }
+            }
         };
         end.sent += 1;
         end.streak = if counted { end.streak + 1 } else { 0 };

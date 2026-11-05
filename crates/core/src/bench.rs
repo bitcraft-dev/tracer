@@ -93,7 +93,7 @@ fn run(
     let deadline = plan.duration_secs.map(|s| started + Duration::from_secs(s));
     // The number of the next request to send; the first has gone.
     let next = Arc::new(AtomicU64::new(1));
-    let shared = Arc::new(Worker { sending, secrets, written: request.clone(), total, deadline, rate: plan.rate, started });
+    let shared = Arc::new(Worker { sending, secrets, written: request.clone(), root: hub.root().to_path_buf(), total, deadline, rate: plan.rate, started });
     let workers: Vec<_> = (0..plan.concurrency.min(total.saturating_sub(1).min(u32::MAX as u64) as u32))
         .map(|_| {
             let (shared, next, stop, samples) = (shared.clone(), next.clone(), stop.clone(), samples.clone());
@@ -113,6 +113,8 @@ struct Worker {
     secrets: Vec<(String, String)>,
     /// The request as written, for its checks.
     written: HttpRequest,
+    /// The workspace, for a `spec` check.
+    root: std::path::PathBuf,
     total: u64,
     deadline: Option<Instant>,
     rate: Option<f64>,
@@ -145,7 +147,7 @@ impl Worker {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-            let checks = graphql::checks(&self.written, outcome.as_ref().map_err(String::as_str));
+            let checks = graphql::checks(&self.root, &self.written, outcome.as_ref().map_err(String::as_str));
             samples.lock().unwrap().add(outcome.as_ref().map_err(String::as_str), &checks, self.started.elapsed());
         }
     }

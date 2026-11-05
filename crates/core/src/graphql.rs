@@ -156,8 +156,9 @@ pub fn to_http(request: &HttpRequest) -> Result<HttpRequest, String> {
 
 /// `request`'s expectations checked against `response`, and for a GraphQL
 /// request, whether the answer has errors.
-pub fn checks(request: &HttpRequest, response: Result<&HttpResponse, &str>) -> Vec<CheckResult> {
+pub fn checks(root: &std::path::Path, request: &HttpRequest, response: Result<&HttpResponse, &str>) -> Vec<CheckResult> {
     let mut out = expect::check(&request.expect, response);
+    crate::openapi::fill_checks(root, request, response, &mut out);
     // A subscription's is judged over its messages (`subscription_check`).
     if is_graphql(request) && !is_subscription(request) {
         out.push(errors_check(response));
@@ -277,7 +278,7 @@ mod tests {
         assert_eq!(subscribe["payload"]["variables"], json!({ "n": 2 }));
         assert!(subscribe["payload"]["query"].as_str().unwrap().contains("tick(every: $n)"));
         // Its errors check is the stream's, not the 101's empty body.
-        assert!(checks(&sub, Ok(&HttpResponse { status: 101, headers: vec![], body: String::new(), size: 0, timing: tracer_protocol::Timing { ttfb_ms: 1.0, total_ms: 1.0, dns_ms: None, connect_ms: None, tls_ms: None }, tls_unchecked: false })).is_empty());
+        assert!(checks(std::path::Path::new("."), &sub, Ok(&HttpResponse { status: 101, headers: vec![], body: String::new(), size: 0, timing: tracer_protocol::Timing { ttfb_ms: 1.0, total_ms: 1.0, dns_ms: None, connect_ms: None, tls_ms: None }, tls_unchecked: false })).is_empty());
     }
 
     #[test]
@@ -329,13 +330,13 @@ mod tests {
             tls_unchecked: false,
         };
         let r = gql("{ a }");
-        let ok = checks(&r, Ok(&answer(r#"{"data":{"a":1}}"#)));
+        let ok = checks(std::path::Path::new("."), &r, Ok(&answer(r#"{"data":{"a":1}}"#)));
         assert_eq!((ok.len(), ok[0].pass), (1, true));
-        let bad = checks(&r, Ok(&answer(r#"{"data":null,"errors":[{"message":"no field a"}]}"#)));
+        let bad = checks(std::path::Path::new("."), &r, Ok(&answer(r#"{"data":null,"errors":[{"message":"no field a"}]}"#)));
         assert_eq!((bad[0].pass, bad[0].actual.as_str()), (false, "1 error: no field a"));
-        assert!(!checks(&r, Ok(&answer("<html>")))[0].pass);
+        assert!(!checks(std::path::Path::new("."), &r, Ok(&answer("<html>")))[0].pass);
         let rest = HttpRequest { method: "GET".into(), ..r };
-        assert!(checks(&rest, Ok(&answer("<html>"))).is_empty(), "only GraphQL requests get it");
+        assert!(checks(std::path::Path::new("."), &rest, Ok(&answer("<html>"))).is_empty(), "only GraphQL requests get it");
     }
 
     #[test]

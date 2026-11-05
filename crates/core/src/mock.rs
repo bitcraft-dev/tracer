@@ -38,11 +38,34 @@ pub fn start(hub: &Arc<Hub>, actor: &Actor, folder: &str, port: Option<u16>) -> 
     if routes.is_empty() {
         return Err(format!("there are no saved requests under `{folder}` to mock"));
     }
+    let shown: Vec<String> = routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
+    listen(hub, actor, port, folder.clone(), shown, Source::Folder(folder))
+}
+
+/// Start a mock of OpenAPI spec `name` (see `openapi::mock_answer`).
+pub fn start_spec(hub: &Arc<Hub>, actor: &Actor, name: &str, port: Option<u16>) -> Result<(u64, u16, Vec<String>), String> {
+    let spec = crate::openapi::load(hub.root(), name)?;
+    if spec.ops.is_empty() {
+        return Err(format!("the spec `{}` has no operations to mock", spec.name));
+    }
+    let shown: Vec<String> = spec.ops.iter().map(|o| o.label()).collect();
+    listen(hub, actor, port, format!("spec {}", spec.name), shown, Source::Spec(spec.name.clone()))
+}
+
+/// What a mock answers from.
+#[derive(Clone)]
+enum Source {
+    /// The saved requests under a folder, with their last answers.
+    Folder(String),
+    /// An OpenAPI spec in the workspace, by name.
+    Spec(String),
+}
+
+fn listen(hub: &Arc<Hub>, actor: &Actor, port: Option<u16>, shown_as: String, shown: Vec<String>, source: Source) -> Result<(u64, u16, Vec<String>), String> {
     let listener = TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).map_err(|e| format!("could not listen on port {}: {e}", port.unwrap_or(0)))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let shown: Vec<String> = routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
     let stop = Arc::new(AtomicBool::new(false));
-    let mock_id = hub.start_mock(actor.clone(), folder.clone(), port, shown.clone(), stop.clone());
+    let mock_id = hub.start_mock(actor.clone(), shown_as, port, shown.clone(), stop.clone());
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -50,8 +73,8 @@ pub fn start(hub: &Arc<Hub>, actor: &Actor, folder: &str, port: Option<u16>) -> 
                 break;
             }
             let Ok(stream) = stream else { continue };
-            let (hub, actor, folder) = (hub.clone(), actor.clone(), folder.clone());
-            thread::spawn(move || serve(&hub, &actor, mock_id, &folder, stream));
+            let (hub, actor, source) = (hub.clone(), actor.clone(), source.clone());
+            thread::spawn(move || serve(&hub, &actor, mock_id, &source, stream));
         }
     });
     Ok((mock_id, port, shown))
@@ -166,7 +189,7 @@ fn find<'a>(routes: &'a [Route], method: &str, path: &str) -> Option<&'a Route> 
         .max_by_key(|r| (literal(r), std::cmp::Reverse(r.saved.path.clone())))
 }
 
-fn serve(hub: &Hub, actor: &Actor, mock_id: u64, folder: &str, stream: TcpStream) {
+fn serve(hub: &Hub, actor: &Actor, mock_id: u64, source: &Source, stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let Ok(mut writer) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
@@ -179,12 +202,14 @@ fn serve(hub: &Hub, actor: &Actor, mock_id: u64, folder: &str, stream: TcpStream
     let (method, target) = (method.to_ascii_uppercase(), target.to_string());
     let mut length = 0usize;
     let mut asked_headers = String::new();
+    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
             match name.trim().to_ascii_lowercase().as_str() {
                 "content-length" => length = value.trim().parse().unwrap_or(0),
                 "access-control-request-headers" => asked_headers = value.trim().to_string(),
@@ -192,10 +217,15 @@ fn serve(hub: &Hub, actor: &Actor, mock_id: u64, folder: &str, stream: TcpStream
             }
         }
     }
-    // The body isn't used, but it's read so the client sees its answer.
-    let _ = reader.by_ref().take(length.min(16 * 1024 * 1024) as u64).read_to_end(&mut Vec::new());
+    // Read whole so the client sees its answer; a spec mock checks it.
+    let mut sent = Vec::new();
+    let _ = reader.by_ref().take(length.min(16 * 1024 * 1024) as u64).read_to_end(&mut sent);
+    let sent = String::from_utf8_lossy(&sent).into_owned();
 
-    let routes = routes(hub, folder);
+    let folder = match source {
+        Source::Folder(f) => f.as_str(),
+        Source::Spec(_) => "",
+    };
     let (status, headers, body, route) = if method == "OPTIONS" {
         let allowed = if asked_headers.is_empty() { "*".to_string() } else { asked_headers };
         let headers = vec![
@@ -204,7 +234,13 @@ fn serve(hub: &Hub, actor: &Actor, mock_id: u64, folder: &str, stream: TcpStream
             ("Access-Control-Max-Age".into(), "600".into()),
         ];
         (204, headers, String::new(), None)
+    } else if let Source::Spec(name) = source {
+        match crate::openapi::load(hub.root(), name) {
+            Ok(spec) => crate::openapi::mock_answer(&spec, &method, &target, &headers, &sent),
+            Err(e) => (500, json_type(), serde_json::json!({ "error": e }).to_string(), None),
+        }
     } else {
+        let routes = routes(hub, folder);
         match find(&routes, &method, &target) {
             Some(route) => match hub.last_answer(&route.saved.request) {
                 Some(answer) => (answer.status, kept_headers(&answer), answer.body, Some(route.saved.path.clone())),

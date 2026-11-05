@@ -49,6 +49,11 @@ pub const POLICY_PATH: &str = "agents.policy";
 /// `requests/` so they can be checked in and a CI run compared against them.
 pub const BASELINES_DIR: &str = "baselines";
 
+/// Where OpenAPI documents live, one `<name>.json` or `<name>.yaml` each as
+/// fetched, beside `<name>.from` saying where from. Their requests are
+/// saved under `requests/<name>/`.
+pub const SPECS_DIR: &str = "specs";
+
 /// Where the core is listening and what it wants to hear first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Discovery {
@@ -292,6 +297,41 @@ pub enum Command {
         other_bench: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tolerance_pct: Option<f64>,
+    },
+    /// Read the OpenAPI (3.x or Swagger 2) document at `from`, a URL or a
+    /// file, keep it as spec `name` (from its title if not given) under
+    /// [`SPECS_DIR`], and save a request for each operation that hasn't one
+    /// under `requests/<name>/`, each checking its answer against the spec.
+    /// Requests already there are kept as they are. With `env`, that
+    /// environment gets `base` set to the spec's server if it has no `base`.
+    /// Published as `spec_imported`, and each new request as saved.
+    ImportSpec {
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+    },
+    /// The workspace's specs.
+    ListSpecs,
+    /// How finished request `request_id`'s answer measures up to spec
+    /// `spec`: the one its `spec` check names, or the first that has its
+    /// operation, if not given.
+    CheckSpec {
+        request_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spec: Option<String>,
+    },
+    /// Where the API, as history has seen it, and spec `name` part ways.
+    SpecDrift { name: String },
+    /// Serve spec `name` as a mock on 127.0.0.1:`port` (any free port if not
+    /// given): each operation answers with its example (or one made from
+    /// its schema), after checking the request's parameters and body
+    /// against it. `Prefer: code=404` picks another answer.
+    StartSpecMock {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
     },
     /// The GraphQL schema in finished request `request_id`'s answer: one
     /// sent with the introspection query ([`GRAPHQL_INTROSPECTION`]).
@@ -1010,6 +1050,115 @@ impl GqlSchema {
     }
 }
 
+/// An OpenAPI document in the workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecInfo {
+    pub name: String,
+    pub title: String,
+    pub version: String,
+    /// `3.0.3`, `3.1.0`, `2.0`.
+    pub openapi: String,
+    /// Where it was imported from: a URL or a file.
+    pub from: String,
+    pub servers: Vec<String>,
+    pub operations: Vec<SpecOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecOperation {
+    pub method: String,
+    /// As the spec writes it: `/pets/{petId}`.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deprecated: bool,
+}
+
+/// What importing a spec did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecImported {
+    pub spec: SpecInfo,
+    /// Requests saved for operations that had none.
+    pub created: Vec<String>,
+    /// Requests already there for an operation, left as they were.
+    pub kept: Vec<String>,
+    /// Requests under the spec's folder that match no operation now.
+    pub gone: Vec<String>,
+    /// What changed since the spec was last imported, in words.
+    pub changes: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+/// How one answer measures up to a spec.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecReport {
+    pub spec: String,
+    /// `GET /pets/{petId}`, if the spec has the request's operation.
+    pub operation: Option<String>,
+    pub status: u16,
+    /// Whether the spec lists the status (or its class, or a default).
+    pub declared: bool,
+    /// The body's schema, by name where it has one.
+    pub schema: Option<String>,
+    /// What's wrong, each at a JSON path: `$.id is a string ("7"), and the
+    /// spec says integer`.
+    pub problems: Vec<String>,
+    /// Fields the answer has and the schema doesn't name: drift, not a
+    /// failure.
+    pub undocumented: Vec<String>,
+    pub pass: bool,
+}
+
+/// Where the API and a spec part ways, from what history has seen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecDrift {
+    pub spec: SpecInfo,
+    pub operations: Vec<SpecOpDrift>,
+    /// Endpoints the API answered that the spec doesn't have.
+    pub undocumented: Vec<SpecEndpoint>,
+    /// Saved requests under the spec's folder that match no operation.
+    pub stale: Vec<String>,
+    /// How many answers were looked at.
+    pub checked: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecOpDrift {
+    pub method: String,
+    pub path: String,
+    pub summary: String,
+    pub deprecated: bool,
+    /// Its saved requests.
+    pub saved: Vec<String>,
+    /// Requests sent; of those answered, how many were checked and how
+    /// many didn't match the spec.
+    pub sent: u32,
+    pub checked: u32,
+    pub failing: u32,
+    /// Statuses seen, and those of them the spec doesn't list.
+    pub statuses: Vec<u16>,
+    pub undeclared: Vec<u16>,
+    /// What didn't match, array indexes made `[*]`, a few at most.
+    pub problems: Vec<String>,
+    /// Fields answers had that the spec doesn't name.
+    pub undocumented: Vec<String>,
+    /// The newest request for it, and the newest that didn't match (0: none).
+    pub last_request: u64,
+    pub last_failing: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecEndpoint {
+    pub method: String,
+    pub path: String,
+    pub sent: u32,
+    pub last_status: Option<u16>,
+    pub last_request: u64,
+}
+
 /// How two responses differ, `a` being the earlier one asked about.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseDiff {
@@ -1355,6 +1504,10 @@ pub enum ReplyBody {
     Baselines { baselines: Vec<Baseline>, skipped: Vec<String> },
     BenchCompared { comparison: BenchComparison },
     GraphqlSchema { schema: GqlSchema },
+    SpecImported { imported: SpecImported },
+    Specs { specs: Vec<SpecInfo>, skipped: Vec<String> },
+    SpecChecked { report: SpecReport },
+    SpecDrift { drift: SpecDrift },
     StreamSent,
     StreamMessages {
         messages: Vec<StreamItem>,
@@ -1499,6 +1652,9 @@ pub enum EventKind {
     },
     /// A mock stopped, by this event's actor.
     MockStopped { mock_id: u64 },
+    /// Spec `spec.name` was imported (again): `created` requests were saved
+    /// for operations that had none.
+    SpecImported { spec: SpecInfo, created: u32 },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The workspace's browser behaviour changed; this event's actor is who.

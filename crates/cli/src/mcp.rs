@@ -698,12 +698,46 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             Ok(json!({ "markdown": text }))
         }
         "create_mock" => {
-            let path = str_arg(args, "path").ok_or("`path` (a folder of saved requests) is required")?.to_string();
             let port = args.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
-            let ReplyBody::MockStarted { mock_id, port, url, routes } = call(core, Command::StartMock { path, port })? else {
+            let command = match (str_arg(args, "spec").filter(|s| !s.trim().is_empty()), str_arg(args, "path")) {
+                (Some(name), _) => Command::StartSpecMock { name: name.to_string(), port },
+                (None, Some(path)) => Command::StartMock { path: path.to_string(), port },
+                (None, None) => return Err("`path` (a folder of saved requests) or `spec` (a spec's name) is required".into()),
+            };
+            let ReplyBody::MockStarted { mock_id, port, url, routes } = call(core, command)? else {
                 return Err(unexpected());
             };
             Ok(json!({ "mock_id": mock_id, "port": port, "url": url, "routes": routes }))
+        }
+        "import_spec" => {
+            let from = str_arg(args, "from").ok_or("`from` (the document's URL or file) is required")?.to_string();
+            let name = str_arg(args, "name").filter(|n| !n.trim().is_empty()).map(String::from);
+            let env = str_arg(args, "env").filter(|n| !n.trim().is_empty()).map(String::from);
+            let ReplyBody::SpecImported { imported } = call(core, Command::ImportSpec { from, name, env })? else {
+                return Err(unexpected());
+            };
+            Ok(json!(imported))
+        }
+        "list_specs" => {
+            let ReplyBody::Specs { specs, skipped } = call(core, Command::ListSpecs)? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "specs": specs, "skipped": skipped }))
+        }
+        "check_spec" => {
+            let request_id = args.get("request_id").and_then(Value::as_u64).ok_or("`request_id` is required")?;
+            let spec = str_arg(args, "spec").filter(|n| !n.trim().is_empty()).map(String::from);
+            let ReplyBody::SpecChecked { report } = call(core, Command::CheckSpec { request_id, spec })? else {
+                return Err(unexpected());
+            };
+            Ok(json!(report))
+        }
+        "spec_drift" => {
+            let name = str_arg(args, "name").ok_or("`name` (a spec's name) is required")?.to_string();
+            let ReplyBody::SpecDrift { drift } = call(core, Command::SpecDrift { name })? else {
+                return Err(unexpected());
+            };
+            Ok(json!(drift))
         }
         "stop_mock" => {
             let mock_id = args.get("mock_id").and_then(Value::as_u64).ok_or("`mock_id` is required")?;
@@ -1436,15 +1470,50 @@ fn tools() -> Value {
         },
         {
             "name": "create_mock",
-            "description": "Serve the saved requests under a folder as a mock server on 127.0.0.1 (a free port unless `port` is given): each answers its own method and path (a {{variable}} segment matches any, e.g. GET /items/{id}) with its last real answer in history, the last good one first. A route with no answer yet gets 501; anything else 404 listing the routes. Any origin is allowed. Gives its url and routes; hits show in Tracer's window.",
+            "description": "Serve the saved requests under a folder as a mock server on 127.0.0.1 (a free port unless `port` is given): each answers its own method and path (a {{variable}} segment matches any, e.g. GET /items/{id}) with its last real answer in history, the last good one first. A route with no answer yet gets 501; anything else 404 listing the routes. Or, with `spec`, serve an OpenAPI spec of the workspace: each operation answers with its example (or one made from its schema) once the request's parameters and body match it (400 or 422 saying what doesn't); a `Prefer: code=404` header picks another answer. Any origin is allowed. Gives its url and routes; hits show in Tracer's window.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "A folder under requests/, such as `shop`." },
+                    "spec": { "type": "string", "description": "A spec's name, as list_specs gives it, instead of a folder." },
                     "port": { "type": "integer" },
                 },
-                "required": ["path"],
             },
+        },
+        {
+            "name": "import_spec",
+            "description": "Keep an OpenAPI document (3.0, 3.1 or Swagger 2; JSON or YAML; a URL or a file in the workspace) as a spec under specs/, and save a request for each of its operations that has none under requests/<name>/. Each request starts with {{base}} and checks its answer against the spec (`# @expect spec <name>`). Requests already there are kept. Imported again, it says what changed in the spec. With `env`, that environment gets `base` set to the spec's server if it has none.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "The document's URL, or its file's path." },
+                    "name": { "type": "string", "description": "One word; from the spec's title if not given." },
+                    "env": env,
+                },
+                "required": ["from"],
+            },
+        },
+        {
+            "name": "list_specs",
+            "description": "The workspace's OpenAPI specs, each with its servers and operations.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "check_spec",
+            "description": "How a past request's answer measures up to an OpenAPI spec: the operation it is, whether the spec lists its status and content type, and what in the body doesn't match the schema, each at a JSON path; plus fields the spec doesn't name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "integer" },
+                    "spec": { "type": "string", "description": "The spec's name; the one the request's check names, or the first with its operation, if not given." },
+                },
+                "required": ["request_id"],
+            },
+        },
+        {
+            "name": "spec_drift",
+            "description": "Where an API, as Tracer's history has seen it, and its OpenAPI spec part ways: per operation, answers that don't match (problems with their JSON paths), statuses the spec doesn't list, fields it doesn't name, and whether it was ever tried; endpoints the API answered that the spec lacks; saved requests that match no operation.",
+            "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] },
         },
         {
             "name": "stop_mock",

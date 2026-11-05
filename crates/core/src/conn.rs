@@ -17,7 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
-use crate::{discover, explain, export, files, import, mock, transcript};
+use crate::{discover, explain, export, files, import, mock, openapi, transcript};
 use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
@@ -232,6 +232,19 @@ pub fn serve(
             }
             (Some((_, actor)), Command::StartMock { path, port }) => mock::start(&hub, actor, &path, port)
                 .map(|(mock_id, port, routes)| ReplyBody::MockStarted { mock_id, port, url: format!("http://127.0.0.1:{port}"), routes }),
+            (Some((_, actor)), Command::StartSpecMock { name, port }) => mock::start_spec(&hub, actor, &name, port)
+                .map(|(mock_id, port, routes)| ReplyBody::MockStarted { mock_id, port, url: format!("http://127.0.0.1:{port}"), routes }),
+            (Some((_, actor)), Command::ImportSpec { from, name, env }) => {
+                openapi::import(&hub, actor, &from, name.as_deref(), env.as_deref()).map(|imported| ReplyBody::SpecImported { imported })
+            }
+            (Some(_), Command::ListSpecs) => {
+                let (specs, skipped) = openapi::list(hub.root());
+                Ok(ReplyBody::Specs { specs, skipped })
+            }
+            (Some(_), Command::CheckSpec { request_id, spec }) => {
+                openapi::check_request(&hub, request_id, spec.as_deref()).map(|report| ReplyBody::SpecChecked { report })
+            }
+            (Some(_), Command::SpecDrift { name }) => openapi::drift_of(&hub, &name).map(|drift| ReplyBody::SpecDrift { drift }),
             (Some((_, actor)), Command::StopMock { mock_id }) => {
                 if hub.stop_mock(actor, mock_id) {
                     Ok(ReplyBody::MockStopped)
@@ -467,7 +480,7 @@ pub(crate) fn run_one(
         .map(|response| envs::redact_response(response, &secrets))
         .map_err(|error| envs::redact(&error, &secrets));
     // Checked on what clients see, secrets already taken out.
-    let mut results = graphql::checks(request, outcome.as_ref().map_err(String::as_str));
+    let mut results = graphql::checks(hub.root(), request, outcome.as_ref().map_err(String::as_str));
     if graphql::is_subscription(request) {
         let received: Vec<String> = hub
             .stream_messages(request_id, 0, u64::MAX)

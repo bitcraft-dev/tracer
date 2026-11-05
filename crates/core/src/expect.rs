@@ -10,6 +10,7 @@
 //! $.items[0].name contains "Kam"   a string's text, or an array's items
 //! len($.items) >= 3                an array's items, an object's keys, a string's characters
 //! body contains ok
+//! spec petstore                    matches the workspace's OpenAPI spec (openapi.rs)
 //! ```
 //!
 //! An expectation that can't be read fails, saying why, rather than
@@ -27,6 +28,8 @@ enum Subject {
     Body,
     Path(String),
     Len(String),
+    /// Filled in by `openapi::fill_checks`, which can read the workspace.
+    Spec,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -81,6 +84,13 @@ fn parse(line: &str) -> Result<Expect, String> {
         "ttfb" => (Subject::Ttfb, rest),
         "size" => (Subject::Size, rest),
         "body" => (Subject::Body, rest),
+        "spec" => {
+            let name = rest.trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                return Err("`spec` takes the name of a spec in specs/, such as `spec petstore`".into());
+            }
+            return Ok(Expect { subject: Subject::Spec, op: Op::Exists, value: None });
+        }
         "header" => {
             let (name, rest) = split_word(rest);
             if name.is_empty() {
@@ -91,7 +101,7 @@ fn parse(line: &str) -> Result<Expect, String> {
         w if w.starts_with('$') => (Subject::Path(w.to_string()), rest),
         w if w.starts_with("len(") && w.ends_with(')') => (Subject::Len(w[4..w.len() - 1].to_string()), rest),
         "" => return Err("it's empty".into()),
-        w => return Err(format!("`{w}` isn't something to check: status, time, ttfb, size, header, body, $.path or len($.path)")),
+        w => return Err(format!("`{w}` isn't something to check: status, time, ttfb, size, header, body, spec, $.path or len($.path)")),
     };
     let (op_word, value) = split_word(rest);
     // `status 200` as people write it: `status == 200`.
@@ -155,6 +165,7 @@ fn evaluate(e: &Expect, r: &HttpResponse, json: Option<&Value>) -> (bool, String
         Subject::Ttfb => number((r.timing.ttfb_ms * 10.0).round() / 10.0),
         Subject::Size => Some(Value::from(r.size)),
         Subject::Body => Some(Value::String(r.body.clone())),
+        Subject::Spec => return (false, "a spec check is made by the core, against specs/".into()),
         Subject::Header(name) => {
             let values: Vec<&str> = r.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect();
             (!values.is_empty()).then(|| Value::String(values.join(", ")))

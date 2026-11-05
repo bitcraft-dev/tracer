@@ -26,6 +26,9 @@
 //!
 //! Every command takes `-w <dir>` for the workspace (default: here).
 
+// The MCP tool list is one `json!` literal, past the default depth.
+#![recursion_limit = "256"]
+
 mod mcp;
 mod mcp_http;
 
@@ -159,7 +162,29 @@ usage:
                                       and path ({{var}} segments match any) with
                                       its last real answer in history; prints
                                       hits until Ctrl+C (the mock carries on)
+  tracer mock --spec <NAME> [--port <N>]
+                                      serve OpenAPI spec NAME as a mock: each
+                                      operation answers with its example (or one
+                                      made from its schema) after checking the
+                                      request against it; `Prefer: code=404`
+                                      picks another answer
   tracer mock stop <ID>               stop a mock
+  tracer spec import <URL|FILE> [--name <NAME>] [--env <ENV>]
+                                      keep an OpenAPI (3.x, Swagger 2; JSON or
+                                      YAML) document as spec NAME under specs/,
+                                      and save a request for each operation that
+                                      has none under requests/NAME/, each with
+                                      `# @expect spec NAME`; ENV gets `base` set
+                                      to its server if it has none. Again later:
+                                      says what changed, keeps your requests
+  tracer spec ls                      the workspace's specs
+  tracer spec check <ID> [--spec <NAME>]
+                                      how a past answer measures up to its spec;
+                                      exits 1 if it doesn't match
+  tracer spec drift <NAME> [--json]   where the API, as history saw it, and the
+                                      spec part ways: answers that don't match,
+                                      statuses and fields it doesn't name,
+                                      endpoints it lacks, operations never tried
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -222,6 +247,7 @@ fn main() -> ExitCode {
         Some("explain") => explain(workspace, args[1..].to_vec()),
         Some("servers") => servers(workspace, args[1..].to_vec()),
         Some("mock") => mock(workspace, args[1..].to_vec()),
+        Some("spec") => spec(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
@@ -1628,9 +1654,18 @@ fn mock(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
         Some(p) => Some(p.parse::<u16>().map_err(|_| io::Error::other(format!("`{p}` isn't a port")))?),
         None => None,
     };
-    let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    let spec = take_value(&mut args, "--spec");
+    let command = match spec {
+        Some(name) if args.is_empty() => Command::StartSpecMock { name, port },
+        Some(_) => return Err(io::Error::other(USAGE)),
+        None => {
+            let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+            Command::StartMock { path, port }
+        }
+    };
+    let from_spec = matches!(command, Command::StartSpecMock { .. });
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
-    let (mock_id, url, routes) = match client.call(Command::StartMock { path, port })? {
+    let (mock_id, url, routes) = match client.call(command)? {
         Ok(ReplyBody::MockStarted { mock_id, url, routes, .. }) => (mock_id, url, routes),
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),
@@ -1643,7 +1678,11 @@ fn mock(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     loop {
         match client.next_event()?.kind {
             EventKind::MockHit { mock_id: m, method, path, status, route } if m == mock_id => {
-                let from = route.map(|r| format!("  ← requests/{r}.http")).unwrap_or_default();
+                let from = match route {
+                    Some(r) if from_spec => format!("  ← {r}"),
+                    Some(r) => format!("  ← requests/{r}.http"),
+                    None => String::new(),
+                };
                 println!("{method} {path} → {status}{from}");
             }
             EventKind::MockStopped { mock_id: m } if m == mock_id => {
@@ -1652,6 +1691,139 @@ fn mock(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
             }
             _ => {}
         }
+    }
+}
+
+fn spec(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer spec")?;
+    let mut call = |command: Command| -> io::Result<ReplyBody> { client.call(command)?.map_err(io::Error::other) };
+    let unexpected = |other: ReplyBody| io::Error::other(format!("unexpected answer: {other:?}"));
+    match args.first().map(String::as_str) {
+        Some("import") => {
+            args.remove(0);
+            let name = take_value(&mut args, "--name");
+            let env = take_value(&mut args, "--env");
+            let [from] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+            let imported = match call(Command::ImportSpec { from, name, env })? {
+                ReplyBody::SpecImported { imported } => imported,
+                other => return Err(unexpected(other)),
+            };
+            let s = &imported.spec;
+            println!("spec {} · {} {} (OpenAPI {}) · {} operations", s.name, s.title, s.version, s.openapi, s.operations.len());
+            for note in &imported.notes {
+                println!("  {note}");
+            }
+            for c in &imported.changes {
+                println!("  changed: {c}");
+            }
+            for p in &imported.created {
+                println!("  + requests/{p}.http");
+            }
+            if !imported.kept.is_empty() {
+                println!("  {} already saved, kept as they are", imported.kept.len());
+            }
+            for p in &imported.gone {
+                println!("  ? requests/{p}.http matches no operation now");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("ls") | None => {
+            let (specs, skipped) = match call(Command::ListSpecs)? {
+                ReplyBody::Specs { specs, skipped } => (specs, skipped),
+                other => return Err(unexpected(other)),
+            };
+            if specs.is_empty() {
+                println!("no specs yet: `tracer spec import <URL|FILE>`");
+            }
+            for s in specs {
+                println!("{:<20} {} {} · {} operations · {}", s.name, s.title, s.version, s.operations.len(), s.from);
+            }
+            for w in skipped {
+                eprintln!("skipped {w}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("check") => {
+            args.remove(0);
+            let spec = take_value(&mut args, "--spec");
+            let [id] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+            let request_id = id.trim_start_matches('#').parse::<u64>().map_err(|_| io::Error::other(format!("`{id}` isn't a request number")))?;
+            let report = match call(Command::CheckSpec { request_id, spec })? {
+                ReplyBody::SpecChecked { report } => report,
+                other => return Err(unexpected(other)),
+            };
+            let op = report.operation.clone().unwrap_or_else(|| "no operation".into());
+            println!("{} · spec {} · {op} · {}", if report.pass { "matches" } else { "doesn't match" }, report.spec, report.status);
+            if let Some(schema) = &report.schema {
+                println!("  body: {schema}");
+            }
+            for p in &report.problems {
+                println!("  ✗ {p}");
+            }
+            for u in &report.undocumented {
+                println!("  ? {u} isn't in the spec");
+            }
+            Ok(if report.pass { ExitCode::SUCCESS } else { ExitCode::from(1) })
+        }
+        Some("drift") => {
+            args.remove(0);
+            let json = match args.iter().position(|a| a == "--json") {
+                Some(i) => {
+                    args.remove(i);
+                    true
+                }
+                None => false,
+            };
+            let [name] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+            let drift = match call(Command::SpecDrift { name })? {
+                ReplyBody::SpecDrift { drift } => drift,
+                other => return Err(unexpected(other)),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&drift).map_err(io::Error::other)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let tried = drift.operations.iter().filter(|o| o.sent > 0).count();
+            let failing = drift.operations.iter().filter(|o| o.failing > 0).count();
+            println!(
+                "spec {} · {} answers looked at · {tried} of {} operations tried · {failing} with answers that don't match",
+                drift.spec.name,
+                drift.checked,
+                drift.operations.len()
+            );
+            for o in &drift.operations {
+                let mark = if o.failing > 0 || !o.undeclared.is_empty() {
+                    "✗"
+                } else if !o.undocumented.is_empty() {
+                    "~"
+                } else if o.sent == 0 {
+                    "·"
+                } else {
+                    "✓"
+                };
+                let statuses: Vec<String> = o.statuses.iter().map(u16::to_string).collect();
+                let seen = if o.sent == 0 { "never sent".to_string() } else { format!("{} sent, {} of {} off, saw {}", o.sent, o.failing, o.checked, statuses.join(" ")) };
+                println!("{mark} {:<7} {:<36} {seen}{}", o.method, o.path, if o.deprecated { " (deprecated)" } else { "" });
+                for s in &o.undeclared {
+                    println!("      answers {s}, which the spec doesn't list");
+                }
+                for p in &o.problems {
+                    println!("      {p}");
+                }
+                if !o.undocumented.is_empty() {
+                    println!("      fields it doesn't name: {}", o.undocumented.join(", "));
+                }
+            }
+            for e in &drift.undocumented {
+                let status = e.last_status.map(|s| format!(" → {s}")).unwrap_or_default();
+                println!("! {:<7} {:<36} not in the spec ({} sent{status}, last #{})", e.method, e.path, e.sent, e.last_request);
+            }
+            for s in &drift.stale {
+                println!("? requests/{s}.http matches no operation in the spec");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        _ => Err(io::Error::other(USAGE)),
     }
 }
 
@@ -1996,6 +2168,7 @@ fn describe(event: &Event) -> String {
             route.as_deref().map(|r| format!(" from requests/{r}.http")).unwrap_or_default()
         ),
         EventKind::MockStopped { mock_id } => format!("stopped mock {mock_id}"),
+        EventKind::SpecImported { spec, created } => format!("imported spec {} ({} operations, {created} new requests)", spec.name, spec.operations.len()),
         EventKind::BrowserChanged { browser } => format!(
             "browser behaviour: cookies {}, origin {}, TLS unchecked for {}",
             if browser.cookies { "on" } else { "off" },

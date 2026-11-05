@@ -717,6 +717,22 @@ impl Hub {
         Some((entry, response, checks.unwrap_or_default()))
     }
 
+    /// Every past request, oldest first, with its answer if it has one:
+    /// one pass, for reading the whole history (a spec's drift).
+    pub fn answered(&self) -> Vec<(HistoryEntry, Option<HttpResponse>)> {
+        let inner = self.inner.lock().unwrap();
+        let mut answers: std::collections::HashMap<u64, HttpResponse> = std::collections::HashMap::new();
+        for e in inner.events.iter() {
+            if let EventKind::RequestFinished { request_id, response } = &e.kind {
+                answers.insert(*request_id, response.clone());
+            }
+        }
+        entries(&inner.events).into_iter().map(|e| {
+            let r = answers.remove(&e.request_id);
+            (e, r)
+        }).collect()
+    }
+
     /// The last request before `request_id` with the same method and URL
     /// (as written) that answered below 400 with no check failed.
     pub fn last_good_before(&self, request_id: u64, method: &str, url: &str) -> Option<HistoryEntry> {

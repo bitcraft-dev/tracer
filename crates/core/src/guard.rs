@@ -155,6 +155,9 @@ pub fn refused(actor: &Actor, command: &Command, agents_allowed: bool, access: A
             | Command::Cookies
             | Command::Export { .. }
             | Command::Import { .. }
+            | Command::ListSpecs
+            | Command::CheckSpec { .. }
+            | Command::SpecDrift { .. }
             | Command::Explain { .. }
             | Command::LocalServers { .. }
             | Command::Transcript { .. }

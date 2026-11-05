@@ -13,3 +13,6 @@ ureq = "3.5.0"
 # Already in the build through ureq: a WebSocket's TLS, which ureq can't upgrade.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+# OpenAPI documents written in YAML, and a schema's `pattern`.
+serde_yaml = "0.9"
+regex-lite = "0.1"
