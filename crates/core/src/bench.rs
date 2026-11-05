@@ -27,7 +27,14 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// Check `plan` against the sender's policy, start the bench on a thread of
 /// its own, and give its id.
-pub fn start(hub: &Arc<Hub>, actor: &Actor, request: HttpRequest, env: Option<String>, plan: BenchPlan) -> Result<u64, String> {
+pub fn start(
+    hub: &Arc<Hub>,
+    actor: &Actor,
+    request: HttpRequest,
+    env: Option<String>,
+    plan: BenchPlan,
+    extra: Vec<(String, String)>,
+) -> Result<u64, String> {
     if crate::realtime::is_websocket(&request) {
         return Err("a WebSocket stays open, so it can't be benched; bench an HTTP request".into());
     }
@@ -37,13 +44,14 @@ pub fn start(hub: &Arc<Hub>, actor: &Actor, request: HttpRequest, env: Option<St
     let (bench_id, stop) = hub.start_bench(actor.clone(), request.clone(), env.clone(), plan.clone());
     let (hub, actor) = (hub.clone(), actor.clone());
     thread::spawn(move || {
-        let (stats, stopped) = run(&hub, &actor, bench_id, &stop, &request, env, &plan);
+        let (stats, stopped) = run(&hub, &actor, bench_id, &stop, &request, env, &plan, &extra);
         hub.end_bench(actor, bench_id, stats, stopped);
     });
     Ok(bench_id)
 }
 
 /// The bench's stats at its end, and why it ended early if it did.
+#[allow(clippy::too_many_arguments)]
 fn run(
     hub: &Hub,
     actor: &Actor,
@@ -52,10 +60,12 @@ fn run(
     request: &HttpRequest,
     env: Option<String>,
     plan: &BenchPlan,
+    extra: &[(String, String)],
 ) -> (BenchStats, Option<String>) {
     let samples = Arc::new(Mutex::new(Samples::default()));
     let (request_id, cancelled) = hub.start_request(actor.clone(), request.clone(), env.clone(), None, None, Some(bench_id));
-    let first = match run_one(hub, actor, request_id, &cancelled, request, env.as_deref(), &[], Some(plan)) {
+    hub.remember_vars(request_id, extra);
+    let first = match run_one(hub, actor, request_id, &cancelled, request, env.as_deref(), extra, Some(plan)) {
         Ran::Stopped(why) => return (BenchStats::default(), Some(why)),
         Ran::Ended(outcome, checks) => {
             let took = outcome.as_ref().map_or(0.0, |r| r.timing.total_ms);
@@ -71,7 +81,7 @@ fn run(
     }
 
     // Resolved once for every worker, as `run_one` resolved the first.
-    let (sending, secrets) = match resolve(hub, request, env.as_deref()) {
+    let (sending, secrets) = match resolve(hub, request, env.as_deref(), extra) {
         Ok(found) => found,
         Err(why) => return (stats(&samples), Some(why)),
     };
@@ -157,7 +167,7 @@ impl Worker {
 
 /// `request` as it will go out, `env`'s variables and secrets filled in,
 /// and the secrets, for taking back out of what comes back.
-fn resolve(hub: &Hub, request: &HttpRequest, env: Option<&str>) -> Result<(HttpRequest, Vec<(String, String)>), String> {
+fn resolve(hub: &Hub, request: &HttpRequest, env: Option<&str>, extra: &[(String, String)]) -> Result<(HttpRequest, Vec<(String, String)>), String> {
     let (environment, secrets) = match env {
         Some(name) => {
             let (environment, secrets) = hub.environment_for_sending(name)?;
@@ -165,6 +175,7 @@ fn resolve(hub: &Hub, request: &HttpRequest, env: Option<&str>) -> Result<(HttpR
         }
         None => (None, Vec::new()),
     };
+    let environment = envs::with_extra(environment, extra);
     let sending = envs::resolve(request, environment.as_ref())
         .and_then(|r| if graphql::is_graphql(&r) { graphql::to_http(&r) } else { Ok(r) })
         .map_err(|e| envs::redact(&e, &secrets))?;

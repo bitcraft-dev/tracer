@@ -94,6 +94,11 @@ usage:
   tracer bench <PATH> --env <A> --env <B> ...
                                       the same bench against each environment in
                                       turn, then side by side
+  tracer bench <FOLDER> [-n ...] [--env <NAME>] [--save-baseline <NAME> | --baseline <NAME>]
+                                      a flow step by step: run once for each
+                                      step's captures, then each step benched
+                                      with them, side by side; baselines per
+                                      step, named NAME--<step>
   tracer bench <PATH> --save-baseline <NAME>
                                       keep the bench as baselines/<NAME>.json
   tracer bench <PATH> --baseline <NAME> [--tolerance <PCT>]
@@ -916,18 +921,26 @@ fn bench(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     let wanted = wanted.strip_prefix("requests/").unwrap_or(&wanted);
     let wanted = wanted.strip_suffix(".http").unwrap_or(wanted);
     let (requests, _) = saved(&workspace, "tracer bench")?;
-    let Some(found) = requests.into_iter().find(|r| r.path == wanted) else {
-        return Err(io::Error::other(format!("there is no saved request `{wanted}`; `tracer ls` lists them")));
-    };
     // Neither a count nor a time: a hundred.
     let total = if total.is_none() && duration_secs.is_none() { Some(100) } else { total };
     let plan = BenchPlan { total, concurrency, duration_secs, rate };
+    let under = format!("{}/", wanted.trim_end_matches('/'));
+    let Some(found) = requests.iter().find(|r| r.path == wanted).cloned() else {
+        if requests.iter().any(|r| r.path.starts_with(&under)) {
+            if envs.len() > 1 {
+                return Err(io::Error::other("a folder is benched step by step with one --env"));
+            }
+            let flow = FlowBench { path: wanted.trim_end_matches('/'), env: envs.pop(), plan: &plan, baseline, save_as, tolerance_pct };
+            return bench_flow(&workspace, &flow, report.is_some());
+        }
+        return Err(io::Error::other(format!("there is no saved request or folder `{wanted}`; `tracer ls` lists them")));
+    };
 
     let runs: Vec<Option<String>> = if envs.is_empty() { vec![None] } else { envs.into_iter().map(Some).collect() };
     let mut ok = true;
     let mut ran = Vec::new();
     for env in &runs {
-        let (bench_id, stats, stopped) = bench_once(&workspace, &found.request, env.clone(), &plan, wanted)?;
+        let (bench_id, stats, stopped) = bench_once(&workspace, &found.request, env.clone(), &plan, wanted, None)?;
         ok &= stopped.is_none() && stats.bad() == 0;
         ran.push(serde_json::json!({ "bench_id": bench_id, "env": env, "stopped": stopped, "stats": stats }));
     }
@@ -1158,6 +1171,94 @@ fn millis(text: &str) -> io::Result<u64> {
     }
 }
 
+/// A folder benched step by step.
+struct FlowBench<'a> {
+    path: &'a str,
+    env: Option<String>,
+    plan: &'a BenchPlan,
+    /// Each step compared with baseline `NAME--<step>`, or kept as one.
+    baseline: Option<String>,
+    save_as: Option<String>,
+    tolerance_pct: Option<f64>,
+}
+
+/// A step's baseline name: the flow's, then the step's last path part.
+fn step_baseline(name: &str, step: &str) -> String {
+    let last = step.rsplit('/').next().unwrap_or(step);
+    let slug: String = last.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' }).collect();
+    format!("{name}--{}", slug.trim_matches('-'))
+}
+
+/// Run the folder's flow once, so each step has the captures it's sent
+/// with, then bench each step that passed with them, one after the other,
+/// and set the steps side by side; each compared with its own baseline, or
+/// kept as one, if asked.
+fn bench_flow(workspace: &PathBuf, f: &FlowBench, json: bool) -> io::Result<ExitCode> {
+    let mut client = Client::connect(workspace, ClientKind::Cli, "tracer bench")?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    let flow_id = match client.call(Command::RunFlow { path: f.path.to_string(), env: f.env.clone(), keep_going: false, data: None })? {
+        Ok(ReplyBody::FlowStarted { flow_id, .. }) => flow_id,
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    eprintln!("flow {flow_id}: running {} once for each step's captures", f.path);
+    let steps = loop {
+        if let EventKind::FlowFinished { flow_id: id, steps, .. } = client.next_event()?.kind {
+            if id == flow_id {
+                break steps;
+            }
+        }
+    };
+    let (requests, _) = saved(workspace, "tracer bench")?;
+    let mut ok = true;
+    let mut rows: Vec<(String, Option<BenchStats>, String)> = Vec::new();
+    let mut ran = Vec::new();
+    for step in &steps {
+        let (Some(request_id), StepOutcome::Passed) = (step.request_id, step.outcome) else {
+            eprintln!("– {}: not benched, the flow's run of it {}", step.path, if step.note.is_empty() { "didn't pass".into() } else { step.note.clone() });
+            rows.push((step.path.clone(), None, "not benched".into()));
+            ok = false;
+            continue;
+        };
+        let Some(saved) = requests.iter().find(|r| r.path == step.path) else { continue };
+        let (bench_id, stats, stopped) = bench_once(workspace, &saved.request, f.env.clone(), f.plan, &step.path, Some(request_id))?;
+        ok &= stopped.is_none() && stats.bad() == 0;
+        let mut verdict = String::new();
+        if let Some(name) = &f.baseline {
+            let against = step_baseline(name, &step.path);
+            match compare(workspace, Command::CompareBench { bench_id, baseline: Some(against.clone()), other_bench: None, tolerance_pct: f.tolerance_pct }) {
+                Ok(c) => {
+                    eprint!("
+{}", comparison_table(&c));
+                    ok &= !c.regressed;
+                    verdict = if c.regressed { format!("worse than {against}") } else { format!("as {against}") };
+                }
+                Err(e) => verdict = format!("no baseline: {e}"),
+            }
+        }
+        if let Some(name) = &f.save_as {
+            let as_name = step_baseline(name, &step.path);
+            client.call(Command::SaveBaseline { bench_id, name: as_name.clone() })?.map_err(io::Error::other)?;
+            verdict = format!("saved as {as_name}");
+        }
+        ran.push(serde_json::json!({ "step": step.path, "bench_id": bench_id, "stopped": stopped, "stats": stats, "verdict": verdict }));
+        rows.push((step.path.clone(), Some(stats), verdict));
+    }
+    eprintln!("
+{:<32} {:>8} {:>8} {:>8} {:>9} {:>6}  ", "step", "p50 ms", "p95 ms", "p99 ms", "per sec", "wrong");
+    for (path, stats, verdict) in &rows {
+        match stats {
+            Some(s) => eprintln!("{path:<32} {:>8.1} {:>8.1} {:>8.1} {:>9.1} {:>6}  {verdict}", s.p50_ms, s.p95_ms, s.p99_ms, s.per_sec, s.bad()),
+            None => eprintln!("{path:<32} {verdict}"),
+        }
+    }
+    if json {
+        let report = serde_json::json!({ "path": f.path, "flow_id": flow_id, "plan": f.plan, "steps": ran });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+    }
+    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
 fn bench_id(arg: Option<&String>) -> io::Result<u64> {
     arg.and_then(|a| a.trim_start_matches('#').parse().ok()).ok_or_else(|| io::Error::other(USAGE))
 }
@@ -1176,10 +1277,11 @@ fn bench_once(
     env: Option<String>,
     plan: &BenchPlan,
     path: &str,
+    vars_of: Option<u64>,
 ) -> io::Result<(u64, BenchStats, Option<String>)> {
     let mut client = Client::connect(workspace, ClientKind::Cli, "tracer bench")?;
     client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
-    let bench_id = match client.call(Command::RunBench { request: request.clone(), env: env.clone(), plan: plan.clone() })? {
+    let bench_id = match client.call(Command::RunBench { request: request.clone(), env: env.clone(), plan: plan.clone(), vars_of })? {
         Ok(ReplyBody::BenchStarted { bench_id }) => bench_id,
         Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
         Err(e) => return Err(io::Error::other(e)),

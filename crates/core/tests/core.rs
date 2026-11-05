@@ -1603,7 +1603,7 @@ GET {base}/x
 
 fn bench(url: String, plan: tracer_protocol::BenchPlan) -> Command {
     let request = HttpRequest { method: "GET".into(), url, ..Default::default() };
-    Command::RunBench { request, env: None, plan }
+    Command::RunBench { request, env: None, plan, vars_of: None }
 }
 
 /// How bench `id` ended: its stats and why it stopped, if it did.

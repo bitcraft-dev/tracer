@@ -562,7 +562,7 @@ pub fn run_bench(
         duration_secs: (secs > 0).then_some(secs),
         rate: (rate > 0.0).then_some(rate),
     };
-    match shared()?.call(Command::RunBench { request, env, plan }) {
+    match shared()?.call(Command::RunBench { request, env, plan, vars_of: None }) {
         Ok(Ok(ReplyBody::BenchStarted { bench_id })) => Ok(bench_id),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),

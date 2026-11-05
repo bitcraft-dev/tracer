@@ -231,11 +231,17 @@ pub enum Command {
     /// about as any send; the rest are counted, not kept. The reply gives
     /// the bench's id; the run is `bench_progress` events, then
     /// `bench_finished`.
+    ///
+    /// With `vars_of`, a past request's number, the variables it was sent
+    /// with beyond its environment (a flow step's captures, such as a
+    /// token) fill the bench's too, so a flow's later steps can be benched.
     RunBench {
         request: HttpRequest,
         #[serde(default)]
         env: Option<String>,
         plan: BenchPlan,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vars_of: Option<u64>,
     },
     /// Stop a running bench, whoever started it. It ends with
     /// `bench_finished`, naming who stopped it.

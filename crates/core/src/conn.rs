@@ -173,8 +173,9 @@ pub fn serve(
                 Some(_) => Err(format!("request #{request_id} has no answer to read a schema from")),
                 None => Err(format!("there is no request #{request_id} in the history")),
             },
-            (Some((_, actor)), Command::RunBench { request, env, plan }) => {
-                bench::start(&hub, actor, request, env, plan).map(|bench_id| ReplyBody::BenchStarted { bench_id })
+            (Some((_, actor)), Command::RunBench { request, env, plan, vars_of }) => {
+                let extra = vars_of.map(|id| hub.vars_of(id)).unwrap_or_default();
+                bench::start(&hub, actor, request, env, plan, extra).map(|bench_id| ReplyBody::BenchStarted { bench_id })
             }
             (Some((_, actor)), Command::SaveBaseline { bench_id, name }) => {
                 hub.save_baseline(actor.clone(), bench_id, &name).map(|(name, path)| ReplyBody::BaselineSaved { name, path })

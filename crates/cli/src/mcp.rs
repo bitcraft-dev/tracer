@@ -496,7 +496,7 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             };
             let wait = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(WAIT_DEFAULT * 2).min(WAIT_MAX);
             while core.events.try_recv().is_ok() {}
-            let ReplyBody::BenchStarted { bench_id } = call(core, Command::RunBench { request: found.request, env, plan })? else {
+            let ReplyBody::BenchStarted { bench_id } = call(core, Command::RunBench { request: found.request, env, plan, vars_of: None })? else {
                 return Err(unexpected());
             };
             let deadline = Instant::now() + Duration::from_secs(wait);
