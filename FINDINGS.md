@@ -1232,9 +1232,12 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   cx.closure(…, vec![__c])`), as the array arm already does with
   `__c1_0`; and a release-build test of a closure capturing a parameter in
   an async-calling function.
-- **Status:** open. The Rux checkout (7a2be84) had uncommitted changes in
-  rux-layout, rux-runtime and rux-script when the installed `rux` was
-  built.
+- **Status:** fixed in Rux cabfc45 ("A release build compiles a closure
+  that captures a parameter beside an await"; installed `rux` 2026-11-05
+  05:33, checkout clean at 29fb783). Not re-driven by Tracer (the user's
+  call, 2026-11-05: the fix is taken as given). Tracer never worked
+  around it, so `toggleFold` stays as written and a release build of the
+  window is open again, for the Show more measurements (PROGRESS, Next 1).
 
 ## AW-042 `margin: auto` is laid out as 0 in a flex container
 
@@ -1277,7 +1280,13 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   §8.1 says: main axis, share the positive free space among them before
   `justify-content`; cross axis, an auto margin turns off `stretch` and
   aligns the item. Tests for a row's end, a centred item and a column.
-- **Status:** open.
+- **Status:** fixed in Rux 29fb783 ("An auto margin takes the free space,
+  and keeps its place in the shorthand"; installed `rux` 2026-11-05
+  05:33). Not re-driven by Tracer (the user's call, 2026-11-05). Tracer
+  never worked around it: its `margin-left: auto` rules (the Collections
+  `+`, Save, a history row's time, the environment editor's Save and
+  danger link) were left as written and now take the row's free space as
+  intended, with no change in Tracer.
 
 ## AW-043 The root's background lags one change behind when its class changes as the focused element goes
 
@@ -1350,6 +1359,82 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   removal relayout; restyle the root (or read its background) after the
   tree change, in the same frame. A test: flip a root class and remove an
   `r-if` child in one handler, then check the painted clear colour.
+- **Status:** open.
+
+## AW-044 `rux check` refuses a function that reads a signal declared after the `effect` that calls it
+
+- **Found:** 2026-11-05, Tracer's API view. Its signals (`specs`,
+  `specPick`, `drift`, …) and functions (`loadSpecs`, `loadDrift`) were
+  written together, below the window's event `effect`, which calls the two
+  functions when a `spec_imported` or `request_checked` event arrives.
+- **Severity:** friction, a false error. `rux check` stops with an error,
+  and the window's dev overlay shows it at launch; the code runs correctly.
+- **Limit:** a top-level signal declared after an `effect` is taken, in a
+  function that effect calls, to be the effect's own local:
+  ```
+  app.rux:9: error: `load` reads `note`, which only whoever calls it has. A
+  function whose parameters are all typed, or that has none, sees its own
+  names and the document's, not its caller's: pass `note` in as a parameter
+  ```
+  `note` is the document's, declared at the top level of the same
+  `<script>`. Declared one line above the `effect`, the same code passes.
+  Top-level order otherwise doesn't matter to the checker (an `effect` may
+  assign a signal declared further down, as Tracer's does with `mockId`).
+- **Reproduction:** (installed `rux` of 2026-11-05 05:33, checkout clean at
+  29fb783, no native crate)
+  ```html
+  <template><view><text @tap="tick = tick + 1">{{ note }} {{ tick }}</text></view></template>
+  <script>
+    let tick = signal(0);
+    effect {
+      if tick > 0 { load(); }
+    }
+    let note = signal("");
+    async fn load() {
+      note = `loaded ${tick}`;
+    }
+  </script>
+  ```
+  `rux check` gives the error above, and `rux run` opens with it in the
+  overlay. Dismissed, a tap on the text shows `loaded 1 1`: the runtime
+  reads and writes `note` as the document's. Moving `let note` above the
+  `effect`: no problems found.
+- **Workaround:** Tracer declares the API view's signals above the event
+  `effect` (a comment there names this entry), apart from the functions
+  that use them. To be moved back once this is fixed.
+- **Suggested fix:** collect a script's top-level names before checking the
+  functions a top-level `effect` (or `computed`) calls, as the runtime
+  does, so declaration order among top-level statements doesn't change
+  what a function can see. A test: the reproduction above passes.
+- **Status:** open.
+
+## AW-045 `if c { ["b"] } else { [] }` is typed `string[] | any[]`, which `+` refuses
+
+- **Found:** 2026-11-05, Tracer's API view, joining an import's notes:
+  `r.notes + r.changes.map(…) + made + kept + gone`, where `kept` is
+  `if r.kept > 0 { [`…`] } else { [] }`.
+- **Severity:** papercut. The empty array literal in one branch doesn't
+  take the other branch's element type, and the union is then refused by
+  `+` between arrays.
+- **Reproduction:** (installed `rux` of 2026-11-05 05:33)
+  ```html
+  <template><view><text>{{ joined().join(",") }}</text></view></template>
+  <script>
+    let more = signal(true);
+    fn joined(): string[] {
+      let base: string[] = ["a"];
+      let extra = if more { ["b"] } else { [] };
+      return base + extra;
+    }
+  </script>
+  ```
+  ``app.rux:7: error: `+` cannot be applied to `string[]` and `string[] | any[]` ``.
+  With `let extra: string[] = if …` it passes.
+- **Workaround:** the annotation, which is ordinary typed code (Tracer's
+  `kept: string[]`).
+- **Suggested fix:** type `[]` from its context: the other branch of an
+  `if`, the array it's added to, or the declared type; or treat
+  `T[] | any[]` as `T[]`.
 - **Status:** open.
 
 ## Phase 0 results
