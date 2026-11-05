@@ -14,6 +14,13 @@ user's core from 2026-11-02 (`tracer-running-2026-11-02.exe`, PIDs 10280,
 bring your own model) hasn't started. The plan's features not built yet
 are listed under Next, item 7. Next is still Show more (item 1).
 
+Later the same day the user said: **leave Phase 5's chat until near
+release**, and build the S and M items (Next, items 2 and 7) first.
+Done so far: the TLS switch (bc2ff7e) and export/import (1571661), both
+driven in the window. Being worked through next: re-run on file change,
+the "explain this failure" bundle, port discovery, then data-driven runs
+and the mock server, then item 2's follow-ups.
+
 ## Where it stood (2026-11-04, night)
 
 The user went to sleep and asked for development to go on, committing as
@@ -598,6 +605,35 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   (`browser_behaviour_…` and unit tests) and driven against httpbin.
   Not done: SameSite isn't enforced (no notion of a top-level site), and
   a browser's own headers (User-Agent) count as script-set ones.
+- **Unchecked TLS for named hosts** (bc2ff7e, 2026-11-05).
+  `Browser.unchecked_tls` (`localhost`, `*.dev.test`, `*`), set by a
+  person: those hosts' certificates aren't checked (ureq's
+  `disable_verification`; WebSockets get a rustls verifier that still
+  checks signatures). With any set, redirects go a hop at a time
+  (`send_hop_by_hop`, was `send_keeping_cookies`) so each host is judged
+  on its own; a bench to such a host doesn't follow redirects. Answers
+  say `tls_unchecked`. CLI `tracer browser tls HOSTS|none`, a line after
+  the response; MCP `tls_unchecked`; window: field in the Browser panel,
+  amber `… · TLS unchecked` chip, "TLS not checked" on the response.
+  Driven against a self-signed `localhost:18443` (scratchpad `tls/`):
+  refused before, 200 after, a redirect to 127.0.0.1 still refused
+  ("redirected to …: invalid peer certificate").
+- **Export and import** (1571661). `export.rs`: curl, fetch, Python
+  (requests), Rux (a native export with ureq plus the page's call: Rux
+  script has no HTTP of its own, by design). Variables from the env,
+  secrets stay `{{name}}`, a trusted-unchecked host gets `--insecure` /
+  `verify=False` / `disable_verification`. `import.rs`: curl in bash or
+  cmd quoting (cmd is read as cmd then the C runtime's argv rules), and
+  fetch calls via a small JS-literal parser that keeps key order (no
+  `preserve_order` in serde_json here). Notes name what's left out
+  (`-F`, `-T`, `-k`, `credentials: "include"`). CLI `tracer export
+  <PATH|#ID> --as …`, `tracer import [FILE] --save`; MCP
+  `export_request`, `import_request`; window: **Copy as…** menu (the
+  page's own curl builder is removed) and the palette's **Paste a curl
+  command or fetch call**. Driven: a Chrome-style curl imported, exported
+  and run as curl, Node fetch and Python (a stand-in `requests` over
+  urllib: `requests` isn't installed here) to 201; the Rux export
+  compiled inside `app/native` (then removed).
 
 ### Next
 
@@ -648,14 +684,12 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
 6. Small: the Bench panel's baseline name field is drawn taller than
    its row (seen 2026-11-04, not looked into).
 7. **Not built yet from PLAN.md** (checked 2026-11-05 against the code):
-   Phase 5, the in-window chat with your own model (OpenAI-compatible,
-   Anthropic, Gemini, Ollama / LM Studio; keys in the vault); a mock
-   server from a collection or spec (and MCP `create_mock`); data-driven
-   runs from CSV/JSON; OpenAPI import, response validation and drift
-   detection; importing pasted cURL/fetch; export to Rux / JS / Python
-   (cURL is done); an "explain this failure" bundle; localhost port
-   discovery; re-run on file change; a self-signed TLS toggle; gRPC (a
-   stretch); themes; undo in the editor.
+   a mock server from a collection or spec (and MCP `create_mock`);
+   data-driven runs from CSV/JSON; OpenAPI import, response validation
+   and drift detection; an "explain this failure" bundle; localhost port
+   discovery; re-run on file change; gRPC (a stretch); themes; undo in
+   the editor. Phase 5's chat waits for release time (the user's call,
+   2026-11-05).
 
 ## Gotchas and how they were solved
 
