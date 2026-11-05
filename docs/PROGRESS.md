@@ -5,7 +5,26 @@ how it was solved. Read this first in a new session; update it at the end of
 each one. Rux's own limits go in [FINDINGS.md](../FINDINGS.md), not here; this
 file is about working on Tracer.
 
-## Where it stands (2026-11-05)
+## Where it stands (2026-11-05, afternoon)
+
+The user picked three things: OpenAPI (import, validation, drift, a spec
+mock), the schema-aware query editor, and undo in the editor. All three
+are built and driven in the window, committed on `phase-1-core` (889fe9e,
+27de06b, f296b3c, 97b2914), **not pushed** (11 ahead of origin). The
+user also said the Rux team fixed findings and that they needn't be
+re-driven: **AW-041 and AW-042 are marked fixed** from the Rux log
+(cabfc45, 29fb783); Tracer had no workaround for either, so its
+`margin-left: auto` rules now lay out as written. **AW-043 has no fix
+yet.** New findings: **AW-044** (a false `rux check` error on top-level
+order; Tracer's API-view signals sit above the event effect because of
+it, to move back), **AW-045** (`[]` in an `if` branch typed `any[]`),
+**AW-046** (no caret, selection or styled runs for a field from script:
+completion at the caret and highlighting in a field are blocked),
+**AW-047** (a field's undo: lost on blur, script edits not undoable, an
+empty history still swallows Ctrl+Z). Left from the plan: gRPC
+(stretch) and Phase 5 (at release). Nothing of this session is running.
+
+## Where it stood (2026-11-05)
 
 **`phase-1-core` pushed** (2dfc0f4; the 15 commits from bb55ab1 on). The
 user's core from 2026-11-02 (`tracer-running-2026-11-02.exe`, PIDs 10280,
@@ -723,6 +742,44 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
   are added). Palette Theme: dark/light/system, kept in settings. Switching
   from the palette hits **AW-043** (root background one change behind);
   started in a theme, it's right.
+- **OpenAPI** (889fe9e core, CLI, MCP; 27de06b window). `openapi.rs`
+  reads 3.0, 3.1 and Swagger 2 (JSON or YAML via serde_yaml; YAML number
+  keys become text) and keeps the document under `specs/<name>.<ext>`
+  with `<name>.from`. Import saves a request per operation that has none
+  under `requests/<name>/<tag>/<summary>`, URL `{{base}}…`, required
+  query/header params, security as `{{token}}`/`{{apiKey}}`, a body made
+  from the example or schema, `# @expect status …` and `# @expect spec
+  <name>`; with an env, `base` = the first server (a relative server
+  taken against the document's URL). Imported again: what changed, kept
+  requests, ones no operation matches. `schema.rs` checks JSON against
+  the schema subset (refs, types, nullable, enum, const, all/any/oneOf,
+  not, object/array/string/number keywords, formats, `pattern` via
+  regex-lite); fields the schema doesn't name are drift, not failure.
+  The `spec` check runs wherever checks run (sends, benches, run-until).
+  Drift reads the whole history in one pass (`Hub::answered`). The spec
+  mock (`mock.rs` now has a `Source`) checks params and body (400/422),
+  answers from examples, `Prefer: code=` / `?__code=`; the server's base
+  path is taken off. CLI `tracer spec import|ls|check|drift`, `tracer
+  mock --spec`; MCP `import_spec`, `list_specs`, `check_spec`,
+  `spec_drift`, `create_mock` with `spec`. Window: rail **API** (import
+  form, spec tabs, drift tiles and rows; a row opens its saved request,
+  `#N` shows the failing one), palette import/check/mock. Driven against
+  a drifting local API (scratchpad `api/server.py`, port 18796).
+- **Schema-aware GraphQL query** (f296b3c). `gqlcheck.rs` parses the
+  query and checks it against the loaded schema; problems at line:col
+  with suggestions, nearest first; a misspelt name's suggestion replaces
+  its bytes (`tracer.replaceRange`). Introspection now asks for
+  `defaultValue`, so an argument with a default isn't required. The
+  parsed schema is cached by request id (`graphql::cached_schema`): the
+  window checks on every change. MCP `check_graphql`. Driven against
+  countries.trevorblades.com. Completion at the caret and highlighting in
+  the field are AW-046.
+- **Editor undo** (97b2914). Tracer's own history of the request
+  (method, URL, headers, checks, body, query, variables), a step per
+  change, typing in one place within a second one step; Ctrl+Z / Ctrl+Y
+  / Ctrl+Shift+Z on the screen's `@key` (only reached with no field
+  focused), palette Undo/Redo, a notice naming what changed; `load` and
+  `newRequest` start a new history. Field-level undo is Rux's (AW-047).
 
 ### Next
 
@@ -770,11 +827,15 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    jar; a response's own Cookies tab (the plan's).
 6. Small: the Bench panel's baseline name field is drawn taller than
    its row (seen 2026-11-04, not looked into).
-7. **Not built yet from PLAN.md** (checked 2026-11-05 against the code):
-   a mock from an OpenAPI spec (the collection mock is done); OpenAPI
-   import, response validation and drift detection; gRPC (a stretch);
-   undo in the editor. Phase 5's chat waits for release time (the user's call,
-   2026-11-05).
+7. **Not built yet from PLAN.md** (2026-11-05, afternoon): gRPC (a
+   stretch). Phase 5's chat waits for release time (the user's call,
+   2026-11-05). Waiting on Rux: completion at the caret and highlighting
+   in the query field (AW-046); when AW-044 is fixed, move the API view's
+   signals back beside their functions.
+9. **A mock from a dead core shows as serving**: the journal replays
+   `mock_started` and nothing says it stopped when that core went (seen
+   2026-11-05: the status bar's mock chip after a restart). Close mocks
+   as dangling requests are closed when a core opens a journal. S.
 8. **Borrowed from an outside review** (a ChatGPT read of `phase-1-core`
    at 2dfc0f4, source only, nothing run; noted 2026-11-05, not
    scheduled, the user's call). It brings no new features; its feature
@@ -821,6 +882,15 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
      state that can be rebuilt), not `Hub` itself.
 
 ## Gotchas and how they were solved
+
+- **Bash heredocs with apostrophes in the text fail** in this tool ("unexpected
+  EOF while looking for matching `''") even with `<<'EOF'`. Write the
+  patch script with the Write tool into the scratchpad and run it.
+- **A textarea's tap target is its first line** when the box around it is
+  taller: tap on the placeholder's line, not the middle of the box.
+- **A `.rux` edit hot-reloads the page**, which resets script state (the
+  rail goes back to REST): re-open the view before the next tap.
+- `now()` is a `float`; a signal holding it needs `signal(0.0)`.
 
 Things that cost a round trip once. Check here before debugging them again.
 

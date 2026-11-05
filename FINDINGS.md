@@ -1437,6 +1437,104 @@ Rux under test: `rux 0.9.0-dev`, checkout at `C:\Users\USER\Mobile\UI Research`
   `T[] | any[]` as `T[]`.
 - **Status:** open.
 
+## AW-046 Script can't read or set a text field's caret or selection, or style runs of its text
+
+- **Found:** 2026-11-05, building Tracer's schema-aware GraphQL query
+  editor (PLAN.md: "Request / body editor: text input, selection,
+  highlighting in a field, undo").
+- **Severity:** blocker for completion at the caret and for highlighting
+  in a field; what doesn't need them was built.
+- **Limit:** a focused field's `caret` and `anchor` live in the shell
+  (`Focus`, 05-as-built "Selection & clipboard") and nothing in script
+  reads them: no `selectionStart` / `selectionEnd`, no event when they
+  move. Script can't set them either (`el.focus()` puts the caret
+  wherever it was), nor insert text at the caret as the user's own edit.
+  And a field draws its value as one run: there's no way to colour a
+  keyword or underline a range in it, as a code editor does. So a query
+  editor can't offer "the fields of the type at the caret", can't insert
+  a picked field where the caret is, and can't mark a problem in place.
+- **What Tracer built instead (no workaround of these):** the query is
+  checked as a whole on every change (the core parses it against the
+  schema); each problem is listed under the field with its line and
+  column, and a misspelt name's suggestions replace the bytes the problem
+  names. Nothing is guessed about where the caret is.
+- **Suggested fix:** in script, `el.selection` on a text input's element
+  (`{ start, end, caret }` in the units strings index by), settable;
+  `el.insertText(text)` that edits as typing does (replacing the
+  selection, joining the field's undo history, moving the caret); an
+  `@select` (or `@caret`) event when it moves. For highlighting, a way to
+  give a field's text styled runs: a `:marks="[{ start, end, class }]"`
+  on `<input type="textarea">`, painted under or over the text without
+  changing what is typed.
+- **Status:** open.
+
+## AW-047 A field's undo lasts only while it has focus, script edits can't be undone, and a field takes Ctrl+Z even with nothing to undo
+
+- **Found:** 2026-11-05, Tracer's request editor (PLAN.md's "undo" for the
+  editor), driven in a probe page and in Tracer.
+- **Severity:** friction. Each part is as documented in 07-script.md
+  ("The history belongs to the field while it has focus, and is dropped
+  when the app's script changes the field's value"), but together they
+  leave an editor with tabs (Body, Headers, Query) without undo across a
+  tab switch, and leave no way for an app to undo its own edits from
+  inside the field.
+- **Limit:** driven in a page with a textarea, a button that appends `!`
+  from script, and a `<screen @key>` that counts Ctrl+Z it receives:
+  1. Type `abc` in the field, Ctrl+Z: the field empties; the app counts
+     nothing. (As documented.)
+  2. With the field still focused and nothing left to undo, Ctrl+Z: the
+     field takes it and the app counts nothing. **An empty history still
+     swallows the key**, so an app's own undo can't follow on.
+  3. Type `xy`, tap the script button (`xy!`), click back in the field,
+     Ctrl+Z: nothing at all happens. The typing went with the focus, the
+     script's edit was never a step, and the key is swallowed again.
+  4. Type `qq`, click elsewhere, Ctrl+Z: the app counts one (right). Click
+     back in the field, Ctrl+Z: nothing. The typing's history went with
+     the focus.
+  In Tracer that means: a GraphQL suggestion taken (script sets the
+  query), a request opened or a paste imported, or an edit made before
+  switching from Body to Headers and back, can't be undone in the field.
+- **Reproduction:** (installed `rux` of 2026-11-05 05:33, no native crate)
+  ```html
+  <template>
+    <screen class="page" @key="onKey(event)">
+      <view class="box"><input type="textarea" r-model="text" placeholder="field" /></view>
+      <view class="btn" @tap="scriptEdit()"><text>script edit (append !)</text></view>
+      <view class="btn" @tap="noop()"><text>somewhere else</text></view>
+      <text>text: [{{ text }}]</text>
+      <text>app undos: {{ appUndo }}</text>
+    </screen>
+  </template>
+  <style>
+    .page { padding: 20px; gap: 12px; display: flex; flex-direction: column; background: #ffffff; height: 100%; }
+    .box { height: 120px; }
+    .btn { padding: 8px; border: 1px solid #888888; }
+    text { color: #000000; }
+  </style>
+  <script>
+    let text = signal("");
+    let appUndo = signal(0);
+    fn onKey(e: KeyEvent) {
+      if e.primary && e.key == "z" { appUndo = appUndo + 1; return false; }
+    }
+    fn scriptEdit() { text = text + "!"; }
+    fn noop() {}
+  </script>
+  ```
+- **Workaround:** none for the field. Tracer keeps its own history of the
+  whole request (method, URL, headers, checks, body, query, variables;
+  typing in one place within a second is one step), which Ctrl+Z reaches
+  only when no field has focus, and the palette's Undo and Redo. That is
+  the documented path (`history.undo()` on the screen's `@key`), not a
+  way round the field.
+- **Suggested fix:** keep a field's history across focus while its
+  element lives (a browser does); let a key the field can't use pass on:
+  Ctrl+Z with nothing to undo (and Ctrl+Y with nothing to redo) goes on
+  to the `@key`s around it; and an edit from script that can join the
+  history (AW-046's `insertText`, or `el.setValue(text, { undoable:
+  true })`).
+- **Status:** open.
+
 ## Phase 0 results
 
 Driven in the window on 2026-10-29 with `tools/drive.ps1` (screenshot, click,
