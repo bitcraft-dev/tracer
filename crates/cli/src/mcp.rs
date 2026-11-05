@@ -69,7 +69,7 @@ read_stream gives messages after a number, send_stream_message sends on a \
 WebSocket. Opening a WebSocket counts as a write for approval.";
 
 pub fn serve(workspace: PathBuf, name_override: Option<String>) -> io::Result<()> {
-    let mut server = Server { workspace, name_override, core: None };
+    let mut server = Server::new(workspace, name_override);
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -94,7 +94,7 @@ pub fn serve(workspace: PathBuf, name_override: Option<String>) -> io::Result<()
     Ok(())
 }
 
-struct Server {
+pub(crate) struct Server {
     workspace: PathBuf,
     name_override: Option<String>,
     core: Option<Core>,
@@ -106,9 +106,21 @@ struct Core {
     events: Receiver<Event>,
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(core) = self.core.take() {
+            core.client.close();
+        }
+    }
+}
+
 impl Server {
+    pub(crate) fn new(workspace: PathBuf, name_override: Option<String>) -> Server {
+        Server { workspace, name_override, core: None }
+    }
+
     /// The answer to one message; none for a notification.
-    fn handle(&mut self, message: Value) -> Option<Value> {
+    pub(crate) fn handle(&mut self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
         let method = message.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
         let params = message.get("params").cloned().unwrap_or(Value::Null);

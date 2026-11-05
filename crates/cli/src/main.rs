@@ -27,6 +27,7 @@
 //! Every command takes `-w <dir>` for the workspace (default: here).
 
 mod mcp;
+mod mcp_http;
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read};
@@ -180,7 +181,11 @@ usage:
   tracer mcp [--name <AGENT>]         an MCP server on stdio: an AI agent drives
                                       Tracer through it, as AGENT or the name its
                                       client gives; starts a core if none runs
-  tracer stop                         stop the workspace's core
+  tracer mcp --http <PORT> [--name <AGENT>]
+                                      the same over HTTP at
+                                      http://127.0.0.1:PORT/mcp (MCP's Streamable
+                                      HTTP, JSON answers), a session per client
+  tracer stop                        stop the workspace's core
 
 options:
   -w <dir>                            the workspace (default: the current directory)";
@@ -223,7 +228,13 @@ fn main() -> ExitCode {
         Some("policy") => policy(workspace),
         Some("mcp") => {
             let name = take_value(&mut args, "--name");
-            mcp::serve(workspace, name).map(|_| ExitCode::SUCCESS)
+            match take_value(&mut args, "--http") {
+                Some(port) => {
+                    let port = port.parse().map_err(|_| io::Error::other(format!("`{port}` isn't a port")));
+                    port.and_then(|port| mcp_http::serve(workspace, name, port)).map(|_| ExitCode::SUCCESS)
+                }
+                None => mcp::serve(workspace, name).map(|_| ExitCode::SUCCESS),
+            }
         }
         Some("stop") => stop(workspace),
         _ => {

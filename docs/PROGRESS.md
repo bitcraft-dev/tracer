@@ -740,6 +740,50 @@ Remote `origin` is https://github.com/bitcraft-dev/tracer (pushed 2026-10-30): `
    import, response validation and drift detection; gRPC (a stretch);
    themes; undo in the editor. Phase 5's chat waits for release time (the user's call,
    2026-11-05).
+8. **Borrowed from an outside review** (a ChatGPT read of `phase-1-core`
+   at 2dfc0f4, source only, nothing run; noted 2026-11-05, not
+   scheduled, the user's call). It brings no new features; its feature
+   gaps are the ones above, most now done. What to carry, each checked
+   against the code:
+   - **Journal write errors are dropped**: `let _ = writeln!(inner.
+     journal, …)` in `publish_locked` (hub.rs), so a client can see an
+     event the journal never got, despite the comment above it saying
+     otherwise. Make the failure loud (an event, or refuse to publish). S.
+   - **Nothing is ever let go**: `Inner.events` keeps every event,
+     bodies included, and history, `last_answer` and `since` scan it
+     whole. Later: segment the journal, page old events, keep a
+     compacted snapshot, and set a retention rule for large bodies. M-L.
+   - **Slow clients**: each subscriber's outbox is an unbounded
+     `mpsc::channel()` (hub.rs ~726, ~839), so a stuck client grows the
+     core's memory without limit. Bound it, and drop or resync a client
+     that falls behind (it can replay with `since`). S-M.
+   - **A thread per connection** (conn.rs) with no cap or idle timeout.
+     Add a connection limit and idle timeouts. S.
+   - **Tokens through `RandomState`** (lib.rs ~168, ws.rs ~108). std
+     seeds it once per thread and then steps the key, so it's weaker
+     than the comment claims. Read OS randomness directly (getrandom /
+     `BCryptGenRandom`). S.
+   - **Disk rescans every second** (`DISK_SCAN`, lib.rs ~117) instead of
+     file-change notifications. It's fine at today's sizes; revisit if
+     workspaces get big. M.
+   - **Show more** re-walks the layout from the top on each page
+     (view.rs): the same thing as item 1, from the other side.
+   - **app.rux** (3,593 lines now) wants splitting into modules. Check
+     first what Rux's module support allows; a missing piece is a
+     finding.
+   - **The root `Cargo.toml` patches `rux-native` to an absolute
+     `C:/Users/USER/…` path**, so no other checkout builds. Use a
+     relative path, a git dependency, or a documented override.
+   - Open questions it raised: `PROTOCOL_VERSION` is reject-only with no
+     negotiation; policy types live in the wire crate; the protocol and
+     the local HTTP/WS API are two surfaces that must stay in sync.
+   - For Rux (stress tests, not Tracer work): async native calls,
+     channel delivery under sustained traffic, effects over large
+     lists, live SVG charts, large-response memory, and native process
+     shutdown. Drive the ones the findings don't already cover.
+   - For Mava (not Tracer): reuse the patterns (a single state owner,
+     explicit commands, ordered events, many clients, a native boundary,
+     state that can be rebuilt), not `Hub` itself.
 
 ## Gotchas and how they were solved
 
