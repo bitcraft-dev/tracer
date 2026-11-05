@@ -21,7 +21,7 @@ use tracer_protocol::{
     POLICY_PATH, Browser, CookieSeen,
 };
 
-use crate::cookies::Jar;
+use crate::cookies::Jars;
 
 /// The workspace's browser behaviour and its cookie jar, beside the journal.
 const BROWSER_PATH: &str = ".tracer/browser.json";
@@ -88,7 +88,7 @@ struct Inner {
     step_vars: HashMap<u64, Vec<(String, String)>>,
     /// How requests behave like a browser's, and the cookies kept for it.
     browser: Browser,
-    jar: Jar,
+    jars: Jars,
 }
 
 /// A request in flight: the flag its worker checks to stop early, and what
@@ -294,7 +294,7 @@ impl Hub {
                 disk: Disk::read(workspace),
                 step_vars: HashMap::new(),
                 browser: read_json(&workspace.join(BROWSER_PATH)),
-                jar: read_json(&workspace.join(COOKIES_PATH)),
+                jars: Jars::read(&fs::read_to_string(workspace.join(COOKIES_PATH)).unwrap_or_default()),
             }),
             workspace: workspace.display().to_string(),
             root: workspace.to_path_buf(),
@@ -605,35 +605,47 @@ impl Hub {
         Ok(())
     }
 
-    /// The `Cookie` header the jar gives `url`, if any.
-    pub fn cookie_header(&self, url: &str) -> Option<String> {
-        self.inner.lock().unwrap().jar.header_for(url, now_ms())
+    /// The `Cookie` header the jar for a request sent with `env` gives
+    /// `url`, if any.
+    pub fn cookie_header(&self, url: &str, env: Option<&str>) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let key = jar_key(&inner.browser, env);
+        inner.jars.jar(&key).header_for(url, now_ms())
     }
 
-    /// Keep the `Set-Cookie` headers of an answer from `url`, in `actor`'s
-    /// name if that changes the jar.
-    pub fn keep_cookies(&self, actor: Actor, url: &str, headers: &[(String, String)]) {
+    /// Keep the `Set-Cookie` headers of an answer from `url`, to a request
+    /// sent with `env`, in `actor`'s name if that changes the jar.
+    pub fn keep_cookies(&self, actor: Actor, url: &str, headers: &[(String, String)], env: Option<&str>) {
         let mut inner = self.inner.lock().unwrap();
-        let before = inner.jar.clone();
+        let key = jar_key(&inner.browser, env);
+        let before = inner.jars.clone();
         let now = now_ms();
         for (_, value) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie")) {
-            inner.jar.store(url, value, now);
+            inner.jars.jar(&key).store(url, value, now);
         }
-        if inner.jar != before {
+        if inner.jars != before {
             self.jar_changed(&mut inner, actor);
         }
     }
 
-    /// The browser behaviour and the jar, with values if `values`.
+    /// The browser behaviour and every jar's cookies, with values if
+    /// `values`.
     pub fn cookies(&self, values: bool) -> (Browser, Vec<CookieSeen>) {
         let inner = self.inner.lock().unwrap();
-        (inner.browser.clone(), inner.jar.seen(now_ms(), values))
+        (inner.browser.clone(), inner.jars.seen(now_ms(), values))
     }
 
-    /// Empty the jar, or `domain`'s part of it. Gives how many went.
-    pub fn clear_cookies(&self, actor: Actor, domain: Option<&str>) -> usize {
+    /// Empty the jars (or `env`'s: "" for the shared one), or `domain`'s
+    /// part of them. Gives how many went.
+    pub fn clear_cookies(&self, actor: Actor, domain: Option<&str>, env: Option<&str>) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        let removed = inner.jar.clear(domain);
+        let removed = inner
+            .jars
+            .by_env
+            .iter_mut()
+            .filter(|(key, _)| env.is_none_or(|e| e == key.as_str()))
+            .map(|(_, jar)| jar.clear(domain))
+            .sum::<usize>();
         if removed > 0 {
             self.jar_changed(&mut inner, actor);
         }
@@ -641,9 +653,10 @@ impl Hub {
     }
 
     fn jar_changed(&self, inner: &mut Inner, actor: Actor) {
+        inner.jars.by_env.retain(|key, jar| key.is_empty() || !jar.cookies.is_empty());
         // A jar that can't be written still serves this core's life.
-        let _ = write_json(&self.root.join(COOKIES_PATH), &inner.jar);
-        let cookies = inner.jar.seen(now_ms(), false);
+        let _ = write_json(&self.root.join(COOKIES_PATH), &inner.jars);
+        let cookies = inner.jars.seen(now_ms(), false);
         publish_locked(inner, actor, EventKind::CookiesChanged { cookies });
     }
 
@@ -1258,6 +1271,11 @@ fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {
 }
 
 /// A JSON file's value, or the default when it's missing or unreadable.
+/// Which jar a request sent with `env` uses.
+fn jar_key(browser: &Browser, env: Option<&str>) -> String {
+    if browser.jar_per_env { env.unwrap_or_default().to_string() } else { String::new() }
+}
+
 fn read_json<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> T {
     fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
 }

@@ -34,6 +34,43 @@ pub struct Jar {
     pub cookies: Vec<Cookie>,
 }
 
+/// The workspace's jars by environment name ("" for requests sent with
+/// none, and for every request when there's one jar for all).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Jars {
+    pub by_env: std::collections::BTreeMap<String, Jar>,
+}
+
+impl Jars {
+    /// `cookies.json` as written now, or as it was when it held one jar.
+    pub fn read(text: &str) -> Jars {
+        if let Ok(jars) = serde_json::from_str::<Jars>(text) {
+            if !jars.by_env.is_empty() {
+                return jars;
+            }
+        }
+        let one: Jar = serde_json::from_str(text).unwrap_or_default();
+        Jars { by_env: [(String::new(), one)].into() }
+    }
+
+    pub fn jar(&mut self, key: &str) -> &mut Jar {
+        self.by_env.entry(key.to_string()).or_default()
+    }
+
+    /// Every jar's cookies, each naming its environment.
+    pub fn seen(&self, now_ms: u64, values: bool) -> Vec<CookieSeen> {
+        self.by_env
+            .iter()
+            .flat_map(|(env, jar)| {
+                jar.seen(now_ms, values).into_iter().map(move |mut c| {
+                    c.env = (!env.is_empty()).then(|| env.clone());
+                    c
+                })
+            })
+            .collect()
+    }
+}
+
 /// A URL's parts the jar needs: https or not, its host, and its path.
 struct Target {
     secure: bool,
@@ -147,6 +184,7 @@ impl Jar {
                 secure: c.secure,
                 http_only: c.http_only,
                 same_site: c.same_site.clone(),
+                env: None,
             })
             .collect()
     }

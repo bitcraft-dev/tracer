@@ -243,8 +243,8 @@ pub fn serve(
                 let (browser, cookies) = hub.cookies(actor.kind != ClientKind::Agent);
                 Ok(ReplyBody::Cookies { browser, cookies })
             }
-            (Some((_, actor)), Command::ClearCookies { domain }) => {
-                let removed = hub.clear_cookies(actor.clone(), domain.as_deref());
+            (Some((_, actor)), Command::ClearCookies { domain, env }) => {
+                let removed = hub.clear_cookies(actor.clone(), domain.as_deref(), env.as_deref());
                 Ok(ReplyBody::CookiesCleared { removed: removed as u64 })
             }
             (Some((_, actor)), Command::RunUntil { request, env, plan }) => {
@@ -424,7 +424,7 @@ pub(crate) fn run_one(
     let mut cors_origin: Option<String> = None;
     let resolved = resolved.and_then(|mut sending| {
         if browser.cookies {
-            if let Some(jar) = hub.cookie_header(&sending.url) {
+            if let Some(jar) = hub.cookie_header(&sending.url, env) {
                 add_cookies(&mut sending, &jar);
                 credentials = true;
             }
@@ -454,7 +454,7 @@ pub(crate) fn run_one(
             if realtime::is_websocket(&sending) {
                 realtime::websocket(&link, &sending, http::tls_unchecked(&browser, &sending.url))
             } else if browser.cookies || !browser.unchecked_tls.is_empty() {
-                send_hop_by_hop(hub, actor, &browser, sending, redirects, cancelled, &read_events)
+                send_hop_by_hop(hub, actor, &browser, env, sending, redirects, cancelled, &read_events)
             } else {
                 http::execute(&sending, redirects, false, cancelled, Some(&read_events))
             }
@@ -488,10 +488,12 @@ const MAX_REDIRECTS: usize = 20;
 /// certificate only if it's one of `browser.unchecked_tls`. A 303, or a 301
 /// or 302 to a POST, goes on as a GET without the body. The last hop's
 /// answer and timing are the answer.
+#[allow(clippy::too_many_arguments)]
 fn send_hop_by_hop(
     hub: &Hub,
     actor: &Actor,
     browser: &Browser,
+    env: Option<&str>,
     mut sending: HttpRequest,
     redirects: bool,
     cancelled: &AtomicBool,
@@ -502,7 +504,7 @@ fn send_hop_by_hop(
         let response = http::execute(&sending, false, unchecked, cancelled, Some(read_events))
             .map_err(|e| if hop == 0 { e } else { format!("redirected to {}: {e}", sending.url) })?;
         if browser.cookies {
-            hub.keep_cookies(actor.clone(), &sending.url, &response.headers);
+            hub.keep_cookies(actor.clone(), &sending.url, &response.headers, env);
         }
         let location = response.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).map(|(_, v)| v.trim());
         let next = match location {
@@ -519,7 +521,7 @@ fn send_hop_by_hop(
         }
         if browser.cookies {
             sending.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("cookie"));
-            if let Some(jar) = hub.cookie_header(&next) {
+            if let Some(jar) = hub.cookie_header(&next, env) {
                 sending.headers.push(("Cookie".into(), jar));
             }
         }

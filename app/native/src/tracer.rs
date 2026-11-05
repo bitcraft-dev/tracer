@@ -736,6 +736,8 @@ pub struct CookieRow {
     pub expires_ms: u64,
     /// `Secure HttpOnly SameSite=Lax`, those it has.
     pub flags: String,
+    /// The environment whose jar holds it, or "" for the shared jar.
+    pub env: String,
 }
 
 /// How the workspace's requests behave like a browser's, and the jar.
@@ -747,6 +749,8 @@ pub struct BrowserState {
     pub origin: String,
     /// Hosts whose TLS certificates aren't checked, `, ` between them.
     pub unchecked_tls: String,
+    /// A jar per environment.
+    pub jar_per_env: bool,
     pub jar: Vec<CookieRow>,
 }
 
@@ -758,6 +762,7 @@ pub fn browser_state() -> Result<BrowserState, CoreError> {
             cookies: browser.cookies,
             unchecked_tls: browser.unchecked_tls.join(", "),
             origin: browser.origin.unwrap_or_default(),
+            jar_per_env: browser.jar_per_env,
             jar: cookies
                 .into_iter()
                 .map(|c| {
@@ -778,6 +783,7 @@ pub fn browser_state() -> Result<BrowserState, CoreError> {
                         path: c.path,
                         expires_ms: c.expires_ms.unwrap_or(0),
                         flags: flags.join(" "),
+                        env: c.env.unwrap_or_default(),
                     }
                 })
                 .collect(),
@@ -792,10 +798,10 @@ pub fn browser_state() -> Result<BrowserState, CoreError> {
 /// don't check the TLS certificates of `unchecked_tls`'s hosts (separated
 /// by commas or spaces; "" for none).
 #[rux::export]
-pub fn set_browser(cookies: bool, origin: String, unchecked_tls: String) -> Result<(), CoreError> {
+pub fn set_browser(cookies: bool, origin: String, unchecked_tls: String, jar_per_env: bool) -> Result<(), CoreError> {
     let origin = (!origin.trim().is_empty()).then(|| origin.trim().to_string());
     let unchecked_tls = unchecked_tls.split([',', ' ']).map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect();
-    match shared()?.call(Command::SetBrowser { browser: Browser { cookies, origin, unchecked_tls } }) {
+    match shared()?.call(Command::SetBrowser { browser: Browser { cookies, origin, unchecked_tls, jar_per_env } }) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
@@ -806,7 +812,7 @@ pub fn set_browser(cookies: bool, origin: String, unchecked_tls: String) -> Resu
 #[rux::export]
 pub fn clear_cookies(domain: String) -> Result<u64, CoreError> {
     let domain = (!domain.trim().is_empty()).then(|| domain.trim().to_string());
-    match shared()?.call(Command::ClearCookies { domain }) {
+    match shared()?.call(Command::ClearCookies { domain, env: None }) {
         Ok(Ok(ReplyBody::CookiesCleared { removed })) => Ok(removed),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
         Ok(Err(refused)) => Err(CoreError(refused)),

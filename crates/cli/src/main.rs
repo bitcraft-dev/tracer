@@ -115,14 +115,16 @@ usage:
                                       2s); a line an answer; exits 0 when the streak
                                       came, 1 when it ended without it
   tracer until stop <ID>              stop a running run-until, whoever started it
-  tracer browser [cookies on|off] [origin <URL>|none] [tls <HOSTS>|none]
+  tracer browser [cookies on|off] [jars per-env|shared] [origin <URL>|none] [tls <HOSTS>|none]
                                       how requests behave like a browser's (off
                                       unless set): keep cookies and send them back;
                                       as a page at URL, send Origin, preflight what
                                       a browser would, and check the answer's CORS;
                                       HOSTS (localhost,*.dev.test or *) have their
                                       TLS certificates accepted unchecked
-  tracer cookies [clear [DOMAIN]]     the cookie jar, or empty it (a domain's part)
+  tracer cookies [clear [DOMAIN] [--env <NAME>]]
+                                      the cookie jar(s), or empty them (a domain's
+                                      part; one environment's jar)
   tracer schema <URL|PATH> [-H 'Name: value']... [--env <NAME>]
                                       a GraphQL server's schema as SDL, asked by
                                       introspection (a request in history);
@@ -977,6 +979,8 @@ fn browser(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
             match (word.as_str(), words.next().map(String::as_str)) {
                 ("cookies", Some("on")) => browser.cookies = true,
                 ("cookies", Some("off")) => browser.cookies = false,
+                ("jars", Some("per-env")) => browser.jar_per_env = true,
+                ("jars", Some("shared")) => browser.jar_per_env = false,
                 ("origin", Some("none")) => browser.origin = None,
                 ("origin", Some(url)) => browser.origin = Some(url.to_string()),
                 ("tls", Some("none")) => browser.unchecked_tls.clear(),
@@ -992,7 +996,14 @@ fn browser(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
         };
         browser = now;
     }
-    println!("cookies  {}", if browser.cookies { "kept and sent back" } else { "off" });
+    println!(
+        "cookies  {}",
+        match (browser.cookies, browser.jar_per_env) {
+            (false, _) => "off",
+            (true, false) => "kept and sent back, one jar for all",
+            (true, true) => "kept and sent back, a jar per environment",
+        }
+    );
     match &browser.origin {
         Some(origin) => println!("origin   {origin}: Origin sent, preflights as a browser's, answers checked for CORS"),
         None => println!("origin   none: no CORS"),
@@ -1007,8 +1018,10 @@ fn browser(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
 fn cookies(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     let mut client = Client::connect(&workspace, ClientKind::Cli, &person())?;
     if args.first().map(String::as_str) == Some("clear") {
-        let domain = args.get(1).cloned();
-        let Ok(ReplyBody::CookiesCleared { removed }) = client.call(Command::ClearCookies { domain })?.map_err(io::Error::other) else {
+        let mut rest = args[1..].to_vec();
+        let env = take_value(&mut rest, "--env");
+        let domain = rest.first().cloned();
+        let Ok(ReplyBody::CookiesCleared { removed }) = client.call(Command::ClearCookies { domain, env })?.map_err(io::Error::other) else {
             return Err(io::Error::other("unexpected answer"));
         };
         eprintln!("removed {removed} cookie{}", if removed == 1 { "" } else { "s" });
@@ -1038,7 +1051,8 @@ fn cookies(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
             Some(ms) => format!("ends in {}", short_span(ms.saturating_sub(now_ms()))),
             None => "session".into(),
         };
-        println!("{}{}  {}={}  {ends}  {}", c.domain, c.path, c.name, c.value.as_deref().unwrap_or("…"), flags.join(" "));
+        let env = c.env.as_deref().map(|e| format!("[{e}] ")).unwrap_or_default();
+        println!("{env}{}{}  {}={}  {ends}  {}", c.domain, c.path, c.name, c.value.as_deref().unwrap_or("…"), flags.join(" "));
     }
     Ok(ExitCode::SUCCESS)
 }

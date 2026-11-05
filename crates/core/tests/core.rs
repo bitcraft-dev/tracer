@@ -923,7 +923,7 @@ fn browser_behaviour_keeps_cookies_and_preflights_as_a_browser_would_once_switch
     assert_eq!(response.body, "");
 
     // On, it's kept and sent back; an agent may not switch it, nor see values.
-    let on = tracer_protocol::Browser { cookies: true, origin: None, unchecked_tls: vec![] };
+    let on = tracer_protocol::Browser { cookies: true, origin: None, unchecked_tls: vec![], jar_per_env: false };
     assert!(agent.call(Command::SetBrowser { browser: on.clone() }).unwrap().is_err());
     assert_eq!(window.call(Command::SetBrowser { browser: on }).unwrap(), Ok(ReplyBody::BrowserSet));
     let id = send(&mut window, "GET", "/login", vec![]);
@@ -938,11 +938,35 @@ fn browser_behaviour_keeps_cookies_and_preflights_as_a_browser_would_once_switch
     // Kept out of the journal: sent as written, and the jar's event has no values.
     let journal = std::fs::read_to_string(ws.join(tracer_protocol::JOURNAL_PATH)).unwrap();
     assert!(journal.lines().filter(|l| !l.contains("request_finished")).all(|l| !l.contains("abc")), "a cookie's value reached the journal");
-    assert_eq!(window.call(Command::ClearCookies { domain: None }).unwrap(), Ok(ReplyBody::CookiesCleared { removed: 1 }));
+    assert_eq!(window.call(Command::ClearCookies { domain: None, env: None }).unwrap(), Ok(ReplyBody::CookiesCleared { removed: 1 }));
+
+    // A jar per environment: a login with `a` isn't sent with `b`, or with none.
+    std::fs::create_dir_all(ws.join("environments")).unwrap();
+    for name in ["a", "b"] {
+        std::fs::write(ws.join(format!("environments/{name}.env")), "x=1\n").unwrap();
+    }
+    let per_env = tracer_protocol::Browser { cookies: true, origin: None, unchecked_tls: vec![], jar_per_env: true };
+    window.call(Command::SetBrowser { browser: per_env }).unwrap().unwrap();
+    let send_in = |client: &mut Client, path: &str, env: Option<&str>| {
+        let request = HttpRequest { method: "GET".into(), url: format!("{base}{path}"), ..Default::default() };
+        let Ok(ReplyBody::Accepted { request_id }) = client.call(Command::Send { request, env: env.map(String::from) }).unwrap() else { panic!() };
+        request_id
+    };
+    let id = send_in(&mut window, "/login", Some("a"));
+    end_of(&mut window, id);
+    for (env, want) in [(Some("a"), "sid=abc"), (Some("b"), ""), (None, "")] {
+        let id = send_in(&mut window, "/me", env);
+        let EventKind::RequestFinished { response, .. } = end_of(&mut window, id) else { panic!() };
+        assert_eq!(response.body, want, "sent with {env:?}");
+    }
+    let Ok(ReplyBody::Cookies { cookies, .. }) = window.call(Command::Cookies).unwrap() else { panic!() };
+    assert_eq!(cookies.iter().map(|c| c.env.as_deref()).collect::<Vec<_>>(), [Some("a")]);
+    assert_eq!(window.call(Command::ClearCookies { domain: None, env: Some("b".into()) }).unwrap(), Ok(ReplyBody::CookiesCleared { removed: 0 }));
+    assert_eq!(window.call(Command::ClearCookies { domain: None, env: Some("a".into()) }).unwrap(), Ok(ReplyBody::CookiesCleared { removed: 1 }));
 
     // With a page's origin: PUT with X-Token is preflighted (a request of
     // its own), allowed, and its answer passes the CORS check.
-    let page = tracer_protocol::Browser { cookies: false, origin: Some("HTTPS://app.test:443/index.html".into()), unchecked_tls: vec![] };
+    let page = tracer_protocol::Browser { cookies: false, origin: Some("HTTPS://app.test:443/index.html".into()), unchecked_tls: vec![], jar_per_env: false };
     window.call(Command::SetBrowser { browser: page }).unwrap().unwrap();
     let Ok(ReplyBody::Cookies { browser, .. }) = window.call(Command::Cookies).unwrap() else { panic!() };
     assert_eq!(browser.origin.as_deref(), Some("https://app.test"));

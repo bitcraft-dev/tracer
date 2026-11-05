@@ -199,6 +199,10 @@ pub enum Command {
     ClearCookies {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         domain: Option<String>,
+        /// Only that environment's jar ("" for the shared one); every jar
+        /// if not given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
     },
     /// Run the saved requests under folder `path` (or the one at `path`),
     /// in the order of their paths, as one flow: each step's captures fill
@@ -577,6 +581,11 @@ pub struct Browser {
     /// says so ([`HttpResponse::tls_unchecked`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unchecked_tls: Vec<String>,
+    /// Each environment keeps cookies in a jar of its own (requests sent
+    /// with none share one), so a login against one doesn't follow you to
+    /// another. Off, every request shares one jar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub jar_per_env: bool,
 }
 
 impl Browser {
@@ -612,6 +621,10 @@ pub struct CookieSeen {
     pub http_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub same_site: Option<String>,
+    /// The environment whose jar holds it, with a jar per environment;
+    /// none for the shared jar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
 }
 
 /// The most a run-until sends when its plan doesn't say.

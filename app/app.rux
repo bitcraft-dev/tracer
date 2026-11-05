@@ -236,18 +236,22 @@
                                 </view>
                             </view>
                             <view class="tabs">
-                                <view class="tab" :class="{ on: resTab == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
+                                <view class="tab" :class="{ on: shownTab() == &quot;body&quot; }" @tap="resTab = &quot;body&quot;">
                                     <text class="tab-label">Body</text>
                                 </view>
-                                <view class="tab" :class="{ on: resTab == &quot;headers&quot; }" @tap="resTab = &quot;headers&quot;">
+                                <view class="tab" :class="{ on: shownTab() == &quot;headers&quot; }" @tap="resTab = &quot;headers&quot;">
                                     <text class="tab-label">Headers</text>
                                     <text class="badge">{{ sel.resHeaders.length }}</text>
                                 </view>
-                                <view class="tab" r-if="sel.results.length > 0" :class="{ on: resTab == &quot;checks&quot; }" @tap="resTab = &quot;checks&quot;">
+                                <view class="tab" r-if="cookieCount(sel) > 0" :class="{ on: shownTab() == &quot;cookies&quot; }" @tap="resTab = &quot;cookies&quot;">
+                                    <text class="tab-label">Cookies</text>
+                                    <text class="badge">{{ cookieCount(sel) }}</text>
+                                </view>
+                                <view class="tab" r-if="sel.results.length > 0" :class="{ on: shownTab() == &quot;checks&quot; }" @tap="resTab = &quot;checks&quot;">
                                     <text class="tab-label">Checks</text>
                                     <text class="badge" :class="{ bad: failedChecks(sel) > 0 }">{{ sel.results.length - failedChecks(sel) }}/{{ sel.results.length }}</text>
                                 </view>
-                                <view class="tab" r-if="sel.stream != &quot;&quot;" :class="{ on: resTab == &quot;messages&quot; }" @tap="resTab = &quot;messages&quot;">
+                                <view class="tab" r-if="sel.stream != &quot;&quot;" :class="{ on: shownTab() == &quot;messages&quot; }" @tap="resTab = &quot;messages&quot;">
                                     <text class="tab-label">Messages</text>
                                     <text class="badge">{{ selMsgs.length }}</text>
                                 </view>
@@ -257,7 +261,7 @@
                             <text class="mono dim" r-if="sel.state == &quot;running&quot; && sel.stream == &quot;&quot;">waiting for the answer…</text>
                             <text class="mono warn-t" r-if="sel.state == &quot;approval&quot;">waiting for a person to allow it: {{ sel.reason }}. Nothing has been sent.</text>
                             <text class="mono dim" r-if="sel.state == &quot;cancelled&quot;">cancelled by {{ sel.cancelledBy }}</text>
-                            <view class="viewer" r-if="sel.state == &quot;done&quot; && resTab == &quot;body&quot;">
+                            <view class="viewer" r-if="sel.state == &quot;done&quot; && shownTab() == &quot;body&quot;">
                                 <text class="mono dim" r-if="sel.size == 0">(empty body)</text>
                                 <text class="mono err" r-if="viewError != &quot;&quot;">{{ viewError }}</text>
                                 <view class="ln" r-for="l in bodyLines" r-key="l.no">
@@ -272,12 +276,25 @@
                                     <view class="link" @tap="showMore()"><text class="link-t">Show {{ Math.min(VIEW_STEP, viewVisible - bodyLines.length) }} more</text></view>
                                 </view>
                             </view>
-                            <view class="check" r-if="resTab == &quot;checks&quot;" r-for="c in sel.results">
+                            <view class="cookies" r-if="shownTab() == &quot;cookies&quot;">
+                                <text class="prompt-h" r-if="setCookies(sel).length > 0">Set by this answer</text>
+                                <view class="hdr" r-for="c in setCookies(sel)">
+                                    <text class="hdr-n">{{ c.name }}</text>
+                                    <text class="hdr-v">{{ c.value }}</text>
+                                </view>
+                                <text class="prompt-h" r-if="sentCookies(sel).length > 0">Sent, as written</text>
+                                <view class="hdr" r-for="c in sentCookies(sel)">
+                                    <text class="hdr-n">{{ c.name }}</text>
+                                    <text class="hdr-v">{{ c.value }}</text>
+                                </view>
+                                <text class="mono dim" r-if="browserOn">Cookies the jar added aren't listed: they're added as it's sent and kept out of history. The jar is in the browser chip below.</text>
+                            </view>
+                            <view class="check" r-if="shownTab() == &quot;checks&quot;" r-for="c in sel.results">
                                 <text class="check-mark" :class="{ bad: !c.pass }">{{ if c.pass { "✓" } else { "✗" } }}</text>
                                 <text class="check-e">{{ c.expect }}</text>
                                 <text class="check-a">found {{ c.actual }}</text>
                             </view>
-                            <view class="stream" r-if="resTab == &quot;messages&quot; && sel.stream != &quot;&quot;">
+                            <view class="stream" r-if="shownTab() == &quot;messages&quot; && sel.stream != &quot;&quot;">
                                   <view class="compose" r-if="sel.stream == &quot;websocket&quot; && sel.open">
                                        <view class="hsearch grow"><input r-model="wsText" placeholder="a message to send, Enter" @key="wsKey(event)" /></view>
                                        <view class="link" @tap="sendWs()"><text class="link-t">Send</text></view>
@@ -294,7 +311,7 @@
                                        <text class="msg-t" :class="{ bin: m.binary }">{{ m.text }}</text>
                                   </view>
                             </view>
-                            <view class="hdr" r-if="(sel.state == &quot;done&quot; || sel.stream != &quot;&quot;) && resTab == &quot;headers&quot;" r-for="h in sel.resHeaders">
+                            <view class="hdr" r-if="(sel.state == &quot;done&quot; || sel.stream != &quot;&quot;) && shownTab() == &quot;headers&quot;" r-for="h in sel.resHeaders">
                                 <text class="hdr-n">{{ h.name }}</text>
                                 <text class="hdr-v">{{ h.value }}</text>
                             </view>
@@ -478,6 +495,10 @@
                 <text class="b-box">{{ if bCookies { "☑" } else { "☐" } }}</text>
                 <text class="b-t">Keep cookies and send them back, as a browser does</text>
             </view>
+            <view class="b-row" r-if="bCookies" @tap="bPerEnv = !bPerEnv">
+                <text class="b-box">{{ if bPerEnv { "☑" } else { "☐" } }}</text>
+                <text class="b-t">A jar per environment, so a login in one doesn't follow you to another</text>
+            </view>
             <text class="sub">Page origin, blank for none</text>
             <view class="pal-field small"><input r-model="bOrigin" placeholder="https://app.example.com" /></view>
             <text class="sub">As from a page there: Origin is sent to other origins, a request a browser would preflight goes after its OPTIONS (in History), and the answer gets a CORS check.</text>
@@ -491,7 +512,7 @@
             <text class="prompt-h">Cookies · {{ jar.length }}</text>
             <text class="empty" r-if="jar.length == 0">The jar is empty.</text>
             <view class="c-row" r-for="c in jar" r-key="`${c.domain}${c.path} ${c.name}`">
-                <text class="c-where">{{ c.domain }}{{ c.path }}</text>
+                <text class="c-where">{{ if c.env != "" { `${c.env} · ` } else { "" } }}{{ c.domain }}{{ c.path }}</text>
                 <text class="c-kv">{{ c.name }}={{ c.value }}</text>
                 <text class="c-meta">{{ c.flags }} {{ cookieEnds(c.expiresMs) }}</text>
             </view>
@@ -1039,6 +1060,7 @@
 
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
   .check { display: flex; gap: 10px; align-items: baseline; }
+  .cookies { display: flex; flex-direction: column; gap: 6px; }
 
   .check-mark {
     width: 14px;
@@ -1882,6 +1904,8 @@
   let bCookies = signal(false);
   let bOrigin = signal("");
   let bTls = signal("");
+  let bPerEnv = signal(false);
+  let browserPerEnv = signal(false);
   let browserError = signal("");
 
   effect {
@@ -1894,6 +1918,7 @@
       browserOn = b.cookies;
       browserOrigin = b.origin;
       browserTls = b.uncheckedTls;
+      browserPerEnv = b.jarPerEnv;
       jar = b.jar;
     } catch e {
       browserError = e.message;
@@ -1922,6 +1947,7 @@
     bCookies = browserOn;
     bOrigin = browserOrigin;
     bTls = browserTls;
+    bPerEnv = browserPerEnv;
     browserError = "";
     loadBrowser();
     browserOpen = true;
@@ -1929,7 +1955,7 @@
 
   fn saveBrowser() {
     try {
-      tracer.setBrowser(bCookies, bOrigin, bTls);
+      tracer.setBrowser(bCookies, bOrigin, bTls, bPerEnv);
       browserError = "";
       browserOpen = false;
     } catch e {
@@ -2642,6 +2668,57 @@
     } catch e {
       notice = `could not explain: ${e.message}`;
     }
+  }
+
+  // The response tab to show: the one chosen, or Body when the request on
+  // show has no such tab (no checks, no cookies, not a stream).
+  fn shownTab(): string {
+    if sel == none { return "body"; }
+    let has = if resTab == "checks" {
+      sel.results.length > 0
+    } else if resTab == "cookies" {
+      cookieCount(sel) > 0
+    } else if resTab == "messages" {
+      sel.stream != ""
+    } else {
+      true
+    };
+    if has { resTab } else { "body" }
+  }
+
+  // What an answer's Set-Cookie headers set: the name, then the value and
+  // the attributes.
+  fn setCookies(r: Row): Header[] {
+    let out: Header[] = [];
+    for h in r.resHeaders {
+      if h.name.toLowerCase() != "set-cookie" { continue; }
+      let at = h.value.indexOf(";");
+      let pair = if at < 0 { h.value } else { h.value.slice(0, at) };
+      let attrs = if at < 0 { "" } else { h.value.slice(at + 1).trim() };
+      let eq = pair.indexOf("=");
+      let name = if eq < 0 { pair.trim() } else { pair.slice(0, eq).trim() };
+      let value = if eq < 0 { "" } else { pair.slice(eq + 1).trim() };
+      out.push({ name: name, value: if attrs == "" { value } else { `${value}   ${attrs}` } });
+    }
+    out
+  }
+
+  // The cookies a request carried in its own Cookie header, as written.
+  fn sentCookies(r: Row): Header[] {
+    let out: Header[] = [];
+    for h in r.reqHeaders {
+      if h.name.toLowerCase() != "cookie" { continue; }
+      for part in h.value.split(";") {
+        let eq = part.indexOf("=");
+        if part.trim() == "" { continue; }
+        out.push({ name: if eq < 0 { part.trim() } else { part.slice(0, eq).trim() }, value: if eq < 0 { "" } else { part.slice(eq + 1).trim() } });
+      }
+    }
+    out
+  }
+
+  fn cookieCount(r: Row): int {
+    setCookies(r).length + sentCookies(r).length
   }
 
   // The stream on show, its messages both ways, as Markdown on the clipboard.
