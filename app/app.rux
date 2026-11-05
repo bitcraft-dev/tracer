@@ -2041,7 +2041,9 @@
     { id: "res:body", label: "Show the response body", hint: "" },
     { id: "res:headers", label: "Show the response headers", hint: "" },
     { id: "layout", label: "Reset the layout", hint: "" },
-    { id: "reconnect", label: "Reconnect to the core", hint: "" }
+    { id: "reconnect", label: "Reconnect to the core", hint: "" },
+    { id: "undo", label: "Undo the last change to the request", hint: "Ctrl+Z" },
+    { id: "redo", label: "Redo the change to the request", hint: "Ctrl+Y" }
   ] + methods.map(m => { id: `method:${m}`, label: `Set the method to ${m}`, hint: "" });
 
   // Saved requests, as the core's list and its events say. `asOf` is the
@@ -2434,6 +2436,37 @@
   let specCheck: SpecCheck? = signal(none);
   let specCheckFor = signal(0);
   computed spec = specs.find(x => x.name == specPick) ?? none;
+
+  // The request editor's own undo, for what a field's can't reach: a
+  // field keeps its history only while it has focus and drops it when
+  // script sets its value (AW-047), so a method picked, a suggestion
+  // taken, a paste, or an edit in another tab can't be undone there. Each
+  // change of the editor is a step, typing in one place for a second
+  // being one; Ctrl+Z with no field focused, or the palette, goes back.
+  type Snap = { method: string, url: string, headerText: string, checksText: string, body: string, gqlQuery: string, gqlVars: string };
+  let undoStack: Snap[] = signal([]);
+  let redoStack: Snap[] = signal([]);
+  let undoCur: Snap? = signal(none);
+  let undoAt: float = signal(0.0);
+  let undoWhat = signal("");
+
+  effect {
+    let snap: Snap = { method: method, url: url, headerText: headerText, checksText: checksText, body: body, gqlQuery: gqlQuery, gqlVars: gqlVars };
+    let was = undoCur;
+    if was == none {
+      undoCur = snap;
+    } else if !sameSnap(was, snap) {
+      let what = changedPart(was, snap);
+      let at = now();
+      if at - undoAt > 1000 || what != undoWhat || undoStack.length == 0 {
+        undoStack = (undoStack + [was]).slice(Math.max(0, undoStack.length - 99));
+      }
+      redoStack = [];
+      undoCur = snap;
+      undoAt = at;
+      undoWhat = what;
+    }
+  }
 
   // The query being edited, checked against the loaded schema each time
   // it changes.
@@ -2885,6 +2918,68 @@
     }
   }
 
+  fn sameSnap(a: Snap, b: Snap): bool {
+    a.method == b.method && a.url == b.url && a.headerText == b.headerText && a.checksText == b.checksText && a.body == b.body && a.gqlQuery == b.gqlQuery && a.gqlVars == b.gqlVars
+  }
+
+  // What of the request changed between two steps, in words.
+  fn changedPart(a: Snap, b: Snap): string {
+    if a.method != b.method { return "the method"; }
+    if a.url != b.url { return "the URL"; }
+    if a.gqlQuery != b.gqlQuery { return "the query"; }
+    if a.gqlVars != b.gqlVars { return "the variables"; }
+    if a.headerText != b.headerText { return "the headers"; }
+    if a.checksText != b.checksText { return "the checks"; }
+    return "the body";
+  }
+
+  fn applySnap(x: Snap) {
+    method = x.method;
+    url = x.url;
+    headerText = x.headerText;
+    checksText = x.checksText;
+    gqlQuery = x.gqlQuery;
+    gqlVars = x.gqlVars;
+    body = x.body;
+  }
+
+  fn undoEdit() {
+    if undoStack.length == 0 || undoCur == none {
+      notice = "nothing to undo in the request";
+      return;
+    }
+    let back = undoStack[undoStack.length - 1];
+    let here = undoCur;
+    undoStack = undoStack.slice(0, undoStack.length - 1);
+    redoStack = redoStack + [here];
+    undoCur = back;
+    undoWhat = "";
+    applySnap(back);
+    notice = `undid a change to ${changedPart(back, here)}`;
+  }
+
+  fn redoEdit() {
+    if redoStack.length == 0 || undoCur == none {
+      notice = "nothing to redo";
+      return;
+    }
+    let ahead = redoStack[redoStack.length - 1];
+    let here = undoCur;
+    redoStack = redoStack.slice(0, redoStack.length - 1);
+    undoStack = undoStack + [here];
+    undoCur = ahead;
+    undoWhat = "";
+    applySnap(ahead);
+    notice = `redid a change to ${changedPart(here, ahead)}`;
+  }
+
+  // Opening another request starts its own history.
+  fn forgetEdits() {
+    undoStack = [];
+    redoStack = [];
+    undoCur = none;
+  }
+
   // A problem's suggestion: a name put in place of the misspelt one.
   fn takeSuggestion(d: GqlDiag, s: string) {
     if !d.replaces { return; }
@@ -2902,6 +2997,7 @@
   }
 
   fn load(s: Saved) {
+    forgetEdits();
     method = s.method;
     url = s.url;
     body = s.body;
@@ -3173,6 +3269,7 @@
 
   fn newRequest() {
     if !guardEdits("(new)") { return; }
+    forgetEdits();
     openPath = "";
     method = "GET";
     url = "";
@@ -4053,6 +4150,10 @@
       runFolder();
     } else if id == "mock" {
       mockFolder();
+    } else if id == "undo" {
+      undoEdit();
+    } else if id == "redo" {
+      redoEdit();
     } else if id == "spec-import" {
       specFrom = url.trim();
       toSpecs();
@@ -4146,6 +4247,15 @@
     }
     if e.primary && e.key == "s" {
       save();
+      return false;
+    }
+    // Reached only when no field has focus: a focused one takes Ctrl+Z.
+    if e.primary && !e.shift && (e.key == "z" || e.key == "Z") {
+      undoEdit();
+      return false;
+    }
+    if e.primary && (e.key == "y" || e.key == "Y" || (e.shift && (e.key == "z" || e.key == "Z"))) {
+      redoEdit();
       return false;
     }
     if e.primary && e.key == "Enter" {
