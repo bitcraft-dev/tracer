@@ -71,6 +71,10 @@ struct Inner {
     /// stands was not taken, if it wasn't.
     policy: Policy,
     policy_error: Option<String>,
+    /// Since when the journal can't be written, and how many events it
+    /// has missed, while that lasts.
+    journal_failing: Option<u64>,
+    journal_missed: u64,
     /// The policy file's text when last read (`None`: no file), so a rescan
     /// acts only on a change.
     policy_text: Option<String>,
@@ -298,6 +302,8 @@ impl Hub {
                 agents_allowed,
                 policy,
                 policy_error,
+                journal_failing: None,
+                journal_missed: 0,
                 policy_text,
                 starts: HashMap::new(),
                 disk: Disk::read(workspace),
@@ -1285,9 +1291,32 @@ fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {
     let seq = inner.next_seq;
     inner.next_seq += 1;
     let event = Event { seq, at_ms: now_ms(), actor, kind };
-    // Journal first: an event a client has seen is an event the journal has.
-    if let Ok(line) = serde_json::to_string(&event) {
-        let _ = writeln!(inner.journal, "{line}");
+    // Journal first: an event a client has seen is an event the journal
+    // has. When it can't be written the event is still published (clients
+    // need it to stay right), and the failure is published too, once, so
+    // it isn't silent; a journal event of its own can't be written either,
+    // and isn't tried.
+    let journal_event = matches!(event.kind, EventKind::JournalFailed { .. } | EventKind::JournalRecovered { .. });
+    let mut follow: Option<EventKind> = None;
+    if !journal_event {
+        let written = serde_json::to_string(&event).map_err(io::Error::other).and_then(|line| writeln!(inner.journal, "{line}"));
+        match (written, inner.journal_failing) {
+            (Err(e), None) => {
+                eprintln!("tracer core: could not write event {seq} to the journal: {e}");
+                inner.journal_failing = Some(seq);
+                inner.journal_missed = 1;
+                follow = Some(EventKind::JournalFailed { error: e.to_string(), first_seq: seq });
+            }
+            (Err(_), Some(_)) => inner.journal_missed += 1,
+            (Ok(()), Some(_)) => {
+                let missing = inner.journal_missed;
+                inner.journal_failing = None;
+                inner.journal_missed = 0;
+                eprintln!("tracer core: the journal is written again; {missing} events are not in it");
+                follow = Some(EventKind::JournalRecovered { missing });
+            }
+            (Ok(()), None) => {}
+        }
     }
     // A subscriber whose connection has gone is dropped here rather than
     // failing the publish for everyone else.
@@ -1295,6 +1324,9 @@ fn publish_locked(inner: &mut Inner, actor: Actor, kind: EventKind) -> u64 {
         .subscribers
         .retain(|(_, out)| out.send(ServerMessage::Event(event.clone())).is_ok());
     inner.events.push(event);
+    if let Some(kind) = follow {
+        publish_locked(inner, Actor { kind: ClientKind::Disk, name: "journal".into() }, kind);
+    }
     seq
 }
 
@@ -1315,4 +1347,35 @@ fn write_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_journal_that_cant_be_written_is_said_once_and_its_recovery_too() {
+        let ws = std::env::temp_dir().join(format!("tracer-journal-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let hub = Hub::open(&ws).unwrap();
+        let who = Actor { kind: ClientKind::Cli, name: "t".into() };
+        let path = ws.join(JOURNAL_PATH);
+        // A handle that can only read: every write fails.
+        hub.inner.lock().unwrap().journal = File::open(&path).unwrap();
+        let first = hub.publish(who.clone(), EventKind::AgentsSwitched { allowed: true });
+        hub.publish(who.clone(), EventKind::AgentsSwitched { allowed: true });
+        hub.inner.lock().unwrap().journal = OpenOptions::new().append(true).open(&path).unwrap();
+        hub.publish(who, EventKind::AgentsSwitched { allowed: false });
+        let inner = hub.inner.lock().unwrap();
+        let said: Vec<&EventKind> = inner.events.iter().map(|e| &e.kind).filter(|k| matches!(k, EventKind::JournalFailed { .. } | EventKind::JournalRecovered { .. })).collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(matches!(said[0], EventKind::JournalFailed { first_seq, .. } if *first_seq == first));
+        assert!(matches!(said[1], EventKind::JournalRecovered { missing: 2 }));
+        // Every event clients saw is numbered without a gap.
+        let seqs: Vec<u64> = inner.events.iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+        drop(inner);
+        let _ = fs::remove_dir_all(&ws);
+    }
 }

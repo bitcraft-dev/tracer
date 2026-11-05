@@ -535,6 +535,7 @@
             <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
             <text class="status-t flow-t" r-if="lastBench != &quot;&quot;" :class="{ bad: !benchOk }" @tap="showBench(benchId)">{{ lastBench }}</text>
             <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
+            <text class="status-t policy-bad" r-if="journalError != &quot;&quot;">{{ journalError }}</text>
             <view class="browser-chip on" r-if="mockId > 0" @tap="stopMock()">
                 <text class="browser-t">{{ mockLabel }}</text>
             </view>
@@ -2107,6 +2108,8 @@
   let agentsOn = signal(true);
   // Why agents.policy, as last changed, was not taken; "" when it was.
   let policyError = signal("");
+  // The journal can't be written: history from then on won't outlive the core.
+  let journalError = signal("");
   // The latest flow, as its events last told it, and whether it's well.
   let lastFlow = signal("");
   let flowOk = signal(true);
@@ -2617,6 +2620,11 @@
         loadSpecs();
       } else if e.kind == "agents_switched" {
         agentsOn = e.allow;
+      } else if e.kind == "journal_failed" {
+        journalError = `journal not written from event ${e.n}: ${e.error}`;
+      } else if e.kind == "journal_recovered" {
+        journalError = "";
+        notice = `the journal is written again; ${e.n} events are not in it`;
       } else if e.kind == "policy_changed" {
         policyError = e.error;
       } else if e.kind == "request_finished" || e.kind == "request_failed" || e.kind == "request_cancelled" {

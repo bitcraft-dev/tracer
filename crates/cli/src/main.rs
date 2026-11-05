@@ -2178,6 +2178,8 @@ fn describe(event: &Event) -> String {
         EventKind::CookiesChanged { cookies } => {
             format!("cookie jar: {} cookie{}", cookies.len(), if cookies.len() == 1 { "" } else { "s" })
         }
+        EventKind::JournalFailed { error, first_seq } => format!("could not write the journal from event {first_seq} on: {error}"),
+        EventKind::JournalRecovered { missing } => format!("the journal is written again; {missing} events are not in it"),
         EventKind::PolicyChanged { rules, error: Some(error) } => {
             format!("agents.policy not taken, {} rules stand: {error}", rules.len())
         }

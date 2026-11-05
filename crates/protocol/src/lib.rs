@@ -1689,6 +1689,13 @@ pub enum EventKind {
     CookiesChanged { cookies: Vec<CookieSeen> },
     /// The policy file changed. `rules` are what agents get from now on;
     /// with an `error`, the file was not taken and they are the old rules.
+    /// The core could not write an event to its journal (the disk full, the
+    /// file gone read-only): from `first_seq` on, events reach clients but
+    /// a core started later won't have them. Said once, until writes work.
+    JournalFailed { error: String, first_seq: u64 },
+    /// Writing the journal works again; `missing` events from the failure
+    /// on are not in it.
+    JournalRecovered { missing: u64 },
     PolicyChanged {
         rules: Vec<AgentRules>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

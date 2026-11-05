@@ -1377,6 +1377,8 @@ fn to_page(event: Event) -> CoreEvent {
         }
         EventKind::MockStopped { mock_id } => (out.kind, out.mock) = ("mock_stopped".into(), mock_id),
         EventKind::SpecImported { spec, created } => (out.kind, out.path, out.n) = ("spec_imported".into(), spec.name, created.into()),
+        EventKind::JournalFailed { error, first_seq } => (out.kind, out.error, out.n) = ("journal_failed".into(), error, first_seq),
+        EventKind::JournalRecovered { missing } => (out.kind, out.n) = ("journal_recovered".into(), missing),
         EventKind::PolicyChanged { error, .. } => {
             (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
         }
