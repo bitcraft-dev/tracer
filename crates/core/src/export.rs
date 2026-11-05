@@ -14,6 +14,9 @@ use crate::{graphql, http};
 /// host `browser` trusts without checking its certificate is trusted so in
 /// the code too, where the language lets it be.
 pub fn export(request: &HttpRequest, env: Option<&Environment>, lang: ExportLang, browser: &Browser) -> Result<String, String> {
+    if graphql::is_subscription(request) {
+        return Err("a GraphQL subscription stays open over a WebSocket (graphql-transport-ws), which curl, fetch and requests don't speak; send it from Tracer".into());
+    }
     let request = if graphql::is_graphql(request) { graphql::to_http(request)? } else { request.clone() };
     let fill = |text: &str| fill_known(text, env);
     let method = request.method.trim().to_ascii_uppercase();

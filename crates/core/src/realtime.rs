@@ -366,6 +366,12 @@ pub fn websocket(link: &Link, request: &HttpRequest, unchecked_tls: bool) -> Res
     conn.tcp().set_read_timeout(Some(POLL)).map_err(|e| e.to_string())?;
 
     let mut queue: VecDeque<(bool, String)> = opening(request.body.as_deref().unwrap_or("")).into();
+    // A GraphQL subscription, if the server took its subprotocol: its pings
+    // are answered and its `complete` ends the stream.
+    let graphql_ws = head
+        .headers
+        .iter()
+        .any(|(n, v)| n.eq_ignore_ascii_case("sec-websocket-protocol") && v.trim().eq_ignore_ascii_case(crate::graphql::SUBPROTOCOL));
     // Whether the server has sent anything since we last did.
     let mut heard = false;
     let mut counts = Counts::default();
@@ -439,6 +445,16 @@ pub fn websocket(link: &Link, request: &HttpRequest, unchecked_tls: bool) -> Res
                     counts.bytes += message.len() as u64;
                     heard = true;
                     link.publish(link.actor.clone(), Direction::In, &message, opcode == BINARY, None, None);
+                    if graphql_ws && opcode == TEXT {
+                        match serde_json::from_slice::<serde_json::Value>(&message).ok().as_ref().and_then(|m| m.get("type")?.as_str()) {
+                            Some("ping") => queue.push_front((false, r#"{"type":"pong"}"#.to_string())),
+                            Some("complete") => {
+                                let _ = conn.send(&ws::frame(CLOSE, &1000u16.to_be_bytes(), Some(ws::new_mask())));
+                                break 'open "the subscription completed".into();
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }

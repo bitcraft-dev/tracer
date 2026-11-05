@@ -53,6 +53,87 @@ pub fn is_write(query: &str) -> bool {
     first.starts_with("mutation") || first.starts_with("subscription")
 }
 
+/// The WebSocket subprotocol subscriptions go over (the `graphql-ws`
+/// library's, which Apollo, Hasura, Yoga and others speak).
+pub const SUBPROTOCOL: &str = "graphql-transport-ws";
+
+/// Whether `request` is a GraphQL subscription, which goes over a
+/// WebSocket and stays open.
+pub fn is_subscription(request: &HttpRequest) -> bool {
+    is_graphql(request) && first_word(&split(request.body.as_deref().unwrap_or("")).0) == "subscription"
+}
+
+fn first_word(query: &str) -> &str {
+    let line = query.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
+    line.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("")
+}
+
+/// A subscription as the WebSocket it's sent over: its URL's `http` made
+/// `ws` (`https`, `wss`), the subprotocol asked for, and its opening: the
+/// `connection_init`, then, once the server has answered (its
+/// `connection_ack`), the `subscribe`. Each `next` the server sends is a
+/// message of the stream; its `complete` closes it.
+pub fn to_subscription(request: &HttpRequest) -> Result<HttpRequest, String> {
+    let (query, variables) = split(request.body.as_deref().unwrap_or(""));
+    let url = request.url.trim();
+    let lower = url.to_ascii_lowercase();
+    let url = if lower.starts_with("https://") {
+        format!("wss://{}", &url[8..])
+    } else if lower.starts_with("http://") {
+        format!("ws://{}", &url[7..])
+    } else {
+        url.to_string()
+    };
+    let mut payload = Map::new();
+    payload.insert("query".into(), Value::String(query));
+    if let Some(vars) = variables {
+        payload.insert("variables".into(), vars);
+    }
+    let init = serde_json::json!({ "type": "connection_init", "payload": {} });
+    let subscribe = serde_json::json!({ "id": "1", "type": "subscribe", "payload": Value::Object(payload) });
+    let mut headers = request.headers.clone();
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-protocol")) {
+        headers.push(("Sec-WebSocket-Protocol".into(), SUBPROTOCOL.into()));
+    }
+    Ok(HttpRequest {
+        method: tracer_protocol::WEBSOCKET.into(),
+        url,
+        headers,
+        body: Some(format!("===\n{init}\n=== wait-for-server\n{subscribe}\n")),
+        ..request.clone()
+    })
+}
+
+/// The "no GraphQL errors" check of a subscription, over every message it
+/// got: an `error` message, or a `next` whose payload has errors, fails it.
+pub fn subscription_check(received: &[String]) -> CheckResult {
+    let mut errors: Vec<String> = Vec::new();
+    let mut data = 0;
+    for text in received {
+        let Ok(message) = serde_json::from_str::<Value>(text) else { continue };
+        match message.get("type").and_then(Value::as_str) {
+            Some("error") => errors.push(message.get("payload").map(Value::to_string).unwrap_or_default()),
+            Some("next") => {
+                let payload = message.get("payload");
+                match payload.and_then(|p| p.get("errors")).and_then(Value::as_array) {
+                    Some(list) if !list.is_empty() => {
+                        errors.extend(list.iter().filter_map(|e| e.get("message")?.as_str().map(String::from)));
+                    }
+                    _ => data += 1,
+                }
+            }
+            _ => {}
+        }
+    }
+    let (pass, actual) = if errors.is_empty() {
+        (true, format!("none in {data} result{}", if data == 1 { "" } else { "s" }))
+    } else {
+        let n = errors.len();
+        (false, format!("{n} error{}: {}", if n == 1 { "" } else { "s" }, errors.into_iter().take(3).collect::<Vec<_>>().join("; ")))
+    };
+    CheckResult { expect: NO_ERRORS.into(), pass, actual }
+}
+
 /// `request`, its variables filled in, as it goes out: a JSON `POST`.
 pub fn to_http(request: &HttpRequest) -> Result<HttpRequest, String> {
     let (query, variables) = split(request.body.as_deref().unwrap_or(""));
@@ -77,7 +158,8 @@ pub fn to_http(request: &HttpRequest) -> Result<HttpRequest, String> {
 /// request, whether the answer has errors.
 pub fn checks(request: &HttpRequest, response: Result<&HttpResponse, &str>) -> Vec<CheckResult> {
     let mut out = expect::check(&request.expect, response);
-    if is_graphql(request) {
+    // A subscription's is judged over its messages (`subscription_check`).
+    if is_graphql(request) && !is_subscription(request) {
         out.push(errors_check(response));
     }
     out
@@ -172,6 +254,41 @@ fn type_name(t: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_subscription_goes_over_a_websocket() {
+        let sub = HttpRequest {
+            method: "GRAPHQL".into(),
+            url: "https://api.test/graphql".into(),
+            body: Some("# ticks\nsubscription Ticks($n: Int) { tick(every: $n) }\n\n{\"n\": 2}".into()),
+            ..Default::default()
+        };
+        assert!(is_subscription(&sub));
+        assert!(!is_subscription(&HttpRequest { body: Some("query { a }".into()), ..sub.clone() }));
+        assert!(!is_subscription(&HttpRequest { body: Some("subscriptions { a }".into()), ..sub.clone() }));
+        let ws = to_subscription(&sub).unwrap();
+        assert_eq!((ws.method.as_str(), ws.url.as_str()), ("WEBSOCKET", "wss://api.test/graphql"));
+        assert!(ws.headers.contains(&("Sec-WebSocket-Protocol".into(), SUBPROTOCOL.into())));
+        let opening = crate::realtime::opening(ws.body.as_deref().unwrap());
+        assert_eq!(opening[0], (false, r#"{"payload":{},"type":"connection_init"}"#.to_string()));
+        assert!(opening[1].0, "the subscribe waits for the server's ack");
+        let subscribe: Value = serde_json::from_str(&opening[1].1).unwrap();
+        assert_eq!(subscribe["type"], "subscribe");
+        assert_eq!(subscribe["payload"]["variables"], json!({ "n": 2 }));
+        assert!(subscribe["payload"]["query"].as_str().unwrap().contains("tick(every: $n)"));
+        // Its errors check is the stream's, not the 101's empty body.
+        assert!(checks(&sub, Ok(&HttpResponse { status: 101, headers: vec![], body: String::new(), size: 0, timing: tracer_protocol::Timing { ttfb_ms: 1.0, total_ms: 1.0, dns_ms: None, connect_ms: None, tls_ms: None }, tls_unchecked: false })).is_empty());
+    }
+
+    #[test]
+    fn a_subscriptions_errors_are_in_its_messages() {
+        let ok = [r#"{"type":"connection_ack"}"#, r#"{"id":"1","type":"next","payload":{"data":{"tick":1}}}"#, r#"{"id":"1","type":"next","payload":{"data":{"tick":2}}}"#];
+        let check = subscription_check(&ok.map(String::from));
+        assert_eq!((check.pass, check.actual.as_str()), (true, "none in 2 results"));
+        let bad = [r#"{"id":"1","type":"next","payload":{"errors":[{"message":"boom"}]}}"#, r#"{"id":"1","type":"error","payload":[{"message":"no"}]}"#];
+        let check = subscription_check(&bad.map(String::from));
+        assert!(!check.pass && check.actual.starts_with("2 errors: boom; "), "{}", check.actual);
+    }
     use tracer_protocol::Timing;
 
     fn gql(body: &str) -> HttpRequest {

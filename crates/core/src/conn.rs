@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 
 use tracer_protocol::{
-    Access, Actor, BenchPlan, Browser, CheckResult, ClientKind, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
+    Access, Actor, BenchPlan, Browser, CheckResult, Direction, ClientKind, Command, DiffSide, HttpResponse, EventKind, HttpRequest, Outcome, Reply, ReplyBody, Request, ServerMessage, BENCH_TOLERANCE_PCT, PROTOCOL_VERSION, STREAM_LIMIT,
 };
 
 use crate::baselines::{self, Side};
@@ -403,7 +403,11 @@ pub(crate) fn run_one(
     };
     let resolved = environment
         .and_then(|e| envs::resolve(request, envs::with_extra(e, extra).as_ref()))
-        .and_then(|r| if graphql::is_graphql(&r) { graphql::to_http(&r) } else { Ok(r) });
+        .and_then(|r| match () {
+            _ if graphql::is_subscription(&r) => graphql::to_subscription(&r),
+            _ if graphql::is_graphql(&r) => graphql::to_http(&r),
+            _ => Ok(r),
+        });
     if let (Some(rules), Ok(sending)) = (&rules, &resolved) {
         if let Some(why) = guard::outside_rules(rules, sending) {
             return stopped(envs::redact(&format!("refused by the workspace's policy: {why}"), &secrets));
@@ -463,6 +467,13 @@ pub(crate) fn run_one(
         .map_err(|error| envs::redact(&error, &secrets));
     // Checked on what clients see, secrets already taken out.
     let mut results = graphql::checks(request, outcome.as_ref().map_err(String::as_str));
+    if graphql::is_subscription(request) {
+        let received: Vec<String> = hub
+            .stream_messages(request_id, 0, u64::MAX)
+            .map(|(items, _, _)| items.into_iter().filter(|i| i.message.dir == Direction::In).map(|i| i.message.text).collect())
+            .unwrap_or_default();
+        results.push(graphql::subscription_check(&received));
+    }
     if let (Some(origin), Ok(response)) = (&cors_origin, &outcome) {
         results.push(cors::answer_check(response, origin, credentials));
     }
