@@ -723,6 +723,61 @@ fn a_data_driven_flow_runs_once_per_row_with_its_values() {
     core.stop();
 }
 
+#[test]
+fn a_mock_answers_with_each_saved_requests_last_answer() {
+    let ws = workspace("mock");
+    let base = stub_server();
+    let core = tracer_core::start(&ws).unwrap();
+    let mut window = Client::connect(&ws, ClientKind::Window, "window").unwrap();
+    window.call(Command::Subscribe { since: None }).unwrap().unwrap();
+    let mut cli = Client::connect(&ws, ClientKind::Cli, "tracer").unwrap();
+    let get = |url: &str| HttpRequest { method: "GET".into(), url: url.into(), ..Default::default() };
+    cli.call(Command::SaveRequest { path: "shop/item".into(), request: get("{{base}}/items/{{id}}") }).unwrap().unwrap();
+    cli.call(Command::SaveRequest { path: "shop/new".into(), request: get("{{base}}/items/new") }).unwrap().unwrap();
+
+    // One of them answered once, through an env and a variable.
+    std::fs::create_dir_all(ws.join("environments")).unwrap();
+    std::fs::write(ws.join("environments/local.env"), format!("base={base}\nid=7\n")).unwrap();
+    let Ok(ReplyBody::Accepted { request_id }) =
+        cli.call(Command::Send { request: get("{{base}}/items/{{id}}"), env: Some("local".into()) }).unwrap()
+    else {
+        panic!()
+    };
+    let EventKind::RequestFinished { .. } = end_of(&mut window, request_id) else { panic!() };
+
+    let started = cli.call(Command::StartMock { path: "shop".into(), port: None }).unwrap();
+    let Ok(ReplyBody::MockStarted { mock_id, url, routes, .. }) = started else { panic!("{started:?}") };
+    assert_eq!(routes, ["GET /items/{id}", "GET /items/new"]);
+    let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder().http_status_as_error(false).build());
+    let mut answer = agent.get(&format!("{url}/items/99?x=1")).call().unwrap();
+    assert_eq!(answer.status(), 200);
+    assert_eq!(answer.headers().get("access-control-allow-origin").unwrap(), "*");
+    assert_eq!(answer.body_mut().read_to_string().unwrap(), r#"{"path":"/items/7","got":0}"#);
+    // The literal route wins, and has no answer yet.
+    let mut new = agent.get(&format!("{url}/items/new")).call().unwrap();
+    assert_eq!(new.status(), 501);
+    assert!(new.body_mut().read_to_string().unwrap().contains("requests/shop/new.http"));
+    let mut none = agent.delete(&format!("{url}/items/1")).call().unwrap();
+    assert_eq!(none.status(), 404);
+    assert!(none.body_mut().read_to_string().unwrap().contains("GET /items/{id}"));
+    let pre = agent.run(ureq::http::Request::builder().method("OPTIONS").uri(format!("{url}/items/1")).body(()).unwrap()).unwrap();
+    assert_eq!(pre.status(), 204);
+
+    let hits = wait_for(&mut window, |e| match &e.kind {
+        EventKind::MockHit { status: 204, .. } => Some(()),
+        _ => None,
+    });
+    let () = hits;
+    cli.call(Command::StopMock { mock_id }).unwrap().unwrap();
+    assert!(agent.get(&format!("{url}/items/1")).call().is_err() || {
+        // The listener closes once it wakes; a connection racing it may get through.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        agent.get(&format!("{url}/items/1")).call().is_err()
+    });
+    assert!(cli.call(Command::StopMock { mock_id }).unwrap().is_err());
+    core.stop();
+}
+
 /// An HTTP server answering with `statuses` in turn, then the last one
 /// again. Gives its base URL.
 fn status_server(statuses: Vec<u16>) -> String {

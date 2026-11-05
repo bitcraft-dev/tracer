@@ -28,6 +28,7 @@ mod flows;
 mod graphql;
 mod guard;
 mod http;
+mod mock;
 mod import;
 mod hub;
 mod policy;

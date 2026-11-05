@@ -17,7 +17,7 @@ use tracer_protocol::{
 };
 
 use crate::baselines::{self, Side};
-use crate::{discover, explain, export, files, import};
+use crate::{discover, explain, export, files, import, mock};
 use crate::{bench, cors, diff, envs, flows, graphql, guard, http, realtime, until};
 use crate::hub::Hub;
 use crate::Stop;
@@ -228,6 +228,15 @@ pub fn serve(
             },
             (Some(_), Command::LocalServers { ports }) => {
                 Ok(ReplyBody::LocalServers { servers: discover::local_servers(stop.port, &ports) })
+            }
+            (Some((_, actor)), Command::StartMock { path, port }) => mock::start(&hub, actor, &path, port)
+                .map(|(mock_id, port, routes)| ReplyBody::MockStarted { mock_id, port, url: format!("http://127.0.0.1:{port}"), routes }),
+            (Some((_, actor)), Command::StopMock { mock_id }) => {
+                if hub.stop_mock(actor, mock_id) {
+                    Ok(ReplyBody::MockStopped)
+                } else {
+                    Err(format!("mock {mock_id} isn't serving"))
+                }
             }
             (Some(_), Command::Import { text }) => import::import(&text).map(|(request, notes)| ReplyBody::Imported { http: files::to_text(&request), request, notes }),
             (Some((_, actor)), Command::Cookies) => {

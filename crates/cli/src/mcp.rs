@@ -678,6 +678,19 @@ fn run_tool(core: &Core, name: &str, args: &Value) -> Result<Value, String> {
             ReplyBody::Cookies { browser, cookies } => Ok(json!({ "browser": browser, "cookies": cookies })),
             _ => Err(unexpected()),
         },
+        "create_mock" => {
+            let path = str_arg(args, "path").ok_or("`path` (a folder of saved requests) is required")?.to_string();
+            let port = args.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+            let ReplyBody::MockStarted { mock_id, port, url, routes } = call(core, Command::StartMock { path, port })? else {
+                return Err(unexpected());
+            };
+            Ok(json!({ "mock_id": mock_id, "port": port, "url": url, "routes": routes }))
+        }
+        "stop_mock" => {
+            let mock_id = args.get("mock_id").and_then(Value::as_u64).ok_or("`mock_id` is required")?;
+            call(core, Command::StopMock { mock_id })?;
+            Ok(json!({ "mock_id": mock_id, "state": "stopped" }))
+        }
         "stop_until" => {
             let until_id = args.get("until_id").and_then(Value::as_u64).ok_or("`until_id` is required")?;
             call(core, Command::StopUntil { until_id })?;
@@ -1395,6 +1408,23 @@ fn tools() -> Value {
             "description": "How the workspace's requests behave like a browser's (`cookies`: the jar is kept and sent back; `origin`: requests go as from a page there, with a CORS preflight where a browser sends one and a `CORS` check on the answer); `unchecked_tls`: hosts whose TLS certificates are accepted unchecked, an answer from one carrying `tls_unchecked`, and the cookies in the jar: names, domains, paths, expiry and flags, never values. A person switches these on (`tracer browser`).",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "create_mock",
+            "description": "Serve the saved requests under a folder as a mock server on 127.0.0.1 (a free port unless `port` is given): each answers its own method and path (a {{variable}} segment matches any, e.g. GET /items/{id}) with its last real answer in history, the last good one first. A route with no answer yet gets 501; anything else 404 listing the routes. Any origin is allowed. Gives its url and routes; hits show in Tracer's window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A folder under requests/, such as `shop`." },
+                    "port": { "type": "integer" },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "stop_mock",
+            "description": "Stop a mock server, whoever started it.",
+            "inputSchema": { "type": "object", "properties": { "mock_id": { "type": "integer" } }, "required": ["mock_id"] },
         },
         {
             "name": "stop_until",

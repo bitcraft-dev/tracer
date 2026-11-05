@@ -254,6 +254,17 @@ pub enum Command {
     /// Stop a running run-until, whoever started it. It ends with
     /// `until_finished`, naming who stopped it.
     StopUntil { until_id: u64 },
+    /// Serve the saved requests under folder `path` as a mock server on
+    /// 127.0.0.1:`port` (any free port if not given): each answers its
+    /// method and path (a `{{variable}}` segment matching any) with its
+    /// own last real answer in history. Hits are `mock_hit` events.
+    StartMock {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+    },
+    /// Stop mock `mock_id`, whoever started it.
+    StopMock { mock_id: u64 },
     /// Keep finished bench `bench_id` as baseline `name`
     /// (`baselines/<name>.json`, replacing one of that name).
     SaveBaseline { bench_id: u64, name: String },
@@ -1299,6 +1310,8 @@ pub enum ReplyBody {
     BenchStopped,
     UntilStarted { until_id: u64 },
     UntilStopped,
+    MockStarted { mock_id: u64, port: u16, url: String, routes: Vec<String> },
+    MockStopped,
     BrowserSet,
     Cookies { browser: Browser, cookies: Vec<CookieSeen> },
     CookiesCleared { removed: u64 },
@@ -1448,6 +1461,21 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stopped: Option<String>,
     },
+    /// A mock server began on 127.0.0.1:`port`, answering `routes`
+    /// (`GET /items/{id}`) from the saved requests under `path`.
+    MockStarted { mock_id: u64, path: String, port: u16, routes: Vec<String> },
+    /// A mock answered `method` `path` with `status`, from the saved
+    /// request `route` (none when no route matched).
+    MockHit {
+        mock_id: u64,
+        method: String,
+        path: String,
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+    },
+    /// A mock stopped, by this event's actor.
+    MockStopped { mock_id: u64 },
     /// Agents were let act again, or stopped by this event's actor.
     AgentsSwitched { allowed: bool },
     /// The workspace's browser behaviour changed; this event's actor is who.

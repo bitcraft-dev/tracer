@@ -44,6 +44,9 @@ struct Inner {
     next_flow: u64,
     next_bench: u64,
     next_until: u64,
+    next_mock: u64,
+    /// Mocks serving, each with the flag its listener checks and its port.
+    mocks: HashMap<u64, (Arc<AtomicBool>, u16)>,
     journal: File,
     /// Every event so far, for replay. Kept whole for now; a long-lived
     /// workspace will want this paged from the file instead.
@@ -195,6 +198,14 @@ impl Hub {
             })
             .max()
             .map_or(1, |id| id + 1);
+        let next_mock = events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::MockStarted { mock_id, .. } => Some(mock_id),
+                _ => None,
+            })
+            .max()
+            .map_or(1, |id| id + 1);
         // Run-untils a previous core never finished, with how far they got.
         let mut open_untils: Vec<(u64, Actor, u64, u32)> = Vec::new();
         for e in &events {
@@ -265,6 +276,8 @@ impl Hub {
                 next_flow,
                 next_bench,
                 next_until,
+                next_mock,
+                mocks: HashMap::new(),
                 journal,
                 events,
                 clients: BTreeMap::new(),
@@ -441,6 +454,54 @@ impl Hub {
 
     /// Stop run-until `until_id` on `actor`'s behalf, cancelling the request
     /// it waits on. False when it isn't running.
+    /// Number a mock serving the saved requests under `path` on `port`, and
+    /// publish that it started.
+    pub fn start_mock(&self, actor: Actor, path: String, port: u16, routes: Vec<String>, stop: Arc<AtomicBool>) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        let mock_id = inner.next_mock;
+        inner.next_mock += 1;
+        inner.mocks.insert(mock_id, (stop, port));
+        publish_locked(&mut inner, actor, EventKind::MockStarted { mock_id, path, port, routes });
+        mock_id
+    }
+
+    /// Stop mock `mock_id`; false if it isn't serving.
+    pub fn stop_mock(&self, actor: &Actor, mock_id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some((stop, port)) = inner.mocks.remove(&mock_id) else { return false };
+        stop.store(true, Ordering::SeqCst);
+        // The listener waits in accept: a connection wakes it to see the flag.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        publish_locked(&mut inner, actor.clone(), EventKind::MockStopped { mock_id });
+        true
+    }
+
+    /// What `request` (as written: method and URL) last answered: the last
+    /// answer below 400 if there is one, else the last of any status.
+    pub fn last_answer(&self, request: &HttpRequest) -> Option<HttpResponse> {
+        let inner = self.inner.lock().unwrap();
+        let mut answers = inner.events.iter().rev().filter_map(|e| match &e.kind {
+            EventKind::RequestFinished { request_id, response } => Some((*request_id, response)),
+            _ => None,
+        });
+        let ours: Vec<u64> = entries(&inner.events)
+            .into_iter()
+            .filter(|e| crate::mock::same(&e.request, request) && e.bench.is_none())
+            .map(|e| e.request_id)
+            .collect();
+        let mut fallback = None;
+        for (id, response) in answers.by_ref() {
+            if !ours.contains(&id) {
+                continue;
+            }
+            if response.status < 400 {
+                return Some(response.clone());
+            }
+            fallback.get_or_insert_with(|| response.clone());
+        }
+        fallback
+    }
+
     pub fn stop_until(&self, actor: &Actor, until_id: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
         stop_until_locked(&mut inner, actor, until_id)

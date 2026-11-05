@@ -143,6 +143,12 @@ usage:
                                       machine: its listening ports (or the usual
                                       dev ports) and PORTs, with what answers /,
                                       the process, and any OpenAPI document
+  tracer mock <FOLDER> [--port <N>]   serve the saved requests under FOLDER as a
+                                      mock on 127.0.0.1: each answers its method
+                                      and path ({{var}} segments match any) with
+                                      its last real answer in history; prints
+                                      hits until Ctrl+C (the mock carries on)
+  tracer mock stop <ID>               stop a mock
   tracer env                          list the environments and their variables
   tracer secret set <ENV> <NAME>      set a secret; its value is read from stdin,
                                       so it stays out of shell history
@@ -200,6 +206,7 @@ fn main() -> ExitCode {
         Some("import") => import(workspace, args[1..].to_vec()),
         Some("explain") => explain(workspace, args[1..].to_vec()),
         Some("servers") => servers(workspace, args[1..].to_vec()),
+        Some("mock") => mock(workspace, args[1..].to_vec()),
         Some("env") => env_list(workspace),
         Some("secret") => secret(workspace, args[1..].to_vec()),
         Some("watch") => watch(workspace, args[1..].to_vec()),
@@ -1455,6 +1462,45 @@ fn export(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
     }
 }
 
+fn mock(workspace: PathBuf, mut args: Vec<String>) -> io::Result<ExitCode> {
+    let mut client = Client::connect(&workspace, ClientKind::Cli, "tracer mock")?;
+    if args.first().map(String::as_str) == Some("stop") {
+        let id = args.get(1).and_then(|a| a.parse().ok()).ok_or_else(|| io::Error::other(USAGE))?;
+        client.call(Command::StopMock { mock_id: id })?.map_err(io::Error::other)?;
+        eprintln!("stopped mock {id}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let port = match take_value(&mut args, "--port") {
+        Some(p) => Some(p.parse::<u16>().map_err(|_| io::Error::other(format!("`{p}` isn't a port")))?),
+        None => None,
+    };
+    let [path] = <[String; 1]>::try_from(args).map_err(|_| io::Error::other(USAGE))?;
+    client.call(Command::Subscribe { since: None })?.map_err(io::Error::other)?;
+    let (mock_id, url, routes) = match client.call(Command::StartMock { path, port })? {
+        Ok(ReplyBody::MockStarted { mock_id, url, routes, .. }) => (mock_id, url, routes),
+        Ok(other) => return Err(io::Error::other(format!("unexpected answer: {other:?}"))),
+        Err(e) => return Err(io::Error::other(e)),
+    };
+    println!("mock {mock_id} on {url}");
+    for route in &routes {
+        println!("  {route}");
+    }
+    eprintln!("hits follow; Ctrl+C leaves it serving, `tracer mock stop {mock_id}` stops it");
+    loop {
+        match client.next_event()?.kind {
+            EventKind::MockHit { mock_id: m, method, path, status, route } if m == mock_id => {
+                let from = route.map(|r| format!("  ← requests/{r}.http")).unwrap_or_default();
+                println!("{method} {path} → {status}{from}");
+            }
+            EventKind::MockStopped { mock_id: m } if m == mock_id => {
+                eprintln!("mock {mock_id} stopped");
+                return Ok(ExitCode::SUCCESS);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn servers(workspace: PathBuf, args: Vec<String>) -> io::Result<ExitCode> {
     let ports = args
         .iter()
@@ -1788,6 +1834,14 @@ fn describe(event: &Event) -> String {
             format!("run-until {until_id} ended after {sent} sent: {}", stopped.as_deref().unwrap_or(""))
         }
         EventKind::AgentsSwitched { allowed } => format!("switched agents {}", if *allowed { "on" } else { "off" }),
+        EventKind::MockStarted { mock_id, path, port, routes } => {
+            format!("mock {mock_id} of requests/{path} on http://127.0.0.1:{port}: {}", routes.join(", "))
+        }
+        EventKind::MockHit { mock_id, method, path, status, route } => format!(
+            "mock {mock_id}: {method} {path} → {status}{}",
+            route.as_deref().map(|r| format!(" from requests/{r}.http")).unwrap_or_default()
+        ),
+        EventKind::MockStopped { mock_id } => format!("stopped mock {mock_id}"),
         EventKind::BrowserChanged { browser } => format!(
             "browser behaviour: cookies {}, origin {}, TLS unchecked for {}",
             if browser.cookies { "on" } else { "off" },

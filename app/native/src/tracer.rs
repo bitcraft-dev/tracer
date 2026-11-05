@@ -130,6 +130,10 @@ pub struct CoreEvent {
     /// came (`until_finished`), and `reason` the plan (`until_started`) or
     /// why it ended without the streak (`until_finished`).
     pub until: u64,
+    /// The mock, for `mock_started` (its port in `n`, its folder in `path`),
+    /// `mock_hit` (`method`, `url` the path asked, `status`, `path` the
+    /// saved request that answered) and `mock_stopped`.
+    pub mock: u64,
 }
 
 /// A GraphQL server's schema: its root types by name ("" where it has
@@ -444,6 +448,26 @@ pub async fn local_servers() -> Result<Vec<ServerRow>, CoreError> {
             })
             .collect()),
         Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+/// Serve the saved requests under folder `path` as a mock. Gives its id.
+#[rux::export]
+pub fn start_mock(path: String) -> Result<u64, CoreError> {
+    match shared()?.call(Command::StartMock { path, port: None }) {
+        Ok(Ok(ReplyBody::MockStarted { mock_id, .. })) => Ok(mock_id),
+        Ok(Ok(other)) => Err(CoreError(format!("unexpected answer: {other:?}"))),
+        Ok(Err(refused)) => Err(CoreError(refused)),
+        Err(e) => Err(CoreError(e.to_string())),
+    }
+}
+
+#[rux::export]
+pub fn stop_mock(mock_id: u64) -> Result<(), CoreError> {
+    match shared()?.call(Command::StopMock { mock_id }) {
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(refused)) => Err(CoreError(refused)),
         Err(e) => Err(CoreError(e.to_string())),
     }
@@ -1165,6 +1189,7 @@ fn to_page(event: Event) -> CoreEvent {
         received: 0,
         sent: 0,
         until: 0,
+        mock: 0,
     };
     let headers = headers_of;
     match event.kind {
@@ -1286,6 +1311,14 @@ fn to_page(event: Event) -> CoreEvent {
             (out.kind, out.path, out.bench) = ("baseline_saved".into(), name, bench_id);
         }
         EventKind::AgentsSwitched { allowed } => (out.kind, out.allow) = ("agents_switched".into(), allowed),
+        EventKind::MockStarted { mock_id, path, port, .. } => {
+            (out.kind, out.mock, out.path, out.n) = ("mock_started".into(), mock_id, path, port.into());
+        }
+        EventKind::MockHit { mock_id, method, path, status, route } => {
+            (out.kind, out.mock, out.method, out.url) = ("mock_hit".into(), mock_id, method, path);
+            (out.status, out.path) = (status.into(), route.unwrap_or_default());
+        }
+        EventKind::MockStopped { mock_id } => (out.kind, out.mock) = ("mock_stopped".into(), mock_id),
         EventKind::PolicyChanged { error, .. } => {
             (out.kind, out.error) = ("policy_changed".into(), error.unwrap_or_default())
         }

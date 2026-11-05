@@ -435,6 +435,9 @@
             <text class="status-t flow-t" r-if="lastFlow != &quot;&quot;" :class="{ bad: !flowOk }">{{ lastFlow }}</text>
             <text class="status-t flow-t" r-if="lastBench != &quot;&quot;" :class="{ bad: !benchOk }" @tap="showBench(benchId)">{{ lastBench }}</text>
             <text class="status-t policy-bad" r-if="policyError != &quot;&quot;">{{ policyError }}</text>
+            <view class="browser-chip on" r-if="mockId > 0" @tap="stopMock()">
+                <text class="browser-t">{{ mockLabel }}</text>
+            </view>
             <view class="browser-chip" :class="{ on: browserOn || browserOrigin != &quot;&quot;, warn: browserTls != &quot;&quot; }" @tap="openBrowser()">
                 <text class="browser-t">{{ browserLabel() }}</text>
             </view>
@@ -1698,6 +1701,7 @@
     { id: "explain", label: "Copy the request on show, explained, for a person or an AI", hint: "" },
     { id: "servers", label: "Find servers running on this machine", hint: "" },
     { id: "flow-data", label: "Run the open request's folder once per row of a CSV or JSON file", hint: "" },
+    { id: "mock", label: "Mock the open request's folder: a server answering with its last answers", hint: "" },
     { id: "paste", label: "Paste a curl command or fetch call as a new request", hint: "" },
     { id: "clear-filter", label: "Clear the history filter", hint: "" },
     { id: "allow", label: "Allow the agent's request on show", hint: "" },
@@ -2120,6 +2124,16 @@
         if e.allow {
           requests = requests.map(r => if r.id == e.requestId { asked(r, "") } else { r });
         }
+      } else if e.kind == "mock_started" {
+        mockId = e.mock;
+        mockLabel = `mock ${e.path} :${e.n}`;
+        mockPort = e.n;
+        mockHits = 0;
+      } else if e.kind == "mock_hit" && e.mock == mockId {
+        mockHits = mockHits + 1;
+        mockLabel = `mock :${mockPort} · ${mockHits} hit${if mockHits == 1 { "" } else { "s" }} · last ${e.method} ${e.url} ${e.status} · stop`;
+      } else if e.kind == "mock_stopped" && e.mock == mockId {
+        mockId = 0;
       } else if e.kind == "flow_started" {
         lastFlow = `flow ${e.flow}: ${e.path} running`;
         flowOk = true;
@@ -2886,6 +2900,35 @@
     }
   }
 
+  // The newest mock serving, as the status bar shows it.
+  let mockId = signal(0);
+  let mockPort = signal(0);
+  let mockHits = signal(0);
+  let mockLabel = signal("");
+
+  // The open request's folder, served as a mock from its requests' last answers.
+  fn mockFolder() {
+    let at = openPath.lastIndexOf("/");
+    if at <= 0 {
+      error = "open a saved request in a folder: the folder is what's mocked";
+      return;
+    }
+    try {
+      tracer.startMock(openPath.substring(0, at));
+      notice = "mocking it: each saved request answers with its last real answer";
+    } catch e {
+      error = `could not mock it: ${e.message}`;
+    }
+  }
+
+  fn stopMock() {
+    try {
+      tracer.stopMock(mockId);
+    } catch e {
+      error = e.message;
+    }
+  }
+
   // The prompt for a data file, for a data-driven flow.
   let askingData = signal(false);
   let dataFile = signal("");
@@ -3434,6 +3477,8 @@
       copySelCurl();
     } else if id == "flow" {
       runFolder();
+    } else if id == "mock" {
+      mockFolder();
     } else if id == "flow-data" {
       askingData = true;
     } else if id == "bench" {
